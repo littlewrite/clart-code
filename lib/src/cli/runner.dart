@@ -1348,12 +1348,14 @@ Future<int> _runRichInteractiveRepl(
   var status = buildProviderSetupHint(session.config) ??
       (printIntro ? 'Ready. Type /help for commands.' : 'Ready.');
   var lastCode = 0;
+  var fallbackToPlain = false;
   DateTime? pendingExitHintAt;
   const exitHintWindow = Duration(seconds: 2);
 
   console.hideCursor();
   try {
     while (true) {
+      final inputWaitStartedAt = DateTime.now();
       final inputEvent = _promptRichInput(
         console,
         context,
@@ -1362,6 +1364,16 @@ Future<int> _runRichInteractiveRepl(
         status: status,
         history: inputHistory,
       );
+      final elapsedSincePrompt = DateTime.now().difference(inputWaitStartedAt);
+      if (shouldFallbackToPlainReplOnImmediateEof(
+        richInputReturnedEof: inputEvent.type == _RichInputEventType.eof,
+        hasTranscript: transcript.isNotEmpty,
+        hasInputHistory: inputHistory.isNotEmpty,
+        elapsedSincePrompt: elapsedSincePrompt,
+      )) {
+        fallbackToPlain = true;
+        break;
+      }
       if (inputEvent.type == _RichInputEventType.eof) {
         status = 'Session ended.';
         break;
@@ -1548,7 +1560,31 @@ Future<int> _runRichInteractiveRepl(
     console.writeLine();
   }
 
+  if (fallbackToPlain) {
+    print(
+        'Rich input is unavailable in this terminal. Falling back to plain REPL.');
+    return _runInteractiveRepl(
+      context,
+      streamJson: false,
+      printIntro: printIntro,
+      uiMode: _ReplUiMode.plain,
+    );
+  }
+
   return lastCode;
+}
+
+bool shouldFallbackToPlainReplOnImmediateEof({
+  required bool richInputReturnedEof,
+  required bool hasTranscript,
+  required bool hasInputHistory,
+  required Duration elapsedSincePrompt,
+  Duration threshold = const Duration(milliseconds: 250),
+}) {
+  return richInputReturnedEof &&
+      !hasTranscript &&
+      !hasInputHistory &&
+      elapsedSincePrompt <= threshold;
 }
 
 String _providerApiKey(AppConfig config, ProviderKind provider) {
@@ -1994,7 +2030,7 @@ _RichInputEvent _readRichInput(
   console.showCursor();
   try {
     while (true) {
-      final token = _readRichInputToken(_stdinReadByteSync);
+      final token = _readRichInputToken(_stdinReadByteForRichInputSync);
       switch (token.kind) {
         case RichInputTokenKind.eof:
           return _RichInputEvent.eof();
@@ -2120,7 +2156,30 @@ _RichInputEvent _readRichInput(
   }
 }
 
-int _stdinReadByteSync() => stdin.readByteSync();
+int _stdinReadByteForRichInputSync() {
+  return readRichInputByteSyncForTest(
+    stdin.readByteSync,
+    stdinHasTerminal: stdin.hasTerminal,
+  );
+}
+
+int readRichInputByteSyncForTest(
+  int Function() readByte, {
+  required bool stdinHasTerminal,
+  void Function()? onTransientEof,
+}) {
+  while (true) {
+    final value = readByte();
+    if (value != -1 || !stdinHasTerminal) {
+      return value;
+    }
+    if (onTransientEof != null) {
+      onTransientEof();
+      continue;
+    }
+    sleep(const Duration(milliseconds: 10));
+  }
+}
 
 RichInputToken _readRichInputToken(int Function() readByte) {
   final codeUnit = _readNextNonZeroByte(readByte);

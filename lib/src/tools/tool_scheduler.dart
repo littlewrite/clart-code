@@ -10,58 +10,64 @@ class ToolScheduler {
     required ToolRegistry registry,
     required ToolPermissionPolicy permissionPolicy,
   }) async {
-    final results = <ToolExecutionResult>[];
+    final results = List<ToolExecutionResult?>.filled(invocations.length, null);
+    final parallelSafeBatch =
+        <({int index, ToolInvocation invocation, Tool tool})>[];
 
-    // Group invocations by execution hint for concurrent scheduling
-    final parallelSafeGroup = <(ToolInvocation, Tool)>[];
-    final serialOnlyGroup = <(ToolInvocation, Tool)>[];
+    Future<void> flushParallelSafeBatch() async {
+      if (parallelSafeBatch.isEmpty) {
+        return;
+      }
 
-    // First pass: validate permissions and group by execution hint
-    for (final invocation in invocations) {
+      final pendingBatch = List.of(parallelSafeBatch);
+      parallelSafeBatch.clear();
+      final batchResults = await Future.wait(
+        pendingBatch.map(
+          (item) => _executeToolSafely(item.tool, item.invocation),
+        ),
+      );
+      for (var i = 0; i < pendingBatch.length; i++) {
+        results[pendingBatch[i].index] = batchResults[i];
+      }
+    }
+
+    for (var index = 0; index < invocations.length; index++) {
+      final invocation = invocations[index];
       if (!permissionPolicy.canExecute(invocation.name)) {
-        results.add(
-          ToolExecutionResult.failure(
-            tool: invocation.name,
-            errorCode: 'permission_denied',
-            errorMessage: 'tool execution is denied by current policy',
-          ),
+        await flushParallelSafeBatch();
+        results[index] = ToolExecutionResult.failure(
+          tool: invocation.name,
+          errorCode: 'permission_denied',
+          errorMessage: 'tool execution is denied by current policy',
         );
         continue;
       }
 
       final tool = registry.lookup(invocation.name);
       if (tool == null) {
-        results.add(
-          ToolExecutionResult.failure(
-            tool: invocation.name,
-            errorCode: 'tool_not_found',
-            errorMessage: 'unknown tool: ${invocation.name}',
-          ),
+        await flushParallelSafeBatch();
+        results[index] = ToolExecutionResult.failure(
+          tool: invocation.name,
+          errorCode: 'tool_not_found',
+          errorMessage: 'unknown tool: ${invocation.name}',
         );
         continue;
       }
 
       if (tool.executionHint == ToolExecutionHint.parallelSafe) {
-        parallelSafeGroup.add((invocation, tool));
-      } else {
-        serialOnlyGroup.add((invocation, tool));
+        parallelSafeBatch.add(
+          (index: index, invocation: invocation, tool: tool),
+        );
+        continue;
       }
+
+      await flushParallelSafeBatch();
+      results[index] = await _executeToolSafely(tool, invocation);
     }
 
-    // Execute parallel-safe tools concurrently
-    if (parallelSafeGroup.isNotEmpty) {
-      final parallelResults = await Future.wait(
-        parallelSafeGroup.map((pair) => _executeToolSafely(pair.$2, pair.$1)),
-      );
-      results.addAll(parallelResults);
-    }
+    await flushParallelSafeBatch();
 
-    // Execute serial-only tools sequentially
-    for (final (invocation, tool) in serialOnlyGroup) {
-      results.add(await _executeToolSafely(tool, invocation));
-    }
-
-    return results;
+    return results.map((result) => result!).toList(growable: false);
   }
 
   Future<ToolExecutionResult> _executeToolSafely(

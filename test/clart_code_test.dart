@@ -5,6 +5,8 @@ import 'dart:io';
 import 'package:clart_code/clart_code.dart';
 import 'package:clart_code/src/cli/repl_command_dispatcher.dart';
 import 'package:clart_code/src/cli/workspace_store.dart';
+import 'package:clart_code/src/tools/tool_registry.dart';
+import 'package:clart_code/src/tools/tool_scheduler.dart';
 import 'package:test/test.dart';
 
 class _FakeReplCommandSession implements ReplCommandSession {
@@ -31,6 +33,34 @@ class _CapturedRunResult {
 
   final int code;
   final String output;
+}
+
+class _RecordingTool implements Tool {
+  _RecordingTool({
+    required this.name,
+    required this.executionHint,
+    required this.log,
+    this.delay = Duration.zero,
+  });
+
+  @override
+  final String name;
+
+  @override
+  final ToolExecutionHint executionHint;
+
+  final List<String> log;
+  final Duration delay;
+
+  @override
+  Future<ToolExecutionResult> run(ToolInvocation invocation) async {
+    log.add('start:$name');
+    if (delay > Duration.zero) {
+      await Future<void>.delayed(delay);
+    }
+    log.add('end:$name');
+    return ToolExecutionResult.success(tool: name, output: name);
+  }
 }
 
 Future<_CapturedRunResult> _capturePrintOutput(
@@ -834,7 +864,14 @@ void main() {
   });
 
   test('loop command runs with max turns', () async {
-    final code = await runCli(['loop', '--max-turns', '2', 'hello']);
+    final code = await runCli([
+      '--provider',
+      'local',
+      'loop',
+      '--max-turns',
+      '2',
+      'hello',
+    ]);
     expect(code, 0);
   });
 
@@ -1219,6 +1256,89 @@ void main() {
     expect(code, 2);
   });
 
+  test('rich repl immediate eof falls back to plain mode', () {
+    expect(
+      shouldFallbackToPlainReplOnImmediateEof(
+        richInputReturnedEof: true,
+        hasTranscript: false,
+        hasInputHistory: false,
+        elapsedSincePrompt: const Duration(milliseconds: 50),
+      ),
+      isTrue,
+    );
+
+    expect(
+      shouldFallbackToPlainReplOnImmediateEof(
+        richInputReturnedEof: true,
+        hasTranscript: true,
+        hasInputHistory: false,
+        elapsedSincePrompt: const Duration(milliseconds: 50),
+      ),
+      isFalse,
+    );
+
+    expect(
+      shouldFallbackToPlainReplOnImmediateEof(
+        richInputReturnedEof: true,
+        hasTranscript: false,
+        hasInputHistory: false,
+        elapsedSincePrompt: const Duration(seconds: 1),
+      ),
+      isFalse,
+    );
+  });
+
+  test('tool scheduler preserves order and splits parallel batches', () async {
+    final log = <String>[];
+    final scheduler = ToolScheduler();
+    final registry = ToolRegistry(
+      tools: [
+        _RecordingTool(
+          name: 'read_a',
+          executionHint: ToolExecutionHint.parallelSafe,
+          log: log,
+          delay: const Duration(milliseconds: 30),
+        ),
+        _RecordingTool(
+          name: 'read_b',
+          executionHint: ToolExecutionHint.parallelSafe,
+          log: log,
+          delay: const Duration(milliseconds: 10),
+        ),
+        _RecordingTool(
+          name: 'write_mid',
+          executionHint: ToolExecutionHint.serialOnly,
+          log: log,
+        ),
+        _RecordingTool(
+          name: 'read_c',
+          executionHint: ToolExecutionHint.parallelSafe,
+          log: log,
+        ),
+      ],
+    );
+
+    final results = await scheduler.runBatch(
+      invocations: const [
+        ToolInvocation(name: 'read_a'),
+        ToolInvocation(name: 'read_b'),
+        ToolInvocation(name: 'write_mid'),
+        ToolInvocation(name: 'read_c'),
+      ],
+      registry: registry,
+      permissionPolicy: const ToolPermissionPolicy(),
+    );
+
+    expect(results.map((result) => result.tool).toList(),
+        ['read_a', 'read_b', 'write_mid', 'read_c']);
+
+    final writeStartIndex = log.indexOf('start:write_mid');
+    final readCStartIndex = log.indexOf('start:read_c');
+    expect(writeStartIndex, greaterThan(log.indexOf('end:read_a')));
+    expect(writeStartIndex, greaterThan(log.indexOf('end:read_b')));
+    expect(readCStartIndex, greaterThan(log.indexOf('end:write_mid')));
+  });
+
   test('rich composer buffer supports multiline cursor movement', () {
     final buffer = RichComposerBuffer();
     buffer.insert('hello');
@@ -1323,6 +1443,31 @@ void main() {
 
     expect(token.kind, RichInputTokenKind.text);
     expect(token.text, '你');
+  });
+
+  test('rich terminal byte reader retries transient eof before data', () {
+    final values = <int>[-1, -1, 0x61];
+    var transientEofCount = 0;
+
+    final value = readRichInputByteSyncForTest(
+      () => values.removeAt(0),
+      stdinHasTerminal: true,
+      onTransientEof: () {
+        transientEofCount += 1;
+      },
+    );
+
+    expect(value, 0x61);
+    expect(transientEofCount, 2);
+  });
+
+  test('rich terminal byte reader preserves eof for non-terminal input', () {
+    final value = readRichInputByteSyncForTest(
+      () => -1,
+      stdinHasTerminal: false,
+    );
+
+    expect(value, -1);
   });
 
   test('query engine maps provider exception to providerFailure', () async {
