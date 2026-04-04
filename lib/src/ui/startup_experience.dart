@@ -122,7 +122,7 @@ class StartupExperience {
     print('╭${_fillTitle('─── Clart Code v$version ', innerWidth)}╮');
     print('│${_fitLine(' Welcome back!', innerWidth)}│');
     print(
-      '│${_fitLine(' Tip: run /init to create a CLART.md bootstrap file.', innerWidth)}│',
+      '│${_fitLine(' Tip: run /init in REPL (or clart_code init) to configure LLM.', innerWidth)}│',
     );
     print('│${_fitLine('', innerWidth)}│');
     print('│${_fitLine(' Provider: $provider', innerWidth)}│');

@@ -1,11 +1,12 @@
 import 'runtime_error.dart';
 
-enum QueryEventType { turnStart, assistant, error, done }
+enum QueryEventType { turnStart, providerDelta, assistant, error, done }
 
 class QueryEvent {
   const QueryEvent({
     required this.type,
     this.turn,
+    this.delta,
     this.output,
     this.model,
     this.error,
@@ -15,6 +16,7 @@ class QueryEvent {
 
   final QueryEventType type;
   final int? turn;
+  final String? delta;
   final String? output;
   final String? model;
   final RuntimeError? error;
@@ -25,6 +27,7 @@ class QueryEvent {
     return {
       'type': type.name,
       'turn': turn,
+      'delta': delta,
       'output': output,
       'model': model,
       'error': error?.toJson(),

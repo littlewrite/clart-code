@@ -6,11 +6,93 @@ import 'package:dart_openai/dart_openai.dart';
 import '../core/models.dart';
 import '../core/runtime_error.dart';
 
-abstract class LlmProvider {
-  Future<QueryResponse> run(QueryRequest request);
+enum ProviderStreamEventType { textDelta, done, error }
+
+class ProviderStreamEvent {
+  const ProviderStreamEvent({
+    required this.type,
+    this.delta,
+    this.output,
+    this.model,
+    this.error,
+  });
+
+  final ProviderStreamEventType type;
+  final String? delta;
+  final String? output;
+  final String? model;
+  final RuntimeError? error;
+
+  factory ProviderStreamEvent.textDelta({
+    required String delta,
+    String? model,
+  }) {
+    return ProviderStreamEvent(
+      type: ProviderStreamEventType.textDelta,
+      delta: delta,
+      model: model,
+    );
+  }
+
+  factory ProviderStreamEvent.done({
+    required String output,
+    String? model,
+  }) {
+    return ProviderStreamEvent(
+      type: ProviderStreamEventType.done,
+      output: output,
+      model: model,
+    );
+  }
+
+  factory ProviderStreamEvent.error({
+    required RuntimeError error,
+    String? output,
+    String? model,
+  }) {
+    return ProviderStreamEvent(
+      type: ProviderStreamEventType.error,
+      error: error,
+      output: output,
+      model: model,
+    );
+  }
 }
 
-class LocalEchoProvider implements LlmProvider {
+abstract class LlmProvider {
+  Future<QueryResponse> run(QueryRequest request);
+
+  Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
+    final response = await run(request);
+    if (response.isOk) {
+      if (response.output.isNotEmpty) {
+        yield ProviderStreamEvent.textDelta(
+          delta: response.output,
+          model: response.modelUsed,
+        );
+      }
+      yield ProviderStreamEvent.done(
+        output: response.output,
+        model: response.modelUsed,
+      );
+      return;
+    }
+
+    yield ProviderStreamEvent.error(
+      error: response.error ??
+          const RuntimeError(
+            code: RuntimeErrorCode.unknown,
+            message: 'provider stream failed',
+            source: 'provider_stream',
+            retriable: false,
+          ),
+      output: response.output,
+      model: response.modelUsed,
+    );
+  }
+}
+
+class LocalEchoProvider extends LlmProvider {
   @override
   Future<QueryResponse> run(QueryRequest request) async {
     final text = request.messages
@@ -25,7 +107,7 @@ class LocalEchoProvider implements LlmProvider {
   }
 }
 
-class ClaudeApiProvider implements LlmProvider {
+class ClaudeApiProvider extends LlmProvider {
   ClaudeApiProvider({required this.apiKey, this.baseUrl, this.model});
 
   final String apiKey;
@@ -33,7 +115,134 @@ class ClaudeApiProvider implements LlmProvider {
   final String? model;
 
   @override
+  Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
+    final requestedModel = _resolveClaudeModel(request);
+    if (apiKey.trim().isEmpty) {
+      yield ProviderStreamEvent.error(
+        error: const RuntimeError(
+          code: RuntimeErrorCode.invalidInput,
+          message: 'CLAUDE_API_KEY is required for claude provider',
+          source: 'provider_config',
+          retriable: false,
+        ),
+        output: '[ERROR] missing CLAUDE_API_KEY for claude provider',
+        model: requestedModel,
+      );
+      return;
+    }
+
+    final client = HttpClient();
+    final outputBuffer = StringBuffer();
+    var modelUsed = requestedModel;
+    var emittedTerminalEvent = false;
+
+    try {
+      final uri = _buildClaudeUri(baseUrl);
+      final body = _buildClaudeRequestBody(request)..['stream'] = true;
+      final httpRequest = await client.postUrl(uri);
+      httpRequest.headers
+          .set(HttpHeaders.contentTypeHeader, 'application/json');
+      httpRequest.headers.set('x-api-key', apiKey);
+      httpRequest.headers.set('anthropic-version', _anthropicApiVersion);
+      httpRequest.add(utf8.encode(jsonEncode(body)));
+
+      final httpResponse = await httpRequest.close();
+      if (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300) {
+        final responseText = await httpResponse.transform(utf8.decoder).join();
+        final responseMap = _decodeJsonObject(responseText);
+        yield ProviderStreamEvent.error(
+          error: RuntimeError(
+            code: _mapClaudeHttpCode(httpResponse.statusCode),
+            message: _extractClaudeErrorMessage(
+              responseMap: responseMap,
+              fallbackStatusCode: httpResponse.statusCode,
+            ),
+            source: 'claude_http',
+            retriable: httpResponse.statusCode >= 500,
+          ),
+          output: '[ERROR] Claude request failed',
+          model: modelUsed,
+        );
+        return;
+      }
+
+      String? eventName;
+      final dataLines = <String>[];
+
+      await for (final line in httpResponse
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())) {
+        final trimmed = line.trimRight();
+        if (trimmed.isEmpty) {
+          if (dataLines.isNotEmpty) {
+            final parsed = _parseClaudeStreamPayload(
+              rawPayload: dataLines.join('\n').trim(),
+              eventName: eventName,
+              currentModel: modelUsed,
+              outputBuffer: outputBuffer,
+            );
+            dataLines.clear();
+            modelUsed = parsed.modelUsed;
+            for (final event in parsed.events) {
+              yield event;
+            }
+            if (parsed.terminal) {
+              emittedTerminalEvent = true;
+              break;
+            }
+          }
+          eventName = null;
+          continue;
+        }
+        if (trimmed.startsWith('event:')) {
+          eventName = trimmed.substring(6).trim();
+          continue;
+        }
+        if (trimmed.startsWith('data:')) {
+          dataLines.add(trimmed.substring(5).trim());
+        }
+      }
+
+      if (!emittedTerminalEvent && dataLines.isNotEmpty) {
+        final parsed = _parseClaudeStreamPayload(
+          rawPayload: dataLines.join('\n').trim(),
+          eventName: eventName,
+          currentModel: modelUsed,
+          outputBuffer: outputBuffer,
+        );
+        modelUsed = parsed.modelUsed;
+        for (final event in parsed.events) {
+          yield event;
+        }
+        emittedTerminalEvent = parsed.terminal;
+      }
+
+      if (!emittedTerminalEvent) {
+        final output = outputBuffer.toString();
+        yield ProviderStreamEvent.done(
+          output: output.isEmpty ? '[empty-output]' : output,
+          model: modelUsed,
+        );
+      }
+    } catch (error) {
+      yield ProviderStreamEvent.error(
+        error: RuntimeError(
+          code: RuntimeErrorCode.providerFailure,
+          message: '$error',
+          source: 'claude_stream',
+          retriable: true,
+        ),
+        output: '[ERROR] Claude request failed',
+        model: modelUsed,
+      );
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  @override
   Future<QueryResponse> run(QueryRequest request) async {
+    final requestedModel = _resolveClaudeModel(request);
     if (apiKey.trim().isEmpty) {
       return QueryResponse.failure(
         error: const RuntimeError(
@@ -43,7 +252,7 @@ class ClaudeApiProvider implements LlmProvider {
           retriable: false,
         ),
         output: '[ERROR] missing CLAUDE_API_KEY for claude provider',
-        modelUsed: model ?? _defaultClaudeModel,
+        modelUsed: requestedModel,
       );
     }
 
@@ -66,8 +275,7 @@ class ClaudeApiProvider implements LlmProvider {
         final output = _extractClaudeOutput(responseMap);
         return QueryResponse.success(
           output: output.isEmpty ? '[empty-output]' : output,
-          modelUsed:
-              responseMap['model'] as String? ?? model ?? _defaultClaudeModel,
+          modelUsed: responseMap['model'] as String? ?? requestedModel,
         );
       }
 
@@ -82,7 +290,7 @@ class ClaudeApiProvider implements LlmProvider {
           retriable: httpResponse.statusCode >= 500,
         ),
         output: '[ERROR] Claude request failed',
-        modelUsed: model ?? _defaultClaudeModel,
+        modelUsed: requestedModel,
       );
     } catch (error) {
       return QueryResponse.failure(
@@ -93,7 +301,7 @@ class ClaudeApiProvider implements LlmProvider {
           retriable: true,
         ),
         output: '[ERROR] Claude request failed',
-        modelUsed: model ?? _defaultClaudeModel,
+        modelUsed: requestedModel,
       );
     } finally {
       client.close(force: true);
@@ -139,11 +347,15 @@ class ClaudeApiProvider implements LlmProvider {
     }
 
     return {
-      'model': model ?? _defaultClaudeModel,
+      'model': _resolveClaudeModel(request),
       'max_tokens': _defaultClaudeMaxTokens,
       if (systemMessages.isNotEmpty) 'system': systemMessages.join('\n'),
       'messages': messages,
     };
+  }
+
+  String _resolveClaudeModel(QueryRequest request) {
+    return request.model ?? model ?? _defaultClaudeModel;
   }
 
   Map<String, Object?> _decodeJsonObject(String raw) {
@@ -169,6 +381,113 @@ class ClaudeApiProvider implements LlmProvider {
         .map((block) => block['text'] as String)
         .join('\n')
         .trim();
+  }
+
+  String _extractClaudeDeltaText(Map<String, Object?> eventPayload) {
+    final type = eventPayload['type'];
+    if (type != 'content_block_delta') {
+      return '';
+    }
+    final delta = eventPayload['delta'];
+    if (delta is! Map<String, dynamic>) {
+      return '';
+    }
+    final text = delta['text'];
+    if (text is! String) {
+      return '';
+    }
+    return text;
+  }
+
+  String? _extractClaudeModel(Map<String, Object?> eventPayload) {
+    final message = eventPayload['message'];
+    if (message is! Map<String, dynamic>) {
+      return null;
+    }
+    final model = message['model'];
+    if (model is! String || model.isEmpty) {
+      return null;
+    }
+    return model;
+  }
+
+  _ClaudeStreamPayloadParseResult _parseClaudeStreamPayload({
+    required String rawPayload,
+    required String? eventName,
+    required String currentModel,
+    required StringBuffer outputBuffer,
+  }) {
+    if (rawPayload.isEmpty) {
+      return _ClaudeStreamPayloadParseResult(
+        modelUsed: currentModel,
+        events: const [],
+        terminal: false,
+      );
+    }
+
+    final payload = _decodeJsonObject(rawPayload);
+    final payloadType = payload['type'] as String?;
+    final effectiveType = payloadType ?? eventName;
+    var modelUsed = currentModel;
+    final events = <ProviderStreamEvent>[];
+    var terminal = false;
+
+    if (payloadType == 'error' || eventName == 'error') {
+      events.add(
+        ProviderStreamEvent.error(
+          error: RuntimeError(
+            code: RuntimeErrorCode.providerFailure,
+            message: _extractClaudeErrorMessage(
+              responseMap: payload,
+              fallbackStatusCode: 500,
+            ),
+            source: 'claude_stream',
+            retriable: true,
+          ),
+          output: '[ERROR] Claude request failed',
+          model: modelUsed,
+        ),
+      );
+      terminal = true;
+      return _ClaudeStreamPayloadParseResult(
+        modelUsed: modelUsed,
+        events: events,
+        terminal: terminal,
+      );
+    }
+
+    final startedModel = _extractClaudeModel(payload);
+    if (startedModel != null && startedModel.isNotEmpty) {
+      modelUsed = startedModel;
+    }
+
+    final deltaText = _extractClaudeDeltaText(payload);
+    if (deltaText.isNotEmpty) {
+      outputBuffer.write(deltaText);
+      events.add(
+        ProviderStreamEvent.textDelta(
+          delta: deltaText,
+          model: modelUsed,
+        ),
+      );
+    }
+
+    if (effectiveType == 'message_stop') {
+      final output = outputBuffer.toString();
+      events.add(
+        ProviderStreamEvent.done(
+          output: output.isEmpty ? '[empty-output]' : output,
+          model: modelUsed,
+        ),
+      );
+      terminal = true;
+    }
+
+    return _ClaudeStreamPayloadParseResult(
+      modelUsed: modelUsed,
+      events: events,
+      terminal: terminal,
+    );
   }
 
   String _extractClaudeErrorMessage({
@@ -201,7 +520,19 @@ const String _anthropicApiVersion = '2023-06-01';
 const String _defaultClaudeModel = 'claude-3-5-sonnet-latest';
 const int _defaultClaudeMaxTokens = 1024;
 
-class OpenAiApiProvider implements LlmProvider {
+class _ClaudeStreamPayloadParseResult {
+  const _ClaudeStreamPayloadParseResult({
+    required this.modelUsed,
+    required this.events,
+    required this.terminal,
+  });
+
+  final String modelUsed;
+  final List<ProviderStreamEvent> events;
+  final bool terminal;
+}
+
+class OpenAiApiProvider extends LlmProvider {
   OpenAiApiProvider({
     required this.apiKey,
     this.baseUrl,
@@ -213,7 +544,78 @@ class OpenAiApiProvider implements LlmProvider {
   final String? model;
 
   @override
+  Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
+    final chosenModel = request.model ?? model ?? 'gpt-4o-mini';
+    if (apiKey.trim().isEmpty) {
+      yield ProviderStreamEvent.error(
+        error: const RuntimeError(
+          code: RuntimeErrorCode.invalidInput,
+          message: 'OPENAI_API_KEY is required for openai provider',
+          source: 'provider_config',
+          retriable: false,
+        ),
+        output: '[ERROR] missing OPENAI_API_KEY for openai provider',
+        model: chosenModel,
+      );
+      return;
+    }
+
+    OpenAI.apiKey = apiKey;
+    OpenAI.showLogs = false;
+    OpenAI.showResponsesLogs = false;
+    if (baseUrl != null && baseUrl!.trim().isNotEmpty) {
+      OpenAI.baseUrl = baseUrl!;
+    }
+
+    final messages = request.messages.map(_toOpenAiMessage).toList();
+    final outputBuffer = StringBuffer();
+
+    try {
+      final stream = OpenAI.instance.chat.createStream(
+        model: chosenModel,
+        messages: messages,
+      );
+      await for (final chunk in stream) {
+        final deltaText = chunk.choices
+            .map((choice) => choice.delta.content ?? const [])
+            .expand((items) => items)
+            .map((item) => item?.text ?? '')
+            .where((text) => text.isNotEmpty)
+            .join();
+
+        if (deltaText.isEmpty) {
+          continue;
+        }
+
+        outputBuffer.write(deltaText);
+        yield ProviderStreamEvent.textDelta(
+          delta: deltaText,
+          model: chosenModel,
+        );
+      }
+
+      final output = outputBuffer.toString();
+      yield ProviderStreamEvent.done(
+        output: output.isEmpty ? '[empty-output]' : output,
+        model: chosenModel,
+      );
+    } catch (error) {
+      yield ProviderStreamEvent.error(
+        error: RuntimeError(
+          code: RuntimeErrorCode.providerFailure,
+          message: '$error',
+          source: 'openai_sdk_stream',
+          retriable: true,
+        ),
+        output: '[ERROR] OpenAI request failed',
+        model: chosenModel,
+      );
+    }
+  }
+
+  @override
   Future<QueryResponse> run(QueryRequest request) async {
+    final chosenModel = request.model ?? model ?? 'gpt-4o-mini';
     if (apiKey.trim().isEmpty) {
       return QueryResponse.failure(
         error: const RuntimeError(
@@ -223,7 +625,7 @@ class OpenAiApiProvider implements LlmProvider {
           retriable: false,
         ),
         output: '[ERROR] missing OPENAI_API_KEY for openai provider',
-        modelUsed: model ?? 'openai',
+        modelUsed: chosenModel,
       );
     }
 
@@ -234,7 +636,6 @@ class OpenAiApiProvider implements LlmProvider {
       OpenAI.baseUrl = baseUrl!;
     }
 
-    final chosenModel = model ?? 'gpt-4o-mini';
     final messages = request.messages.map(_toOpenAiMessage).toList();
 
     try {

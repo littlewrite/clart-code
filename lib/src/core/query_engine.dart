@@ -1,6 +1,7 @@
 import 'models.dart';
 import 'runtime_error.dart';
 import '../runtime/app_runtime.dart';
+import '../providers/llm_provider.dart';
 
 class QueryEngine {
   QueryEngine(this.runtime);
@@ -35,6 +36,47 @@ class QueryEngine {
       runtime.telemetry.logError(error, stackTrace);
       runtime.telemetry.logEvent('query_failed', {'error': '$error'});
       return QueryResponse.failure(
+        error: RuntimeError(
+          code: RuntimeErrorCode.providerFailure,
+          message: '$error',
+          source: 'provider',
+          retriable: true,
+        ),
+        output: '[ERROR] provider execution failed',
+      );
+    }
+  }
+
+  Stream<ProviderStreamEvent> runStream(QueryRequest request) async* {
+    final userText = request.messages
+        .where((m) => m.role == MessageRole.user)
+        .map((m) => m.text)
+        .join('\n');
+
+    if (!runtime.securityGuard.allowUserInput(userText)) {
+      runtime.telemetry.logEvent('query_rejected_by_security');
+      yield ProviderStreamEvent.error(
+        error: const RuntimeError(
+          code: RuntimeErrorCode.securityRejected,
+          message: 'blocked by security policy',
+          source: 'security_guard',
+          retriable: false,
+        ),
+        output: '[REJECTED] blocked by security policy',
+      );
+      return;
+    }
+
+    runtime.telemetry.logEvent('query_started');
+    try {
+      await for (final event in runtime.provider.stream(request)) {
+        yield event;
+      }
+      runtime.telemetry.logEvent('query_completed');
+    } catch (error, stackTrace) {
+      runtime.telemetry.logError(error, stackTrace);
+      runtime.telemetry.logEvent('query_failed', {'error': '$error'});
+      yield ProviderStreamEvent.error(
         error: RuntimeError(
           code: RuntimeErrorCode.providerFailure,
           message: '$error',

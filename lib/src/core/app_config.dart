@@ -59,8 +59,13 @@ class ConfigLoader {
     String? configPath,
     String? providerOverride,
     String? modelOverride,
+    String? claudeApiKeyOverride,
+    String? claudeBaseUrlOverride,
+    String? openAiApiKeyOverride,
+    String? openAiBaseUrlOverride,
   }) {
     final env = Platform.environment;
+    final effectiveConfigPath = _resolveConfigPath(configPath);
 
     var config = AppConfig(
       provider: _parseProvider(env['CLART_PROVIDER']) ?? ProviderKind.local,
@@ -69,11 +74,11 @@ class ConfigLoader {
       claudeBaseUrl: env['CLAUDE_BASE_URL'],
       openAiApiKey: env['OPENAI_API_KEY'],
       openAiBaseUrl: env['OPENAI_BASE_URL'],
-      configPath: configPath,
+      configPath: effectiveConfigPath,
     );
 
-    if (configPath != null) {
-      final fileResult = _loadFromFile(configPath, config);
+    if (effectiveConfigPath != null) {
+      final fileResult = _loadFromFile(effectiveConfigPath, config);
       if (!fileResult.isOk) {
         return fileResult;
       }
@@ -91,9 +96,24 @@ class ConfigLoader {
     config = config.copyWith(
       provider: overrideProvider ?? config.provider,
       model: modelOverride ?? config.model,
+      claudeApiKey: claudeApiKeyOverride ?? config.claudeApiKey,
+      claudeBaseUrl: claudeBaseUrlOverride ?? config.claudeBaseUrl,
+      openAiApiKey: openAiApiKeyOverride ?? config.openAiApiKey,
+      openAiBaseUrl: openAiBaseUrlOverride ?? config.openAiBaseUrl,
     );
 
     return ConfigLoadResult(config: config);
+  }
+
+  String? _resolveConfigPath(String? explicitPath) {
+    if (explicitPath != null && explicitPath.trim().isNotEmpty) {
+      return explicitPath;
+    }
+    final fallback = defaultConfigPath();
+    if (File(fallback).existsSync()) {
+      return fallback;
+    }
+    return null;
   }
 
   ConfigLoadResult _loadFromFile(String path, AppConfig current) {
@@ -152,4 +172,9 @@ class ConfigLoader {
         return null;
     }
   }
+}
+
+String defaultConfigPath({String? cwd}) {
+  final base = cwd ?? Directory.current.path;
+  return '$base/.clart/config.json';
 }
