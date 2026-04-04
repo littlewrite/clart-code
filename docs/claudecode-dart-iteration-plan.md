@@ -10,7 +10,7 @@
 - 三方库找不到等价实现时：先做接口占位，不阻塞主程序可运行，并单独列出待你确认项。
 - 不做文件级翻译：按“完整程序逐步可运行”迁移。
 
-## 当前迭代状态（Iteration 9.8，已落地）
+## 当前迭代状态（Iteration 9.9，已落地）
 
 - 已有可执行 CLI：`help/version/start/status/features/chat/print/repl/loop/tool`。
 - 已分离运行时核心：`AppRuntime + QueryEngine + LlmProvider`。
@@ -29,6 +29,13 @@
 - 已实现 REPL 最小命令：`/help`、`/model`、`/provider`、`/clear`、`/exit`。
 - 已实现 `/status` 命令（查看当前 provider/model）。
 - 已支持 REPL 运行期切换 model/provider（后续请求生效）。
+- 已新增统一输入提交链路：
+  - `PromptSubmitter`
+  - `UserInputProcessor`
+  - `ConversationSession`
+- 已把 plain/rich REPL 的 slash command 执行统一到 `repl_command_dispatcher.dart`。
+- 已把 provider 初始化/提示/config merge 辅助逻辑从 `runner.dart` 拆到 `provider_setup.dart`。
+- 已让 `chat / repl / loop` 共用“提交决策 -> query/local-command 分流”的主链路。
 - 已提供交互 UI 预览：`--ui rich`（全屏重绘 + 底部输入栏 + 流式消息重绘）。
 - 已提供 rich->plain 兼容回退（小终端/兼容性路径）。
 - 已支持 REPL 输入续行：plain 模式行尾 `\` + Enter。
@@ -72,6 +79,7 @@
 - [x] 初始化链路：`init` / `/init` 持久化并即时生效
 - [x] provider 缺配置引导：启动与切换时提示 `Run /init`
 - [x] rich 输入稳定性：UTF-8 解码 + CJK 宽度光标/换行
+- [x] 统一输入主链路第一阶段：submitter / processor / slash dispatcher 拆分
 - [ ] rich `/init` 逐步向导（避免在命令行明文显示 key）
 - [ ] 真实 LLM 失败文案细化（按网络/鉴权/host 分类）
 - [ ] 首轮用户引导文案（从 local echo 到真实模型的最短路径）
@@ -198,4 +206,8 @@
 下一步进入 MVP P0 主链路（见 `docs/claudecode-mvp-minimal-flow.md`）：
 - 继续补齐 `/init` 交互向导细节（rich 模式下逐步式引导输入）。
 - 启动阶段提示文案细化（按 provider 错误类型给更具体建议）。
+- 继续将 `processUserInput` 对齐到 `claude-code`：
+  - 从 `runner` 再抽离 turn executor
+  - 增加 typed transcript/local-command/tool-result message
+  - 让 `chat / repl / loop / stream-json` 共用同一 turn 执行器
 - REPL 主循环可用性收敛（真实 LLM 往返 + 错误提示 + 中断语义稳定）。

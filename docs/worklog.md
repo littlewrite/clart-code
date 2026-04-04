@@ -229,7 +229,38 @@
 - REPL provider 配置错误提示收敛：
   - provider 配置缺失类错误统一提示 `Run /init or clart_code init`。
 
+## 2026-04-04 / Iteration 9.9（统一提交链路拆分）
+
+- 新增统一提交器后续处理层：`process_user_input.dart`
+  - 将 `PromptSubmission` 收敛为统一结果：
+    - `ignore`
+    - `exit`
+    - `localCommand`
+    - `query`
+    - `invalid`
+  - query 路径现在会统一生成 transcript message + `QueryRequest`
+  - slash command 路径现在会统一返回本地命令结果结构，而不是直接在 runner 内分支
+- 新增 REPL 命令分发器：`repl_command_dispatcher.dart`
+  - 将 `/help /init /model /provider /status /clear` 从 `runner.dart` 拆出
+  - plain/rich REPL 共用一套 slash command 执行逻辑与返回结构
+- 新增 provider/setup 辅助模块：`provider_setup.dart`
+  - `parseProviderKind`
+  - `buildProviderSetupHint`
+  - `saveProviderSetup`
+  - config 读取/合并与 provider 摘要输出
+- `chat / repl / loop` 进一步收口：
+  - `chat` 现在走 `PromptSubmitter + UserInputProcessor`
+  - `repl` 现在走 `PromptSubmitter + UserInputProcessor + repl_command_dispatcher`
+  - `loop` 现在走 `ConversationSession + PromptSubmitter + UserInputProcessor`
+- `QueryLoop` 不再只依赖手工 messages 构造，续轮 request 改为复用统一输入处理链
+- 新增单测覆盖：
+  - `UserInputProcessor` 的 query / slash-command 回调分流
+  - `repl_command_dispatcher` 对 session 的副作用（`/clear`、`/model`）
+
 ## 下一步
 
 - 继续补齐 `/init` 的 rich 模式逐步向导体验（避免内联明文 key 输入）。
+- 继续把 `processUserInput` 向 `claude-code` 靠拢：
+  - 增加更完整的 typed transcript/tool/local-command message
+  - 让 `chat / repl / loop / stream-json` 共用统一 turn executor
 - 收敛真实 LLM 往返链路与错误提示文案（网络/鉴权/host 分类），再进入 Iteration 10。

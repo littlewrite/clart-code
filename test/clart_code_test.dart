@@ -2,7 +2,24 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:clart_code/clart_code.dart';
+import 'package:clart_code/src/cli/repl_command_dispatcher.dart';
 import 'package:test/test.dart';
+
+class _FakeReplCommandSession implements ReplCommandSession {
+  _FakeReplCommandSession({
+    required this.config,
+  });
+
+  @override
+  AppConfig config;
+
+  var conversationCleared = false;
+
+  @override
+  void clearConversation() {
+    conversationCleared = true;
+  }
+}
 
 void main() {
   test('version exits with 0', () async {
@@ -185,8 +202,128 @@ void main() {
     }
   });
 
+  test('conversation session builds next request from prior turns', () {
+    final session = ConversationSession();
+
+    final first = session.prepareInput('hello', model: 'mock-model');
+    expect(first.request, isNotNull);
+    expect(first.request!.messages.length, 1);
+    expect(first.request!.messages.first.text, 'hello');
+
+    session.recordTurn(prompt: 'hello', output: 'hi there');
+
+    final second = session.prepareInput('how are you', model: 'mock-model');
+    expect(second.request, isNotNull);
+    expect(
+      second.request!.messages
+          .map((message) => '${message.role.name}:${message.text}')
+          .toList(),
+      [
+        'user:hello',
+        'assistant:hi there',
+        'user:how are you',
+      ],
+    );
+
+    session.clear();
+    final reset = session.prepareInput('fresh start', model: 'mock-model');
+    expect(reset.request, isNotNull);
+    expect(reset.request!.messages.length, 1);
+    expect(reset.request!.messages.first.text, 'fresh start');
+  });
+
+  test('prompt submitter reuses conversation history for query submissions',
+      () {
+    final session = ConversationSession();
+    final submitter = PromptSubmitter(conversation: session);
+
+    final first = submitter.submit('hello', model: 'mock-model');
+    expect(first.isQuery, true);
+    expect(first.request, isNotNull);
+    expect(
+      first.request!.messages
+          .map((message) => '${message.role.name}:${message.text}')
+          .toList(),
+      ['user:hello'],
+    );
+
+    session.recordTurn(prompt: 'hello', output: 'hi there');
+
+    final second = submitter.submit('how are you', model: 'mock-model');
+    expect(second.isQuery, true);
+    expect(
+      second.request!.messages
+          .map((message) => '${message.role.name}:${message.text}')
+          .toList(),
+      [
+        'user:hello',
+        'assistant:hi there',
+        'user:how are you',
+      ],
+    );
+  });
+
+  test('user input processor emits query request and transcript user message',
+      () {
+    final submission = PromptSubmitter().submit('hello', model: 'mock-model');
+    final processed = const UserInputProcessor().process(submission);
+
+    expect(processed.isQuery, true);
+    expect(processed.request, isNotNull);
+    expect(processed.transcriptMessages.length, 1);
+    expect(processed.transcriptMessages.first.kind, TranscriptMessageKind.user);
+    expect(processed.transcriptMessages.first.text, 'hello');
+  });
+
+  test('user input processor promotes slash command callback result', () {
+    final submission = PromptSubmitter().submit('/status');
+    final processed = const UserInputProcessor().process(
+      submission,
+      onSlashCommand: (_) => const LocalCommandResult(
+        status: 'Displayed status.',
+        messages: [
+          TranscriptMessage.system('provider=local'),
+        ],
+      ),
+    );
+
+    expect(processed.kind, ProcessUserInputKind.localCommand);
+    expect(processed.status, 'Displayed status.');
+    expect(processed.transcriptMessages.length, 1);
+    expect(processed.transcriptMessages.first.text, 'provider=local');
+  });
+
+  test('repl slash dispatcher clears conversation for /clear', () {
+    final session = _FakeReplCommandSession(
+      config: const AppConfig(provider: ProviderKind.local),
+    );
+
+    final result = executeReplSlashCommand('/clear', session);
+
+    expect(result, isNotNull);
+    expect(result!.clearTranscript, true);
+    expect(session.conversationCleared, true);
+  });
+
+  test('repl slash dispatcher updates session model for /model', () {
+    final session = _FakeReplCommandSession(
+      config: const AppConfig(provider: ProviderKind.local),
+    );
+
+    final result = executeReplSlashCommand('/model claude-sonnet', session);
+
+    expect(result, isNotNull);
+    expect(result!.status, 'Model switched.');
+    expect(session.config.model, 'claude-sonnet');
+  });
+
   test('chat without prompt exits with error', () async {
     final code = await runCli(['chat']);
+    expect(code, 2);
+  });
+
+  test('chat rejects slash command input', () async {
+    final code = await runCli(['chat', '/exit']);
     expect(code, 2);
   });
 
@@ -282,6 +419,11 @@ void main() {
   test('loop command runs with max turns', () async {
     final code = await runCli(['loop', '--max-turns', '2', 'hello']);
     expect(code, 0);
+  });
+
+  test('loop command rejects slash command prompt', () async {
+    final code = await runCli(['loop', '/exit']);
+    expect(code, 2);
   });
 
   test('loop command rejects invalid max turns', () async {
@@ -450,6 +592,18 @@ void main() {
 
     expect(result.success, false);
     expect(result.turns, 1);
+  });
+
+  test('query loop stops after first turn without continuation builder',
+      () async {
+    final runtime = AppRuntime(provider: LocalEchoProvider());
+    final engine = QueryEngine(runtime);
+    final loop = QueryLoop(engine);
+    final result = await loop.run(prompt: 'hello', maxTurns: 3);
+
+    expect(result.success, true);
+    expect(result.turns, 1);
+    expect(result.lastOutput, 'echo: hello');
   });
 
   test('query loop emits providerDelta events in stream mode', () async {

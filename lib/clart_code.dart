@@ -1,8 +1,13 @@
 library clart_code;
 
 export 'src/cli/runner.dart';
+export 'src/cli/provider_setup.dart';
 export 'src/core/app_config.dart';
+export 'src/core/conversation_session.dart';
+export 'src/core/input_processor.dart';
 export 'src/core/models.dart';
+export 'src/core/process_user_input.dart';
+export 'src/core/prompt_submitter.dart';
 export 'src/core/query_engine.dart';
 export 'src/core/query_events.dart';
 export 'src/core/runtime_error.dart';

@@ -6,8 +6,12 @@ import 'dart:math';
 import 'package:dart_console/dart_console.dart';
 
 import '../core/app_config.dart';
+import '../core/conversation_session.dart';
 import '../core/models.dart';
+import '../core/process_user_input.dart';
+import '../core/prompt_submitter.dart';
 import '../core/query_engine.dart';
+import '../core/query_events.dart';
 import '../core/query_loop.dart';
 import '../providers/llm_provider.dart';
 import '../runtime/app_runtime.dart';
@@ -17,6 +21,8 @@ import '../tools/tool_models.dart';
 import '../tools/tool_permissions.dart';
 import '../ui/startup_experience.dart';
 import 'command_registry.dart';
+import 'provider_setup.dart';
+import 'repl_command_dispatcher.dart';
 
 class ParsedCli {
   const ParsedCli({
@@ -148,7 +154,7 @@ Future<int> runCli(List<String> args) async {
         print('provider=${ctx.config.provider.name}');
         print('model=${ctx.config.model ?? '-'}');
         print('config=${ctx.config.configPath ?? '-'}');
-        _printProviderConfigSummary(ctx.config);
+        printProviderConfigSummary(ctx.config);
         return 0;
       },
     ),
@@ -166,7 +172,8 @@ Future<int> runCli(List<String> args) async {
         print('- startup trust gate + welcome screen');
         print('- interactive REPL loop with streaming output');
         print('- optional rich UI mode (full-screen)');
-        print('- multi-turn loop with provider-level stream-json');
+        print('- centralized prompt/slash input processing');
+        print('- provider-level stream-json turn execution');
         print('- tool abstraction + serial scheduler');
         print('- built-in tools: read/write/shell-stub');
         print('- tool permission policy (allow|deny)');
@@ -301,7 +308,7 @@ Future<int> _runAuthCommand(CommandContext context) async {
     return 2;
   }
 
-  final selectedProvider = _parseProviderKind(providerRaw);
+  final selectedProvider = parseProviderKind(providerRaw);
   if (providerRaw != null && selectedProvider == null) {
     print('error: --provider must be local|claude|openai');
     return 2;
@@ -311,12 +318,12 @@ Future<int> _runAuthCommand(CommandContext context) async {
       context.config.configPath ??
       defaultConfigPath(cwd: Directory.current.path);
 
-  final existing = _readConfigJsonFile(resolvedPath);
+  final existing = readConfigJsonFile(resolvedPath);
   if (showOnly) {
-    final merged = _mergeConfigMapIntoAppConfig(context.config, existing);
+    final merged = mergeConfigMapIntoAppConfig(context.config, existing);
     print('config=$resolvedPath');
     print('provider=${merged.provider.name}');
-    _printProviderConfigSummary(merged);
+    printProviderConfigSummary(merged);
     return 0;
   }
 
@@ -364,7 +371,7 @@ Future<int> _runAuthCommand(CommandContext context) async {
   if (baseUrl != null && baseUrl.isNotEmpty) {
     print('baseUrl=$baseUrl');
   }
-  print('apiKey=${_maskSecret(effectiveApiKey)}');
+  print('apiKey=${maskSecret(effectiveApiKey)}');
   print('');
   print('Try now:');
   print('  fvm dart run ./bin/clart_code.dart');
@@ -434,15 +441,15 @@ Future<int> _runInitCommand(CommandContext context) async {
   final resolvedPath = configPath ??
       context.config.configPath ??
       defaultConfigPath(cwd: Directory.current.path);
-  final existingRaw = _readConfigJsonFile(resolvedPath);
-  final existing = _mergeConfigMapIntoAppConfig(
+  final existingRaw = readConfigJsonFile(resolvedPath);
+  final existing = mergeConfigMapIntoAppConfig(
     context.config.copyWith(configPath: resolvedPath),
     existingRaw,
   );
 
   ProviderKind? providerKind;
   if (providerRaw != null) {
-    providerKind = _parseProviderKind(providerRaw);
+    providerKind = parseProviderKind(providerRaw);
     if (providerKind == null || providerKind == ProviderKind.local) {
       print('error: --provider must be claude|openai');
       return 2;
@@ -458,7 +465,7 @@ Future<int> _runInitCommand(CommandContext context) async {
     }
     stdout.write('Provider (claude/openai): ');
     final selected = stdin.readLineSync()?.trim();
-    providerKind = _parseProviderKind(selected);
+    providerKind = parseProviderKind(selected);
     if (providerKind == null || providerKind == ProviderKind.local) {
       print('error: provider must be claude|openai');
       return 2;
@@ -526,7 +533,7 @@ Future<int> _runInitCommand(CommandContext context) async {
   print('Saved init config to ${nextConfig.configPath}');
   print('provider=${nextConfig.provider.name}');
   print('model=${nextConfig.model ?? 'default'}');
-  _printProviderConfigSummary(nextConfig);
+  printProviderConfigSummary(nextConfig);
   print('');
   print('Try now:');
   print('  fvm dart run ./bin/clart_code.dart');
@@ -569,13 +576,23 @@ Future<int> _runLoopCommand(CommandContext context) async {
     print('error: missing prompt text');
     return 2;
   }
+  final initialSubmission = PromptSubmitter().submit(
+    prompt,
+    model: context.config.model,
+  );
+  final processedInput = const UserInputProcessor().process(initialSubmission);
+  if (!processedInput.isQuery) {
+    print('error: loop only accepts plain prompt text');
+    return 2;
+  }
 
   final loop = QueryLoop(context.engine);
   final result = await loop.run(
-    prompt: prompt,
+    prompt: processedInput.submission.raw,
     maxTurns: maxTurns,
     streamJson: streamJson,
     model: context.config.model,
+    continuationPromptBuilder: _autoContinuePromptBuilder,
   );
 
   if (!streamJson) {
@@ -686,12 +703,29 @@ Future<int> _runStartCommand(CommandContext context) async {
   );
 }
 
-class _ReplSessionState {
+String? _autoContinuePromptBuilder(
+  QueryResponse response,
+  int completedTurn,
+  List<ChatMessage> transcript,
+) {
+  if (!response.isOk) {
+    return null;
+  }
+  return 'continue';
+}
+
+class _ReplSessionState implements ReplCommandSession {
   _ReplSessionState({
     required this.config,
-  });
+    ConversationSession? conversation,
+  }) : conversation = conversation ?? ConversationSession() {
+    submitter = PromptSubmitter(conversation: this.conversation);
+  }
 
+  @override
   AppConfig config;
+  final ConversationSession conversation;
+  late final PromptSubmitter submitter;
 
   ProviderKind get provider => config.provider;
 
@@ -703,6 +737,11 @@ class _ReplSessionState {
 
   set model(String? value) {
     config = config.copyWith(model: value);
+  }
+
+  @override
+  void clearConversation() {
+    conversation.clear();
   }
 }
 
@@ -724,6 +763,52 @@ _ReplUiMode? _parseReplUiMode(String raw) {
       return _ReplUiMode.rich;
     default:
       return null;
+  }
+}
+
+ProcessUserInputResult _processReplInput(
+  _ReplSessionState session,
+  String rawInput,
+) {
+  final submission = session.submitter.submit(
+    rawInput,
+    model: session.model,
+  );
+  return const UserInputProcessor().process(
+    submission,
+    onSlashCommand: (pending) => executeReplSlashCommand(pending.raw, session),
+  );
+}
+
+void _renderPlainTranscriptMessages(List<TranscriptMessage> messages) {
+  for (final message in messages) {
+    print(message.text);
+  }
+}
+
+_RichMessageRole _mapTranscriptMessageRole(TranscriptMessageKind kind) {
+  switch (kind) {
+    case TranscriptMessageKind.user:
+      return _RichMessageRole.user;
+    case TranscriptMessageKind.assistant:
+      return _RichMessageRole.assistant;
+    case TranscriptMessageKind.system:
+    case TranscriptMessageKind.localCommand:
+      return _RichMessageRole.system;
+  }
+}
+
+void _appendRichTranscriptMessages(
+  List<_RichMessage> transcript,
+  List<TranscriptMessage> messages,
+) {
+  for (final message in messages) {
+    transcript.add(
+      _RichMessage(
+        role: _mapTranscriptMessageRole(message.kind),
+        text: message.text,
+      ),
+    );
   }
 }
 
@@ -764,28 +849,46 @@ Future<int> _runInteractiveRepl(
       break;
     }
 
-    final input = line.trim();
-    if (input.isEmpty) {
-      continue;
-    }
-    if (_isExitCommand(input)) {
-      break;
-    }
-    if (input.startsWith('/')) {
-      if (_handleSlashCommand(input, context, session)) {
+    final processed = _processReplInput(session, line);
+    switch (processed.kind) {
+      case ProcessUserInputKind.ignore:
         continue;
-      }
-      print('Unknown command: $input (try /help)');
-      continue;
+      case ProcessUserInputKind.exit:
+        return lastCode;
+      case ProcessUserInputKind.localCommand:
+        final localResult = processed.localCommandResult!;
+        if (localResult.clearScreen && stdout.hasTerminal) {
+          stdout.write('\x1B[2J\x1B[H');
+        }
+        _renderPlainTranscriptMessages(processed.transcriptMessages);
+        continue;
+      case ProcessUserInputKind.invalid:
+        print('${processed.errorText} (try /help)');
+        continue;
+      case ProcessUserInputKind.query:
+        break;
     }
 
     final turnConfig = session.config;
     final turnEngine = _buildRuntimeEngine(context, turnConfig);
-    final code = streamJson
-        ? await _runReplTurnJson(turnEngine, input, model: session.model)
-        : await _runReplTurnStreamText(turnEngine, input, model: session.model);
-    if (code != 0) {
-      lastCode = code;
+    final result = streamJson
+        ? await _runReplTurnJson(
+            turnEngine,
+            processed.request!,
+          )
+        : await _runReplTurnStreamText(
+            turnEngine,
+            processed.request!,
+          );
+    if (result.success || result.interrupted) {
+      final output = result.output.isEmpty ? '[empty-output]' : result.output;
+      session.conversation.recordTurn(
+        prompt: processed.submission.raw,
+        output: output,
+      );
+    }
+    if (!result.success && !result.interrupted) {
+      lastCode = 1;
     }
   }
 
@@ -809,11 +912,13 @@ class _ReplStreamTurnResult {
     required this.success,
     required this.output,
     this.interrupted = false,
+    this.modelUsed,
   });
 
   final bool success;
   final String output;
   final bool interrupted;
+  final String? modelUsed;
 }
 
 enum _RichInputEventType { submit, breakSignal, eof }
@@ -1136,41 +1241,50 @@ Future<int> _runRichInteractiveRepl(
         continue;
       }
       pendingExitHintAt = null;
-      final input = inputEvent.text ?? '';
-      final trimmed = input.trim();
-      if (trimmed.isEmpty) {
+      final rawInput = inputEvent.text ?? '';
+      final processed = _processReplInput(session, rawInput);
+      if (processed.kind == ProcessUserInputKind.ignore) {
         status = 'Ready.';
         continue;
       }
-      if (inputHistory.isEmpty || inputHistory.last != input) {
-        inputHistory.add(input);
+      if (inputHistory.isEmpty || inputHistory.last != rawInput) {
+        inputHistory.add(rawInput);
       }
-      if (_isExitCommand(trimmed)) {
+      if (processed.kind == ProcessUserInputKind.exit) {
         status = 'Exiting.';
         break;
       }
 
-      if (trimmed.startsWith('/')) {
-        final handled = _handleSlashCommandRich(
-          trimmed,
-          context,
-          session,
-          transcript,
-          onStatus: (value) => status = value,
+      if (processed.kind == ProcessUserInputKind.invalid) {
+        status = processed.status ?? 'Invalid input.';
+        transcript.add(
+          _RichMessage(
+            role: _RichMessageRole.error,
+            text: processed.errorText ?? 'Invalid input.',
+          ),
         );
-        if (!handled) {
-          status = 'Unknown command: $trimmed';
-          transcript.add(
-            _RichMessage(
-              role: _RichMessageRole.error,
-              text: 'Unknown command: $trimmed',
-            ),
-          );
-        }
         continue;
       }
 
-      transcript.add(_RichMessage(role: _RichMessageRole.user, text: trimmed));
+      if (processed.kind == ProcessUserInputKind.localCommand) {
+        final localResult = processed.localCommandResult!;
+        if (localResult.clearTranscript) {
+          transcript.clear();
+        }
+        _appendRichTranscriptMessages(
+          transcript,
+          processed.transcriptMessages,
+        );
+        status = processed.status ?? 'Done.';
+        continue;
+      }
+
+      final request = processed.request!;
+      final prompt = processed.submission.raw;
+      _appendRichTranscriptMessages(
+        transcript,
+        processed.transcriptMessages,
+      );
       transcript
           .add(const _RichMessage(role: _RichMessageRole.assistant, text: ''));
       status = 'Streaming response... (Ctrl+C to interrupt)';
@@ -1189,13 +1303,12 @@ Future<int> _runRichInteractiveRepl(
       final turnEngine = _buildRuntimeEngine(context, turnConfig);
       final result = await _runReplTurnCollectStream(
         turnEngine,
-        trimmed,
-        model: session.model,
+        request,
         allowInterrupt: true,
         onInterrupt: () {
           status = 'Interrupted.';
         },
-        onDelta: (delta) {
+        onDelta: (delta, _) {
           final current = transcript[assistantIndex].text;
           transcript[assistantIndex] = _RichMessage(
             role: _RichMessageRole.assistant,
@@ -1215,6 +1328,10 @@ Future<int> _runRichInteractiveRepl(
 
       if (result.success) {
         final output = result.output.isEmpty ? '[empty-output]' : result.output;
+        session.conversation.recordTurn(
+          prompt: prompt,
+          output: output,
+        );
         transcript[assistantIndex] = _RichMessage(
           role: _RichMessageRole.assistant,
           text: output,
@@ -1222,6 +1339,10 @@ Future<int> _runRichInteractiveRepl(
         status = 'Done.';
       } else if (result.interrupted) {
         final output = result.output.isEmpty ? '[interrupted]' : result.output;
+        session.conversation.recordTurn(
+          prompt: prompt,
+          output: output,
+        );
         transcript[assistantIndex] = _RichMessage(
           role: _RichMessageRole.assistant,
           text: output,
@@ -1546,144 +1667,6 @@ _RichInputEvent _readRichInput(
   }
 }
 
-bool _handleSlashCommandRich(
-  String raw,
-  CommandContext context,
-  _ReplSessionState session,
-  List<_RichMessage> transcript, {
-  required void Function(String status) onStatus,
-}) {
-  final input = raw.trim();
-  if (input == '/help') {
-    transcript.add(
-      const _RichMessage(
-        role: _RichMessageRole.system,
-        text:
-            'Commands: /help /init /status /model [/model <name>] /provider [/provider <local|claude|openai>] /clear /exit; input: Enter send, Ctrl+J newline, Up/Down cursor/history, Ctrl+P/N history, Ctrl+C interrupt stream / double Ctrl+C exit',
-      ),
-    );
-    onStatus('Displayed help.');
-    return true;
-  }
-  if (input == '/init') {
-    transcript.add(
-      const _RichMessage(
-        role: _RichMessageRole.system,
-        text:
-            'usage: /init <claude|openai> <apiKey> [baseUrl] [model]; also available: clart_code init',
-      ),
-    );
-    onStatus('Displayed /init usage.');
-    return true;
-  }
-  if (input.startsWith('/init ')) {
-    final parsed = _parseInlineInitCommand(input);
-    if (parsed.error != null) {
-      onStatus(parsed.error!);
-      return true;
-    }
-    final nextConfig = saveProviderSetup(
-      current: session.config,
-      provider: parsed.provider!,
-      apiKey: parsed.apiKey!,
-      baseUrl: parsed.baseUrl,
-      model: parsed.model,
-    );
-    session.config = nextConfig;
-    transcript.add(
-      _RichMessage(
-        role: _RichMessageRole.system,
-        text:
-            'configured ${parsed.provider!.name} -> ${nextConfig.configPath ?? defaultConfigPath(cwd: Directory.current.path)}',
-      ),
-    );
-    if (parsed.model != null && parsed.model!.trim().isNotEmpty) {
-      transcript.add(
-        _RichMessage(
-          role: _RichMessageRole.system,
-          text: 'model switched to ${session.model}',
-        ),
-      );
-    }
-    final hint = buildProviderSetupHint(session.config);
-    onStatus(hint ?? 'Initialized provider config.');
-    return true;
-  }
-  if (input == '/clear') {
-    transcript.clear();
-    onStatus('Transcript cleared.');
-    return true;
-  }
-  if (input == '/model') {
-    transcript.add(
-      _RichMessage(
-        role: _RichMessageRole.system,
-        text:
-            'provider=${session.provider.name}, model=${session.model ?? 'default'}',
-      ),
-    );
-    onStatus('Displayed model.');
-    return true;
-  }
-  if (input.startsWith('/model ')) {
-    final requested = input.substring('/model '.length).trim();
-    if (requested.isEmpty) {
-      onStatus('usage: /model <name>');
-      return true;
-    }
-    session.model = requested;
-    transcript.add(
-      _RichMessage(
-        role: _RichMessageRole.system,
-        text: 'model switched to $requested',
-      ),
-    );
-    onStatus('Model switched.');
-    return true;
-  }
-  if (input == '/provider') {
-    transcript.add(
-      _RichMessage(
-        role: _RichMessageRole.system,
-        text: 'provider=${session.provider.name}',
-      ),
-    );
-    onStatus('Displayed provider.');
-    return true;
-  }
-  if (input.startsWith('/provider ')) {
-    final requested = input.substring('/provider '.length).trim();
-    final parsed = _parseProviderKind(requested);
-    if (parsed == null) {
-      onStatus('usage: /provider local|claude|openai');
-      return true;
-    }
-    session.provider = parsed;
-    transcript.add(
-      _RichMessage(
-        role: _RichMessageRole.system,
-        text: 'provider switched to ${parsed.name}',
-      ),
-    );
-    final hint = buildProviderSetupHint(session.config);
-    onStatus(hint ?? 'Provider switched.');
-    return true;
-  }
-  if (input == '/status') {
-    final config = session.config;
-    transcript.add(
-      _RichMessage(
-        role: _RichMessageRole.system,
-        text:
-            'provider=${config.provider.name} model=${config.model ?? 'default'}',
-      ),
-    );
-    onStatus('Displayed status.');
-    return true;
-  }
-  return false;
-}
-
 List<String> _wrapText(String input, int width) {
   if (input.isEmpty) {
     return const [];
@@ -1901,112 +1884,6 @@ bool _isWideRune(int rune) {
       (rune >= 0x30000 && rune <= 0x3FFFD);
 }
 
-bool _isExitCommand(String value) {
-  final input = value.trim().toLowerCase();
-  return input == '/exit' ||
-      input == '/quit' ||
-      input == 'exit' ||
-      input == 'quit';
-}
-
-bool _handleSlashCommand(
-  String raw,
-  CommandContext context,
-  _ReplSessionState session,
-) {
-  final input = raw.trim();
-  if (input == '/help') {
-    _printReplHelp();
-    return true;
-  }
-  if (input == '/init') {
-    print(
-        'usage: /init <claude|openai> <apiKey> [baseUrl] [model]  (or run: clart_code init)');
-    return true;
-  }
-  if (input.startsWith('/init ')) {
-    final parsed = _parseInlineInitCommand(input);
-    if (parsed.error != null) {
-      print(parsed.error);
-      return true;
-    }
-    final nextConfig = saveProviderSetup(
-      current: session.config,
-      provider: parsed.provider!,
-      apiKey: parsed.apiKey!,
-      baseUrl: parsed.baseUrl,
-      model: parsed.model,
-    );
-    session.config = nextConfig;
-    print(
-        'configured ${parsed.provider!.name} -> ${nextConfig.configPath ?? defaultConfigPath(cwd: Directory.current.path)}');
-    if (parsed.model != null && parsed.model!.trim().isNotEmpty) {
-      print('model switched to ${session.model}');
-    }
-    final hint = buildProviderSetupHint(session.config);
-    if (hint == null) {
-      print('init complete.');
-    } else {
-      print('hint: $hint');
-    }
-    return true;
-  }
-  if (input == '/model') {
-    print('provider=${session.provider.name}');
-    print('model=${session.model ?? 'default'}');
-    return true;
-  }
-  if (input.startsWith('/model ')) {
-    final requested = input.substring('/model '.length).trim();
-    if (requested.isEmpty) {
-      print('usage: /model <name>');
-      return true;
-    }
-    session.model = requested;
-    print('model switched to $requested');
-    return true;
-  }
-  if (input == '/provider') {
-    print('provider=${session.provider.name}');
-    _printProviderConfigSummary(session.config);
-    final hint = buildProviderSetupHint(session.config);
-    if (hint != null) {
-      print('hint: $hint');
-    }
-    return true;
-  }
-  if (input.startsWith('/provider ')) {
-    final requested = input.substring('/provider '.length).trim();
-    final parsed = _parseProviderKind(requested);
-    if (parsed == null) {
-      print('usage: /provider local|claude|openai');
-      return true;
-    }
-    session.provider = parsed;
-    print('provider switched to ${parsed.name}');
-    if (parsed != ProviderKind.local) {
-      _printProviderConfigSummary(session.config);
-    }
-    final hint = buildProviderSetupHint(session.config);
-    if (hint != null) {
-      print('hint: $hint');
-    }
-    return true;
-  }
-  if (input == '/status') {
-    print('provider=${session.provider.name}');
-    print('model=${session.model ?? 'default'}');
-    return true;
-  }
-  if (input == '/clear') {
-    if (stdout.hasTerminal) {
-      stdout.write('\x1B[2J\x1B[H');
-    }
-    return true;
-  }
-  return false;
-}
-
 String? _readPlainInputWithContinuation() {
   if (!stdin.hasTerminal) {
     return stdin.readLineSync();
@@ -2031,21 +1908,15 @@ String? _readPlainInputWithContinuation() {
 
 Future<_ReplStreamTurnResult> _runReplTurnCollectStream(
   QueryEngine engine,
-  String prompt, {
-  String? model,
+  QueryRequest request, {
   bool allowInterrupt = false,
   void Function()? onInterrupt,
-  void Function(String delta)? onDelta,
+  void Function(String delta, String? modelUsed)? onDelta,
 }) async {
-  final request = QueryRequest(
-    messages: [ChatMessage(role: MessageRole.user, text: prompt)],
-    maxTurns: 1,
-    model: model,
-  );
-
   final outputBuffer = StringBuffer();
   final completer = Completer<_ReplStreamTurnResult>();
   var completed = false;
+  var modelUsed = request.model;
   late final StreamSubscription<ProviderStreamEvent> streamSub;
   StreamSubscription<ProcessSignal>? sigintSub;
 
@@ -2059,12 +1930,15 @@ Future<_ReplStreamTurnResult> _runReplTurnCollectStream(
 
   streamSub = engine.runStream(request).listen(
     (event) {
+      if (event.model != null && event.model!.isNotEmpty) {
+        modelUsed = event.model;
+      }
       switch (event.type) {
         case ProviderStreamEventType.textDelta:
           final delta = event.delta ?? '';
           if (delta.isNotEmpty) {
             outputBuffer.write(delta);
-            onDelta?.call(delta);
+            onDelta?.call(delta, modelUsed);
           }
           break;
         case ProviderStreamEventType.done:
@@ -2072,6 +1946,7 @@ Future<_ReplStreamTurnResult> _runReplTurnCollectStream(
             _ReplStreamTurnResult(
               success: true,
               output: (event.output ?? outputBuffer.toString()),
+              modelUsed: event.model ?? modelUsed,
             ),
           );
           break;
@@ -2081,6 +1956,7 @@ Future<_ReplStreamTurnResult> _runReplTurnCollectStream(
             _ReplStreamTurnResult(
               success: false,
               output: output,
+              modelUsed: event.model ?? modelUsed,
             ),
           );
           break;
@@ -2091,6 +1967,7 @@ Future<_ReplStreamTurnResult> _runReplTurnCollectStream(
         _ReplStreamTurnResult(
           success: false,
           output: '[ERROR] provider stream failed: $error',
+          modelUsed: modelUsed,
         ),
       );
     },
@@ -2100,12 +1977,19 @@ Future<_ReplStreamTurnResult> _runReplTurnCollectStream(
       }
       final collected = outputBuffer.toString();
       if (collected.isNotEmpty) {
-        complete(_ReplStreamTurnResult(success: true, output: collected));
+        complete(
+          _ReplStreamTurnResult(
+            success: true,
+            output: collected,
+            modelUsed: modelUsed,
+          ),
+        );
       } else {
         complete(
-          const _ReplStreamTurnResult(
+          _ReplStreamTurnResult(
             success: false,
             output: '[ERROR] provider stream ended unexpectedly',
+            modelUsed: modelUsed,
           ),
         );
       }
@@ -2122,6 +2006,7 @@ Future<_ReplStreamTurnResult> _runReplTurnCollectStream(
             success: false,
             output: outputBuffer.toString(),
             interrupted: true,
+            modelUsed: modelUsed,
           ),
         );
         unawaited(streamSub.cancel());
@@ -2147,33 +2032,108 @@ String _renderProviderErrorOutput(ProviderStreamEvent event) {
   return event.error?.message ?? '[ERROR] provider stream failed';
 }
 
-Future<int> _runReplTurnJson(
+Future<_ReplStreamTurnResult> _runReplTurnJson(
   QueryEngine engine,
-  String prompt, {
-  String? model,
-}) async {
-  final loop = QueryLoop(engine);
-  final result = await loop.run(
-    prompt: prompt,
-    maxTurns: 1,
-    streamJson: true,
-    model: model,
+  QueryRequest request,
+) async {
+  print(
+    jsonEncode(
+      QueryEvent(type: QueryEventType.turnStart, turn: 1).toJson(),
+    ),
   );
-  return result.success ? 0 : 1;
+
+  final result = await _runReplTurnCollectStream(
+    engine,
+    request,
+    allowInterrupt: stdin.hasTerminal,
+    onDelta: (delta, modelUsed) {
+      print(
+        jsonEncode(
+          QueryEvent(
+            type: QueryEventType.providerDelta,
+            turn: 1,
+            delta: delta,
+            model: modelUsed,
+          ).toJson(),
+        ),
+      );
+    },
+  );
+
+  if (result.success) {
+    print(
+      jsonEncode(
+        QueryEvent(
+          type: QueryEventType.assistant,
+          turn: 1,
+          output: result.output,
+          model: result.modelUsed ?? request.model,
+        ).toJson(),
+      ),
+    );
+    print(
+      jsonEncode(
+        QueryEvent(
+          type: QueryEventType.done,
+          turns: 1,
+          output: result.output,
+          model: result.modelUsed ?? request.model,
+          status: 'ok',
+        ).toJson(),
+      ),
+    );
+    return result;
+  }
+
+  if (result.interrupted) {
+    print(
+      jsonEncode(
+        QueryEvent(
+          type: QueryEventType.done,
+          turns: 1,
+          output: result.output,
+          model: result.modelUsed ?? request.model,
+          status: 'ok',
+        ).toJson(),
+      ),
+    );
+    return result;
+  }
+
+  print(
+    jsonEncode(
+      QueryEvent(
+        type: QueryEventType.error,
+        turn: 1,
+        output: result.output,
+        model: result.modelUsed ?? request.model,
+      ).toJson(),
+    ),
+  );
+  print(
+    jsonEncode(
+      QueryEvent(
+        type: QueryEventType.done,
+        turns: 1,
+        output: result.output,
+        model: result.modelUsed ?? request.model,
+        status: 'error',
+      ).toJson(),
+    ),
+  );
+  return result;
 }
 
-Future<int> _runReplTurnStreamText(
+Future<_ReplStreamTurnResult> _runReplTurnStreamText(
   QueryEngine engine,
-  String prompt, {
-  String? model,
-}) async {
+  QueryRequest request,
+) async {
   var printedAnyDelta = false;
   final result = await _runReplTurnCollectStream(
     engine,
-    prompt,
-    model: model,
+    request,
     allowInterrupt: stdin.hasTerminal,
-    onDelta: (delta) {
+    onDelta: (delta, modelUsed) {
       printedAnyDelta = true;
       stdout.write(delta);
     },
@@ -2183,7 +2143,7 @@ Future<int> _runReplTurnStreamText(
       stdout.write(result.output);
     }
     stdout.writeln('');
-    return 0;
+    return result;
   }
   if (result.interrupted) {
     if (!printedAnyDelta && result.output.isNotEmpty) {
@@ -2193,31 +2153,13 @@ Future<int> _runReplTurnStreamText(
       stdout.writeln('');
     }
     print('[interrupted] response cancelled');
-    return 0;
+    return result;
   }
   if (printedAnyDelta) {
     stdout.writeln('');
   }
   print(result.output);
-  return 1;
-}
-
-void _printReplHelp() {
-  print('Available REPL commands:');
-  print('/help     Show this help');
-  print('/init     Configure real LLM provider/api key');
-  print('/model    Show or switch current model');
-  print('/provider Show or switch current provider');
-  print('/status   Show current provider/model');
-  print('/clear    Clear terminal screen');
-  print('/exit     Exit REPL');
-  print('');
-  print('Input tips:');
-  print('- Plain UI: end line with \\ then Enter for newline');
-  print('- Rich UI: Ctrl+J inserts newline (true multiline composer)');
-  print('- Rich UI: Ctrl+P / Ctrl+N browse input history');
-  print('- Ctrl+C interrupts current streaming response');
-  print('- At prompt, press Ctrl+C twice to exit');
+  return result;
 }
 
 Future<int> _runToolCommand(CommandContext context) async {
@@ -2308,190 +2250,6 @@ ToolInvocation? _buildToolInvocation(String toolName, List<String> args) {
       );
     default:
       print('error: unknown tool "$toolName"');
-      return null;
-  }
-}
-
-Map<String, Object?> _readConfigJsonFile(String path) {
-  final file = File(path);
-  if (!file.existsSync()) {
-    return <String, Object?>{};
-  }
-  try {
-    final decoded = jsonDecode(file.readAsStringSync());
-    if (decoded is Map<String, dynamic>) {
-      return Map<String, Object?>.from(decoded);
-    }
-  } catch (_) {
-    // Keep auth/status resilient if config file is malformed.
-  }
-  return <String, Object?>{};
-}
-
-AppConfig _mergeConfigMapIntoAppConfig(
-    AppConfig current, Map<String, Object?> raw) {
-  final parsedProvider = _parseProviderKind(raw['provider'] as String?);
-  return current.copyWith(
-    provider: parsedProvider ?? current.provider,
-    model: raw['model'] as String? ?? current.model,
-    claudeApiKey: raw['claudeApiKey'] as String? ?? current.claudeApiKey,
-    claudeBaseUrl: raw['claudeBaseUrl'] as String? ?? current.claudeBaseUrl,
-    openAiApiKey: raw['openAiApiKey'] as String? ?? current.openAiApiKey,
-    openAiBaseUrl: raw['openAiBaseUrl'] as String? ?? current.openAiBaseUrl,
-  );
-}
-
-void _printProviderConfigSummary(AppConfig config) {
-  switch (config.provider) {
-    case ProviderKind.local:
-      print('auth=not required (local provider)');
-      break;
-    case ProviderKind.claude:
-      print(
-          'claude.baseUrl=${config.claudeBaseUrl ?? 'https://api.anthropic.com'}');
-      print('claude.apiKey=${_maskSecret(config.claudeApiKey)}');
-      break;
-    case ProviderKind.openai:
-      print(
-          'openai.baseUrl=${config.openAiBaseUrl ?? 'https://api.openai.com/v1'}');
-      print('openai.apiKey=${_maskSecret(config.openAiApiKey)}');
-      break;
-  }
-}
-
-String _maskSecret(String? value) {
-  final raw = value?.trim() ?? '';
-  if (raw.isEmpty) {
-    return '<missing>';
-  }
-  if (raw.length <= 6) {
-    return '*' * raw.length;
-  }
-  final visibleSuffix = raw.substring(raw.length - 4);
-  return '${'*' * (raw.length - 4)}$visibleSuffix';
-}
-
-class _InlineInitCommandParseResult {
-  const _InlineInitCommandParseResult({
-    this.provider,
-    this.apiKey,
-    this.baseUrl,
-    this.model,
-    this.error,
-  });
-
-  final ProviderKind? provider;
-  final String? apiKey;
-  final String? baseUrl;
-  final String? model;
-  final String? error;
-}
-
-_InlineInitCommandParseResult _parseInlineInitCommand(String input) {
-  final tokens = input.trim().split(RegExp(r'\s+'));
-  if (tokens.length < 3) {
-    return const _InlineInitCommandParseResult(
-      error:
-          'usage: /init <claude|openai> <apiKey> [baseUrl] [model]  (example: /init openai sk-xxx)',
-    );
-  }
-  final parsedProvider = _parseProviderKind(tokens[1]);
-  if (parsedProvider == null || parsedProvider == ProviderKind.local) {
-    return const _InlineInitCommandParseResult(
-      error: 'provider must be claude|openai',
-    );
-  }
-  final apiKey = tokens[2].trim();
-  if (apiKey.isEmpty) {
-    return const _InlineInitCommandParseResult(
-      error: 'api key cannot be empty',
-    );
-  }
-  final baseUrl = tokens.length >= 4 ? tokens[3].trim() : null;
-  final model = tokens.length >= 5 ? tokens.sublist(4).join(' ').trim() : null;
-  return _InlineInitCommandParseResult(
-    provider: parsedProvider,
-    apiKey: apiKey,
-    baseUrl: baseUrl?.isEmpty == true ? null : baseUrl,
-    model: model?.isEmpty == true ? null : model,
-  );
-}
-
-AppConfig saveProviderSetup({
-  required AppConfig current,
-  required ProviderKind provider,
-  required String apiKey,
-  String? baseUrl,
-  String? model,
-  String? configPath,
-}) {
-  if (provider == ProviderKind.local) {
-    throw ArgumentError.value(provider, 'provider', 'provider must be remote');
-  }
-  final trimmedKey = apiKey.trim();
-  if (trimmedKey.isEmpty) {
-    throw ArgumentError.value(apiKey, 'apiKey', 'api key cannot be empty');
-  }
-  final resolvedPath = configPath ??
-      current.configPath ??
-      defaultConfigPath(cwd: Directory.current.path);
-  final existing = _readConfigJsonFile(resolvedPath);
-  final next = Map<String, Object?>.from(existing);
-
-  next['provider'] = provider.name;
-  if (model != null && model.trim().isNotEmpty) {
-    next['model'] = model.trim();
-  }
-  if (provider == ProviderKind.claude) {
-    next['claudeApiKey'] = trimmedKey;
-    if (baseUrl != null && baseUrl.trim().isNotEmpty) {
-      next['claudeBaseUrl'] = baseUrl.trim();
-    }
-  } else {
-    next['openAiApiKey'] = trimmedKey;
-    if (baseUrl != null && baseUrl.trim().isNotEmpty) {
-      next['openAiBaseUrl'] = baseUrl.trim();
-    }
-  }
-
-  final file = File(resolvedPath);
-  file.parent.createSync(recursive: true);
-  file.writeAsStringSync(
-    const JsonEncoder.withIndent('  ').convert(next),
-  );
-
-  return _mergeConfigMapIntoAppConfig(
-    current.copyWith(configPath: resolvedPath),
-    next,
-  ).copyWith(configPath: resolvedPath);
-}
-
-String? buildProviderSetupHint(AppConfig config) {
-  switch (config.provider) {
-    case ProviderKind.local:
-      return 'Not configured for real LLM. Run /init or clart_code init.';
-    case ProviderKind.claude:
-      if (config.claudeApiKey?.trim().isEmpty ?? true) {
-        return 'Claude is not configured (missing API key). Run /init or clart_code init.';
-      }
-      return null;
-    case ProviderKind.openai:
-      if (config.openAiApiKey?.trim().isEmpty ?? true) {
-        return 'OpenAI is not configured (missing API key). Run /init or clart_code init.';
-      }
-      return null;
-  }
-}
-
-ProviderKind? _parseProviderKind(String? value) {
-  switch (value?.trim()) {
-    case 'local':
-      return ProviderKind.local;
-    case 'claude':
-      return ProviderKind.claude;
-    case 'openai':
-      return ProviderKind.openai;
-    default:
       return null;
   }
 }

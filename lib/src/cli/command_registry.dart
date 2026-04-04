@@ -1,6 +1,7 @@
 import '../core/app_config.dart';
-import '../core/models.dart';
+import '../core/process_user_input.dart';
 import '../core/query_engine.dart';
+import '../core/prompt_submitter.dart';
 
 typedef CommandHandler = Future<int> Function(CommandContext context);
 
@@ -44,9 +45,17 @@ Future<int> runChatLikeCommand(CommandContext context) async {
     return 2;
   }
 
-  final response = await context.engine.run(
-    QueryRequest(messages: [ChatMessage(role: MessageRole.user, text: input)]),
+  final submission = PromptSubmitter().submit(
+    input,
+    model: context.config.model,
   );
+  final processed = const UserInputProcessor().process(submission);
+  if (!processed.isQuery) {
+    print('error: chat only accepts plain prompt text');
+    return 2;
+  }
+
+  final response = await context.engine.run(processed.request!);
   print(response.output);
   return response.isOk ? 0 : 1;
 }

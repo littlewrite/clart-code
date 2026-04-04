@@ -1,6 +1,9 @@
 import 'dart:convert';
 
+import 'conversation_session.dart';
 import 'models.dart';
+import 'process_user_input.dart';
+import 'prompt_submitter.dart';
 import 'query_events.dart';
 import 'query_engine.dart';
 import 'runtime_error.dart';
@@ -22,6 +25,12 @@ class QueryLoopResult {
   final String? modelUsed;
 }
 
+typedef ContinuationPromptBuilder = String? Function(
+  QueryResponse response,
+  int completedTurn,
+  List<ChatMessage> transcript,
+);
+
 class QueryLoop {
   QueryLoop(this.engine);
 
@@ -32,11 +41,26 @@ class QueryLoop {
     int maxTurns = 1,
     bool streamJson = false,
     String? model,
+    ContinuationPromptBuilder? continuationPromptBuilder,
     void Function(QueryEvent event)? onEvent,
   }) async {
-    final messages = <ChatMessage>[
-      ChatMessage(role: MessageRole.user, text: prompt)
-    ];
+    final conversation = ConversationSession();
+    final submitter = PromptSubmitter(conversation: conversation);
+    var pendingSubmission = submitter.submit(
+      prompt,
+      model: model,
+    );
+    final inputProcessor = const UserInputProcessor();
+    var pendingInput = inputProcessor.process(pendingSubmission);
+    if (!pendingInput.isQuery) {
+      return QueryLoopResult(
+        turns: 0,
+        lastOutput: '[ERROR] loop only accepts plain prompt text',
+        success: false,
+        status: 'error',
+        modelUsed: model,
+      );
+    }
 
     var turns = 0;
     var lastOutput = '';
@@ -53,7 +77,7 @@ class QueryLoop {
       );
 
       final request = QueryRequest(
-        messages: List<ChatMessage>.from(messages),
+        messages: List<ChatMessage>.from(pendingInput.request!.messages),
         maxTurns: normalizedMaxTurns,
         model: model,
       );
@@ -69,8 +93,9 @@ class QueryLoop {
       lastModelUsed = response.modelUsed ?? lastModelUsed;
 
       if (response.isOk) {
-        messages.add(
-          ChatMessage(role: MessageRole.assistant, text: response.output),
+        conversation.recordTurn(
+          prompt: pendingInput.submission.raw,
+          output: response.output,
         );
 
         _emit(
@@ -103,14 +128,25 @@ class QueryLoop {
         break;
       }
 
-      // Placeholder continuation strategy for migration stage:
-      // use a synthetic user message to keep a runnable multi-turn loop.
-      messages.add(
-        const ChatMessage(
-          role: MessageRole.user,
-          text: '[AUTO_CONTINUE] continue',
-        ),
+      final nextPrompt = continuationPromptBuilder?.call(
+        response,
+        turn,
+        conversation.history,
       );
+      if (nextPrompt == null || nextPrompt.trim().isEmpty) {
+        break;
+      }
+
+      pendingSubmission = submitter.submit(
+        nextPrompt,
+        model: model,
+      );
+      pendingInput = inputProcessor.process(pendingSubmission);
+      if (!pendingInput.isQuery) {
+        success = false;
+        lastOutput = '[ERROR] continuation prompt must be plain query text';
+        break;
+      }
     }
 
     _emit(
