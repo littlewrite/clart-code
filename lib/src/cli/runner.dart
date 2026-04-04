@@ -1084,6 +1084,102 @@ class _RichInputEvent {
   final bool hadDraft;
 }
 
+class RichTranscriptViewport {
+  const RichTranscriptViewport({
+    required this.visibleLines,
+    required this.topLine,
+    required this.maxTopLine,
+    required this.viewportRows,
+  });
+
+  final List<String> visibleLines;
+  final int topLine;
+  final int maxTopLine;
+  final int viewportRows;
+
+  bool get canScrollUp => topLine > 0;
+
+  bool get canScrollDown => topLine < maxTopLine;
+
+  bool get isAtBottom => topLine >= maxTopLine;
+
+  int get hiddenLinesAbove => topLine;
+
+  int get hiddenLinesBelow => max(0, maxTopLine - topLine);
+}
+
+RichTranscriptViewport buildRichTranscriptViewport(
+  List<String> lines,
+  int viewportRows, {
+  int? topLine,
+}) {
+  final effectiveViewportRows = max(1, viewportRows);
+  final maxTopLine = max(0, lines.length - effectiveViewportRows);
+  final effectiveTopLine = (topLine ?? maxTopLine).clamp(0, maxTopLine);
+  final end = min(lines.length, effectiveTopLine + effectiveViewportRows);
+  return RichTranscriptViewport(
+    visibleLines: lines.sublist(effectiveTopLine, end),
+    topLine: effectiveTopLine,
+    maxTopLine: maxTopLine,
+    viewportRows: effectiveViewportRows,
+  );
+}
+
+enum _RichTranscriptScrollAction { pageUp, pageDown }
+
+class _RichTranscriptScrollState {
+  int? _topLine;
+
+  bool get isPinnedToBottom => _topLine == null;
+
+  void pinToBottom() {
+    _topLine = null;
+  }
+
+  RichTranscriptViewport viewFor(
+    List<String> lines,
+    int viewportRows,
+  ) {
+    return buildRichTranscriptViewport(
+      lines,
+      viewportRows,
+      topLine: _topLine,
+    );
+  }
+
+  bool applyAction(
+    _RichTranscriptScrollAction action,
+    List<String> lines,
+    int viewportRows,
+  ) {
+    final view = viewFor(lines, viewportRows);
+    final pageSize = max(1, viewportRows - 1);
+    switch (action) {
+      case _RichTranscriptScrollAction.pageUp:
+        if (!view.canScrollUp && view.maxTopLine == 0) {
+          return false;
+        }
+        _topLine = max(0, view.topLine - pageSize);
+        return _topLine != view.topLine;
+      case _RichTranscriptScrollAction.pageDown:
+        if (!view.canScrollDown) {
+          if (isPinnedToBottom) {
+            return false;
+          }
+          _topLine = null;
+          return true;
+        }
+        final nextTopLine = min(view.maxTopLine, view.topLine + pageSize);
+        if (nextTopLine >= view.maxTopLine) {
+          _topLine = null;
+          return true;
+        }
+        _topLine = nextTopLine;
+        return _topLine != view.topLine;
+    }
+  }
+}
+
 class RichComposerBuffer {
   RichComposerBuffer({String text = '', int? cursor})
       : _text = text,
@@ -1354,6 +1450,7 @@ Future<int> _runRichInteractiveRepl(
     );
   }
   final transcript = <_RichMessage>[];
+  final transcriptScroll = _RichTranscriptScrollState();
   final inputHistory = <String>[];
   var status = buildProviderSetupHint(session.config) ??
       (printIntro ? 'Ready. Type /help for commands.' : 'Ready.');
@@ -1371,6 +1468,7 @@ Future<int> _runRichInteractiveRepl(
         context,
         session,
         transcript,
+        transcriptScroll: transcriptScroll,
         status: status,
         history: inputHistory,
       );
@@ -1429,6 +1527,7 @@ Future<int> _runRichInteractiveRepl(
         status = 'Exiting.';
         break;
       }
+      transcriptScroll.pinToBottom();
 
       if (processed.kind == ProcessUserInputKind.invalid) {
         status = processed.status ?? 'Invalid input.';
@@ -1453,6 +1552,7 @@ Future<int> _runRichInteractiveRepl(
         final localResult = processed.localCommandResult!;
         if (localResult.clearTranscript) {
           transcript.clear();
+          transcriptScroll.pinToBottom();
         }
         session.conversation.appendTranscriptMessages(
           processed.transcriptMessages,
@@ -1484,6 +1584,7 @@ Future<int> _runRichInteractiveRepl(
         context,
         session,
         transcript,
+        transcriptScroll: transcriptScroll,
         status: status,
         inputBuffer: '',
         inputCursor: 0,
@@ -1510,6 +1611,7 @@ Future<int> _runRichInteractiveRepl(
             context,
             session,
             transcript,
+            transcriptScroll: transcriptScroll,
             status: 'Streaming response... (Ctrl+C to interrupt)',
             inputBuffer: '',
             inputCursor: 0,
@@ -1624,6 +1726,7 @@ _RichInputEvent _promptRichInput(
   CommandContext context,
   _ReplSessionState session,
   List<_RichMessage> transcript, {
+  required _RichTranscriptScrollState transcriptScroll,
   required String status,
   List<String> history = const [],
   bool maskInput = false,
@@ -1635,6 +1738,7 @@ _RichInputEvent _promptRichInput(
     context,
     session,
     transcript,
+    transcriptScroll: transcriptScroll,
     status: status,
     inputBuffer: draftInput,
     inputCursor: draftCursor,
@@ -1652,6 +1756,36 @@ _RichInputEvent _promptRichInput(
         context,
         session,
         transcript,
+        transcriptScroll: transcriptScroll,
+        status: status,
+        inputBuffer: draftInput,
+        inputCursor: draftCursor,
+      );
+    },
+    onTranscriptScroll: (action) {
+      final width = min(console.windowWidth, 140);
+      final inner = width - 2;
+      final transcriptRows = _computeRichTranscriptRows(
+        console,
+        session,
+        inputBuffer: draftInput,
+        inputCursor: draftCursor,
+      );
+      final lines = _buildRichTranscriptLines(transcript, inner);
+      final didScroll = transcriptScroll.applyAction(
+        action,
+        lines,
+        transcriptRows,
+      );
+      if (!didScroll) {
+        return;
+      }
+      _renderRichRepl(
+        console,
+        context,
+        session,
+        transcript,
+        transcriptScroll: transcriptScroll,
         status: status,
         inputBuffer: draftInput,
         inputCursor: draftCursor,
@@ -1666,6 +1800,7 @@ String _runRichInitWizard(
   _ReplSessionState session,
   List<_RichMessage> transcript,
 ) {
+  final transcriptScroll = _RichTranscriptScrollState();
   ProviderKind? selectedProvider;
   while (selectedProvider == null) {
     final remoteDefault = session.config.provider == ProviderKind.local
@@ -1676,6 +1811,7 @@ String _runRichInitWizard(
       context,
       session,
       transcript,
+      transcriptScroll: transcriptScroll,
       status: remoteDefault == null
           ? 'Init 1/4: provider (claude/openai). Ctrl+C cancels.'
           : 'Init 1/4: provider (claude/openai). Enter keeps ${remoteDefault.name}. Ctrl+C cancels.',
@@ -1716,6 +1852,7 @@ String _runRichInitWizard(
       context,
       session,
       transcript,
+      transcriptScroll: transcriptScroll,
       status: currentApiKey.isEmpty
           ? 'Init 2/4: API key for ${provider.name}. Input is masked. Ctrl+C cancels.'
           : 'Init 2/4: API key for ${provider.name}. Enter keeps current key. Input is masked. Ctrl+C cancels.',
@@ -1753,6 +1890,7 @@ String _runRichInitWizard(
     context,
     session,
     transcript,
+    transcriptScroll: transcriptScroll,
     status: currentBaseUrl?.isNotEmpty == true
         ? 'Init 3/4: base URL (optional). Enter keeps current: $currentBaseUrl'
         : 'Init 3/4: base URL (optional). Enter leaves default.',
@@ -1781,6 +1919,7 @@ String _runRichInitWizard(
     context,
     session,
     transcript,
+    transcriptScroll: transcriptScroll,
     status: currentModel?.isNotEmpty == true
         ? 'Init 4/4: model (optional). Enter keeps current: $currentModel'
         : 'Init 4/4: model (optional). Enter leaves provider default.',
@@ -1830,6 +1969,7 @@ void _renderRichRepl(
   CommandContext context,
   _ReplSessionState session,
   List<_RichMessage> transcript, {
+  required _RichTranscriptScrollState transcriptScroll,
   required String status,
   required String inputBuffer,
   required int inputCursor,
@@ -1852,9 +1992,8 @@ void _renderRichRepl(
   final transcriptRows = max(3, height - headerRows - footerRows);
 
   final lines = _buildRichTranscriptLines(transcript, inner);
-  final visible = lines.length > transcriptRows
-      ? lines.sublist(lines.length - transcriptRows)
-      : lines;
+  final transcriptView = transcriptScroll.viewFor(lines, transcriptRows);
+  final statusText = _buildRichStatusLine(status, transcriptView);
 
   console.clearScreen();
   console.cursorPosition = const Coordinate(0, 0);
@@ -1871,7 +2010,9 @@ void _renderRichRepl(
   _writeRow(console, headerBody.length + 2, '─' * width);
 
   for (var i = 0; i < transcriptRows; i++) {
-    final line = i < visible.length ? visible[i] : '';
+    final line = i < transcriptView.visibleLines.length
+        ? transcriptView.visibleLines[i]
+        : '';
     _writeRow(console, transcriptStart + i, _fitRow(line, width));
   }
 
@@ -1880,12 +2021,12 @@ void _renderRichRepl(
   _writeRow(
     console,
     statusRow + 1,
-    _fitRow('status: $status', width),
+    _fitRow('status: $statusText', width),
   );
   _writeRow(
     console,
     statusRow + 2,
-    '╭${_fillTitle('── Message (Enter=send, Ctrl+J=newline, paste multiline ok, Up/Down=cursor/history, Ctrl+P/N=history) ', inner)}╮',
+    '╭${_fillTitle('── Message (Enter=send, Ctrl+J=newline, PgUp/PgDn=scroll, Up/Down=cursor/history, Ctrl+P/N=history) ', inner)}╮',
   );
   for (var i = 0; i < composerView.visibleLines.length; i++) {
     final prefix = i == composerView.cursorRow ? ' > ' : '   ';
@@ -1903,6 +2044,40 @@ void _renderRichRepl(
   final cursorRow = statusRow + 3 + composerView.cursorRow;
   final cursorCol = min(width - 2, 4 + composerView.cursorCol);
   console.cursorPosition = Coordinate(cursorRow, cursorCol);
+}
+
+int _computeRichTranscriptRows(
+  Console console,
+  _ReplSessionState session, {
+  required String inputBuffer,
+  required int inputCursor,
+}) {
+  final width = min(console.windowWidth, 140);
+  final inner = width - 2;
+  final headerBody = _buildRichHeaderBody(session, inner);
+  final composerInnerWidth = max(8, inner - 4);
+  final composerView = buildRichComposerView(
+    inputBuffer,
+    inputCursor,
+    composerInnerWidth,
+    maxLines: 6,
+  );
+  final headerRows = headerBody.length + 3;
+  final footerRows = 4 + composerView.visibleLines.length;
+  return max(3, console.windowHeight - headerRows - footerRows);
+}
+
+String _buildRichStatusLine(
+  String status,
+  RichTranscriptViewport view,
+) {
+  if (view.maxTopLine == 0) {
+    return status;
+  }
+  if (view.isAtBottom) {
+    return '$status · PgUp/PgDn scroll';
+  }
+  return '$status · above=${view.hiddenLinesAbove} below=${view.hiddenLinesBelow} · PgDn follows live';
 }
 
 List<String> _buildRichHeaderBody(_ReplSessionState session, int innerWidth) {
@@ -1979,6 +2154,7 @@ _RichInputEvent _readRichInput(
   required List<String> history,
   String Function(String draft)? displayTransform,
   required void Function(String draft, int cursor) onDraftChanged,
+  void Function(_RichTranscriptScrollAction action)? onTranscriptScroll,
 }) {
   final draft = RichComposerBuffer();
   final utf8Decoder = RichInputUtf8Decoder();
@@ -2146,6 +2322,12 @@ _RichInputEvent _readRichInput(
               continue;
             case ControlCharacter.ctrlN:
               moveHistoryDown();
+              continue;
+            case ControlCharacter.pageUp:
+              onTranscriptScroll?.call(_RichTranscriptScrollAction.pageUp);
+              continue;
+            case ControlCharacter.pageDown:
+              onTranscriptScroll?.call(_RichTranscriptScrollAction.pageDown);
               continue;
             case ControlCharacter.tab:
               if (draft.insert('\t')) {

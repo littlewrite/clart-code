@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:dart_console/dart_console.dart';
 import 'package:clart_code/clart_code.dart';
 import 'package:clart_code/src/cli/repl_command_dispatcher.dart';
 import 'package:clart_code/src/cli/workspace_store.dart';
@@ -1405,6 +1406,32 @@ void main() {
     expect(view.cursorCol, 2);
   });
 
+  test('buildRichTranscriptViewport pins to bottom by default', () {
+    final view = buildRichTranscriptViewport(
+      List<String>.generate(10, (index) => 'line $index'),
+      3,
+    );
+
+    expect(view.visibleLines, ['line 7', 'line 8', 'line 9']);
+    expect(view.topLine, 7);
+    expect(view.maxTopLine, 7);
+    expect(view.isAtBottom, true);
+    expect(view.canScrollUp, true);
+    expect(view.canScrollDown, false);
+  });
+
+  test('buildRichTranscriptViewport clamps explicit top line', () {
+    final view = buildRichTranscriptViewport(
+      List<String>.generate(10, (index) => 'line $index'),
+      4,
+      topLine: 99,
+    );
+
+    expect(view.visibleLines, ['line 6', 'line 7', 'line 8', 'line 9']);
+    expect(view.topLine, 6);
+    expect(view.maxTopLine, 6);
+  });
+
   test('rich input utf8 decoder reconstructs chinese chars from bytes', () {
     final decoder = RichInputUtf8Decoder();
 
@@ -1436,6 +1463,14 @@ void main() {
 
     expect(token.kind, RichInputTokenKind.paste);
     expect(token.text, 'line1\nline2\nline3');
+  });
+
+  test('rich input parser decodes page up and page down', () {
+    final pageUp = parseRichInputBytesForTest([0x1B, 0x5B, 0x35, 0x7E]);
+    final pageDown = parseRichInputBytesForTest([0x1B, 0x5B, 0x36, 0x7E]);
+
+    expect(pageUp.controlChar, ControlCharacter.pageUp);
+    expect(pageDown.controlChar, ControlCharacter.pageDown);
   });
 
   test('rich input parser decodes utf8 printable chars', () {
