@@ -1,7 +1,10 @@
 import '../core/app_config.dart';
+import '../core/models.dart';
 import '../core/process_user_input.dart';
 import '../core/query_engine.dart';
 import '../core/prompt_submitter.dart';
+import '../core/turn_executor.dart';
+import 'workspace_store.dart';
 
 typedef CommandHandler = Future<int> Function(CommandContext context);
 
@@ -55,7 +58,31 @@ Future<int> runChatLikeCommand(CommandContext context) async {
     return 2;
   }
 
-  final response = await context.engine.run(processed.request!);
-  print(response.output);
-  return response.isOk ? 0 : 1;
+  final result = await TurnExecutor(context.engine).execute(
+    request: processed.request!,
+    turn: 1,
+  );
+  final sessionId = createWorkspaceSessionId();
+  final transcript = [
+    ...processed.transcriptMessages,
+    ...result.transcriptMessages,
+  ];
+  final history = result.success || result.interrupted
+      ? processed.request!.messages.followedBy([
+          if (result.displayOutput.isNotEmpty)
+            ChatMessage(
+                role: MessageRole.assistant, text: result.displayOutput),
+        ]).toList()
+      : processed.request!.messages;
+  writeWorkspaceSession(
+    buildWorkspaceSessionSnapshot(
+      id: sessionId,
+      provider: context.config.provider.name,
+      model: context.config.model,
+      history: history,
+      transcript: transcript,
+    ),
+  );
+  print(result.output);
+  return result.success ? 0 : 1;
 }

@@ -1,8 +1,10 @@
-import 'dart:io';
-
 import '../core/app_config.dart';
 import '../core/process_user_input.dart';
+import '../core/transcript.dart';
+import 'git_workspace.dart';
+import 'local_reports.dart';
 import 'provider_setup.dart';
+import 'workspace_store.dart';
 
 abstract interface class ReplCommandSession {
   AppConfig get config;
@@ -20,27 +22,43 @@ LocalCommandResult? executeReplSlashCommand(
     return const LocalCommandResult(
       status: 'Displayed help.',
       messages: [
-        TranscriptMessage.system('Available REPL commands:'),
-        TranscriptMessage.system('/help     Show this help'),
-        TranscriptMessage.system(
+        TranscriptMessage.localCommandStdout('Available REPL commands:'),
+        TranscriptMessage.localCommandStdout('/help     Show this help'),
+        TranscriptMessage.localCommandStdout(
             '/init     Configure real LLM provider/api key'),
-        TranscriptMessage.system('/model    Show or switch current model'),
-        TranscriptMessage.system('/provider Show or switch current provider'),
-        TranscriptMessage.system('/status   Show current provider/model'),
-        TranscriptMessage.system(
+        TranscriptMessage.localCommandStdout(
+            '/model    Show or switch current model'),
+        TranscriptMessage.localCommandStdout(
+            '/provider Show or switch current provider'),
+        TranscriptMessage.localCommandStdout(
+            '/status   Show current provider/model'),
+        TranscriptMessage.localCommandStdout(
+            '/doctor   Show workspace/provider diagnostics'),
+        TranscriptMessage.localCommandStdout(
+            '/diff     Show current git workspace summary'),
+        TranscriptMessage.localCommandStdout('/memory   Show workspace memory'),
+        TranscriptMessage.localCommandStdout('/tasks    Show workspace tasks'),
+        TranscriptMessage.localCommandStdout(
+            '/permissions Show default tool permission mode'),
+        TranscriptMessage.localCommandStdout(
+            '/mcp      Show local MCP server registry'),
+        TranscriptMessage.localCommandStdout(
+            '/session  Show current active session snapshot'),
+        TranscriptMessage.localCommandStdout(
             '/clear    Clear terminal screen / transcript'),
-        TranscriptMessage.system('/exit     Exit REPL'),
-        TranscriptMessage.system(''),
-        TranscriptMessage.system('Input tips:'),
-        TranscriptMessage.system(
+        TranscriptMessage.localCommandStdout('/exit     Exit REPL'),
+        TranscriptMessage.localCommandStdout(''),
+        TranscriptMessage.localCommandStdout('Input tips:'),
+        TranscriptMessage.localCommandStdout(
             '- Plain UI: end line with \\ then Enter for newline'),
-        TranscriptMessage.system(
+        TranscriptMessage.localCommandStdout(
             '- Rich UI: Ctrl+J inserts newline (true multiline composer)'),
-        TranscriptMessage.system(
+        TranscriptMessage.localCommandStdout(
             '- Rich UI: Ctrl+P / Ctrl+N browse input history'),
-        TranscriptMessage.system(
+        TranscriptMessage.localCommandStdout(
             '- Ctrl+C interrupts current streaming response'),
-        TranscriptMessage.system('- At prompt, press Ctrl+C twice to exit'),
+        TranscriptMessage.localCommandStdout(
+            '- At prompt, press Ctrl+C twice to exit'),
       ],
     );
   }
@@ -48,7 +66,7 @@ LocalCommandResult? executeReplSlashCommand(
     return const LocalCommandResult(
       status: 'Displayed /init usage.',
       messages: [
-        TranscriptMessage.system(
+        TranscriptMessage.localCommandStdout(
           'usage: /init <claude|openai> <apiKey> [baseUrl] [model]  (or run: clart_code init)',
         ),
       ],
@@ -60,37 +78,32 @@ LocalCommandResult? executeReplSlashCommand(
       return LocalCommandResult(
         status: parsed.error!,
         messages: [
-          TranscriptMessage.system(parsed.error!),
+          TranscriptMessage.localCommandStderr(parsed.error!),
         ],
       );
     }
-    final nextConfig = saveProviderSetup(
+    final applied = applyProviderSetup(
       current: session.config,
       provider: parsed.provider!,
       apiKey: parsed.apiKey!,
       baseUrl: parsed.baseUrl,
       model: parsed.model,
     );
-    session.config = nextConfig;
-    final hint = buildProviderSetupHint(session.config);
-    final lines = <String>[
-      'configured ${parsed.provider!.name} -> ${nextConfig.configPath ?? defaultConfigPath(cwd: Directory.current.path)}',
-    ];
-    if (parsed.model != null && parsed.model!.trim().isNotEmpty) {
-      lines.add('model switched to ${session.config.model}');
-    }
-    lines.add(hint == null ? 'init complete.' : 'hint: $hint');
+    session.config = applied.config;
     return LocalCommandResult(
-      status: hint ?? 'Initialized provider config.',
-      messages: lines.map(TranscriptMessage.system).toList(),
+      status: applied.status,
+      messages:
+          applied.lines.map(TranscriptMessage.localCommandStdout).toList(),
     );
   }
   if (input == '/model') {
     return LocalCommandResult(
       status: 'Displayed model.',
       messages: [
-        TranscriptMessage.system('provider=${session.config.provider.name}'),
-        TranscriptMessage.system('model=${session.config.model ?? 'default'}'),
+        TranscriptMessage.localCommandStdout(
+            'provider=${session.config.provider.name}'),
+        TranscriptMessage.localCommandStdout(
+            'model=${session.config.model ?? 'default'}'),
       ],
     );
   }
@@ -100,7 +113,7 @@ LocalCommandResult? executeReplSlashCommand(
       return const LocalCommandResult(
         status: 'usage: /model <name>',
         messages: [
-          TranscriptMessage.system('usage: /model <name>'),
+          TranscriptMessage.localCommandStderr('usage: /model <name>'),
         ],
       );
     }
@@ -108,7 +121,7 @@ LocalCommandResult? executeReplSlashCommand(
     return LocalCommandResult(
       status: 'Model switched.',
       messages: [
-        TranscriptMessage.system('model switched to $requested'),
+        TranscriptMessage.localCommandStdout('model switched to $requested'),
       ],
     );
   }
@@ -123,7 +136,7 @@ LocalCommandResult? executeReplSlashCommand(
     }
     return LocalCommandResult(
       status: 'Displayed provider.',
-      messages: lines.map(TranscriptMessage.system).toList(),
+      messages: lines.map(TranscriptMessage.localCommandStdout).toList(),
     );
   }
   if (input.startsWith('/provider ')) {
@@ -133,7 +146,8 @@ LocalCommandResult? executeReplSlashCommand(
       return const LocalCommandResult(
         status: 'usage: /provider local|claude|openai',
         messages: [
-          TranscriptMessage.system('usage: /provider local|claude|openai'),
+          TranscriptMessage.localCommandStderr(
+              'usage: /provider local|claude|openai'),
         ],
       );
     }
@@ -148,16 +162,104 @@ LocalCommandResult? executeReplSlashCommand(
     }
     return LocalCommandResult(
       status: hint ?? 'Provider switched.',
-      messages: lines.map(TranscriptMessage.system).toList(),
+      messages: lines.map(TranscriptMessage.localCommandStdout).toList(),
     );
   }
   if (input == '/status') {
     return LocalCommandResult(
       status: 'Displayed status.',
       messages: [
-        TranscriptMessage.system('provider=${session.config.provider.name}'),
-        TranscriptMessage.system('model=${session.config.model ?? 'default'}'),
+        TranscriptMessage.localCommandStdout(
+            'provider=${session.config.provider.name}'),
+        TranscriptMessage.localCommandStdout(
+            'model=${session.config.model ?? 'default'}'),
       ],
+    );
+  }
+  if (input == '/doctor') {
+    return LocalCommandResult(
+      status: 'Displayed doctor report.',
+      messages: buildDoctorReportLines(session.config)
+          .map(TranscriptMessage.localCommandStdout)
+          .toList(),
+    );
+  }
+  if (input == '/diff') {
+    final gitState = readGitWorkspaceStateSync();
+    return LocalCommandResult(
+      status: 'Displayed diff summary.',
+      messages: renderGitWorkspaceSummary(
+        gitState,
+        includePatch: false,
+        includeUntrackedPreview: true,
+      ).split('\n').map(TranscriptMessage.localCommandStdout).toList(),
+    );
+  }
+  if (input == '/memory') {
+    final memory = readWorkspaceMemory();
+    return LocalCommandResult(
+      status: 'Displayed workspace memory.',
+      messages: [
+        TranscriptMessage.localCommandStdout(
+          memory.isEmpty ? '[empty-memory]' : memory,
+        ),
+      ],
+    );
+  }
+  if (input == '/tasks') {
+    final tasks = readWorkspaceTasks();
+    final lines = tasks.isEmpty
+        ? const ['[no-tasks]']
+        : tasks
+            .map(
+                (task) => '[${task.done ? 'x' : ' '}] #${task.id} ${task.text}')
+            .toList();
+    return LocalCommandResult(
+      status: 'Displayed workspace tasks.',
+      messages: lines.map(TranscriptMessage.localCommandStdout).toList(),
+    );
+  }
+  if (input == '/permissions') {
+    final mode = readDefaultToolPermissionMode();
+    return LocalCommandResult(
+      status: 'Displayed permissions.',
+      messages: [
+        TranscriptMessage.localCommandStdout(
+            'permissions.default=${mode.name}'),
+      ],
+    );
+  }
+  if (input == '/mcp') {
+    final servers = readWorkspaceMcpServers();
+    final lines = servers.isEmpty
+        ? const ['[no-mcp-servers]']
+        : servers
+            .map(
+              (server) =>
+                  '${server.name}\t${server.transport}\t${server.target}',
+            )
+            .toList();
+    return LocalCommandResult(
+      status: 'Displayed MCP servers.',
+      messages: lines.map(TranscriptMessage.localCommandStdout).toList(),
+    );
+  }
+  if (input == '/session') {
+    final sessionId = readActiveWorkspaceSessionId();
+    final snapshot = sessionId == null ? null : readWorkspaceSession(sessionId);
+    final lines = snapshot == null
+        ? const ['[no-active-session]']
+        : [
+            'id=${snapshot.id}',
+            'title=${snapshot.title}',
+            'provider=${snapshot.provider}',
+            'model=${snapshot.model ?? 'default'}',
+            'history.messages=${snapshot.history.length}',
+            'transcript.messages=${snapshot.transcript.length}',
+          ];
+    return LocalCommandResult(
+      status: 'Displayed session.',
+      messages: lines.map(TranscriptMessage.localCommandStdout).toList(),
     );
   }
   if (input == '/clear') {
@@ -166,6 +268,7 @@ LocalCommandResult? executeReplSlashCommand(
       status: 'Transcript cleared.',
       clearScreen: true,
       clearTranscript: true,
+      recordCommandInput: false,
     );
   }
   return null;

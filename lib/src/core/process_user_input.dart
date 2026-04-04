@@ -1,32 +1,9 @@
 import 'input_processor.dart';
 import 'models.dart';
 import 'prompt_submitter.dart';
+import 'transcript.dart';
 
 enum ProcessUserInputKind { ignore, exit, localCommand, query, invalid }
-
-enum TranscriptMessageKind { user, assistant, system, localCommand }
-
-class TranscriptMessage {
-  const TranscriptMessage._({
-    required this.kind,
-    required this.text,
-  });
-
-  const TranscriptMessage.user(String text)
-      : this._(kind: TranscriptMessageKind.user, text: text);
-
-  const TranscriptMessage.assistant(String text)
-      : this._(kind: TranscriptMessageKind.assistant, text: text);
-
-  const TranscriptMessage.system(String text)
-      : this._(kind: TranscriptMessageKind.system, text: text);
-
-  const TranscriptMessage.localCommand(String text)
-      : this._(kind: TranscriptMessageKind.localCommand, text: text);
-
-  final TranscriptMessageKind kind;
-  final String text;
-}
 
 class LocalCommandResult {
   const LocalCommandResult({
@@ -34,12 +11,14 @@ class LocalCommandResult {
     this.messages = const [],
     this.clearScreen = false,
     this.clearTranscript = false,
+    this.recordCommandInput = true,
   });
 
   final String status;
   final List<TranscriptMessage> messages;
   final bool clearScreen;
   final bool clearTranscript;
+  final bool recordCommandInput;
 }
 
 typedef SlashCommandExecutor = LocalCommandResult? Function(
@@ -84,7 +63,11 @@ class ProcessUserInputResult {
       kind: ProcessUserInputKind.localCommand,
       submission: submission,
       localCommandResult: localCommandResult,
-      transcriptMessages: localCommandResult.messages,
+      transcriptMessages: [
+        if (localCommandResult.recordCommandInput)
+          TranscriptMessage.localCommand(submission.raw),
+        ...localCommandResult.messages,
+      ],
       status: localCommandResult.status,
     );
   }
@@ -98,7 +81,7 @@ class ProcessUserInputResult {
       submission: submission,
       request: request,
       transcriptMessages: [
-        TranscriptMessage.user(submission.raw),
+        TranscriptMessage.userPrompt(submission.raw),
       ],
     );
   }
@@ -107,13 +90,18 @@ class ProcessUserInputResult {
     required PromptSubmission submission,
     required String errorText,
   }) {
+    final isSlashCommand = submission.kind == ParsedInputKind.slashCommand;
     return ProcessUserInputResult._(
       kind: ProcessUserInputKind.invalid,
       submission: submission,
       errorText: errorText,
       status: errorText,
       transcriptMessages: [
-        TranscriptMessage.system(errorText),
+        if (isSlashCommand) TranscriptMessage.localCommand(submission.raw),
+        if (isSlashCommand)
+          TranscriptMessage.localCommandStderr(errorText)
+        else
+          TranscriptMessage.system(errorText),
       ],
     );
   }

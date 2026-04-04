@@ -58,13 +58,28 @@
 - 最小多轮循环：`loop --max-turns N <prompt>`（迭代占位策略为自动续轮）。
 - provider 级流事件输出：`loop --stream-json ...`（json lines）。
 - Tool 平台最小版：`ToolExecutor + ToolScheduler`（串行调度）。
-- Tool 权限最小版：`ToolPermissionPolicy`（allow/deny）。
+- Tool 权限最小版：`ToolPermissionPolicy`（allow/deny）+ 工作区默认权限持久化。
 - 基础工具：`read`、`write`、`shell(stub)`。
 - CLI 工具入口：`tool` 命令（可直接验证工具链路）。
+- workspace 辅助命令最小版：
+  - `doctor`：输出工作区/配置/权限/MCP/任务/记忆/git 诊断
+  - `memory`：读写 `./.clart/memory.md`
+  - `tasks`：读写 `./.clart/tasks.json`
+  - `permissions`：持久化默认 tool permission（`./.clart/permissions.json`）
+  - `export`：导出 workspace snapshot JSON
+  - `mcp`：管理本地 MCP server 注册表（`./.clart/mcp_servers.json`）
+  - `diff`：查看当前 git working tree 的最小 diff 摘要 / JSON
+  - `review`：基于当前 git diff 构造最小 code review prompt 并执行一轮
+- 本地 session 闭环最小版：
+  - `chat / repl / loop` 会写入 `./.clart/sessions/<id>.json`
+  - `review` 执行结果也会生成本地 session 快照
+  - `session`：列出/查看当前或指定 session
+  - `resume`：基于保存的 session 继续一轮 prompt
+  - `share`：把 session 导出为 Markdown/JSON
 - 启动体验最小版：`start`（trust gate + welcome panel）。
 - 无参数默认入口：进入 `start`，并在交互终端自动进入 REPL loop。
 - REPL 已支持流式输出：按 provider `textDelta` 增量回显到终端。
-- REPL 最小命令：`/help`、`/model`、`/provider`、`/status`、`/clear`、`/exit`。
+- REPL 最小命令：`/help`、`/model`、`/provider`、`/status`、`/doctor`、`/diff`、`/memory`、`/tasks`、`/permissions`、`/mcp`、`/session`、`/clear`、`/exit`。
 - REPL 支持 `--stream-json`（turn 级 json lines）。
 - REPL 运行期切换：`/model <name>` 与 `/provider <local|claude|openai>`。
 - REPL 初始化命令：`/init <claude|openai> <apiKey> [baseUrl] [model]`（最小内联配置，立即生效）。
@@ -101,13 +116,14 @@
 - 完整多轮 query 状态机、compact/token budget、完整 stream-json 协议。
 - tool 并发分组调度器（parallel-safe batch）与复杂工具上下文。
 - 高级终端渲染（复杂布局、快捷键、状态栏、滚动视图）。
-- task 系统与后台任务。
-- MCP 连接与资源/工具桥接。
+- task 系统与后台任务编排（当前仅本地 JSON 任务清单）。
+- MCP 真实连接与资源/工具桥接（当前仅本地注册表）。
+- 远程/后台/多分支 session 管理（当前仅本地快照 + active session）。
 - 复杂权限策略与 sandbox 集成。
 - 插件/skills/bridge/IDE 深度集成。
 
-## C. 当前状态快照（2026-04-03）
+## C. 当前状态快照（2026-04-04）
 
 - TS 侧：功能完备，模块庞大。
-- Dart 侧：已升级为“可运行迁移基座（Iteration 9.3 级别）”。
+- Dart 侧：已升级为“可运行迁移基座（Iteration 9.10 级别）”。
 - 迁移策略：继续按能力域增量落地，始终保持主程序可运行。

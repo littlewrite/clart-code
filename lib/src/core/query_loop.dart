@@ -6,8 +6,8 @@ import 'process_user_input.dart';
 import 'prompt_submitter.dart';
 import 'query_events.dart';
 import 'query_engine.dart';
-import 'runtime_error.dart';
-import '../providers/llm_provider.dart';
+import 'transcript.dart';
+import 'turn_executor.dart';
 
 class QueryLoopResult {
   const QueryLoopResult({
@@ -15,6 +15,8 @@ class QueryLoopResult {
     required this.lastOutput,
     required this.success,
     required this.status,
+    required this.history,
+    required this.transcript,
     this.modelUsed,
   });
 
@@ -23,6 +25,8 @@ class QueryLoopResult {
   final bool success;
   final String status;
   final String? modelUsed;
+  final List<ChatMessage> history;
+  final List<TranscriptMessage> transcript;
 }
 
 typedef ContinuationPromptBuilder = String? Function(
@@ -59,6 +63,8 @@ class QueryLoop {
         success: false,
         status: 'error',
         modelUsed: model,
+        history: const [],
+        transcript: const [],
       );
     }
 
@@ -66,61 +72,47 @@ class QueryLoop {
     var lastOutput = '';
     String? lastModelUsed;
     var success = true;
+    final executor = TurnExecutor(engine);
+    void emitEvent(QueryEvent event) => _emit(
+          streamJson,
+          event,
+          onEvent: onEvent,
+        );
 
     final normalizedMaxTurns = maxTurns < 1 ? 1 : maxTurns;
 
     for (var turn = 1; turn <= normalizedMaxTurns; turn++) {
-      _emit(
-        streamJson,
-        QueryEvent(type: QueryEventType.turnStart, turn: turn),
-        onEvent: onEvent,
-      );
-
       final request = QueryRequest(
         messages: List<ChatMessage>.from(pendingInput.request!.messages),
         maxTurns: normalizedMaxTurns,
         model: model,
       );
-      final response = await _runStreamTurn(
+      final turnResult = await executor.execute(
         request: request,
         turn: turn,
-        streamJson: streamJson,
-        onEvent: onEvent,
+        onEvent: emitEvent,
       );
+      final response = turnResult.toQueryResponse();
 
       turns = turn;
-      lastOutput = response.output;
-      lastModelUsed = response.modelUsed ?? lastModelUsed;
+      lastOutput = turnResult.output;
+      lastModelUsed = turnResult.modelUsed ?? lastModelUsed;
 
-      if (response.isOk) {
-        conversation.recordTurn(
+      if (turnResult.success) {
+        conversation.appendTranscriptMessages([
+          ...pendingInput.transcriptMessages,
+          ...turnResult.transcriptMessages,
+        ]);
+        conversation.recordHistoryTurn(
           prompt: pendingInput.submission.raw,
-          output: response.output,
-        );
-
-        _emit(
-          streamJson,
-          QueryEvent(
-            type: QueryEventType.assistant,
-            turn: turn,
-            output: response.output,
-            model: response.modelUsed,
-          ),
-          onEvent: onEvent,
+          output: turnResult.displayOutput,
         );
       } else {
+        conversation.appendTranscriptMessages([
+          ...pendingInput.transcriptMessages,
+          ...turnResult.transcriptMessages,
+        ]);
         success = false;
-        _emit(
-          streamJson,
-          QueryEvent(
-            type: QueryEventType.error,
-            turn: turn,
-            error: response.error,
-            output: response.output,
-            model: response.modelUsed,
-          ),
-          onEvent: onEvent,
-        );
         break;
       }
 
@@ -167,89 +159,8 @@ class QueryLoop {
       success: success,
       status: success ? 'ok' : 'error',
       modelUsed: lastModelUsed,
-    );
-  }
-
-  Future<QueryResponse> _runStreamTurn({
-    required QueryRequest request,
-    required int turn,
-    required bool streamJson,
-    void Function(QueryEvent event)? onEvent,
-  }) async {
-    var modelUsed = request.model;
-    QueryResponse? terminalResponse;
-    final outputBuffer = StringBuffer();
-
-    await for (final event in engine.runStream(request)) {
-      if (event.model != null && event.model!.isNotEmpty) {
-        modelUsed = event.model;
-      }
-
-      switch (event.type) {
-        case ProviderStreamEventType.textDelta:
-          final delta = event.delta ?? '';
-          if (delta.isNotEmpty) {
-            outputBuffer.write(delta);
-            _emit(
-              streamJson,
-              QueryEvent(
-                type: QueryEventType.providerDelta,
-                turn: turn,
-                delta: delta,
-                model: modelUsed,
-              ),
-              onEvent: onEvent,
-            );
-          }
-          break;
-        case ProviderStreamEventType.done:
-          final output = event.output ?? outputBuffer.toString();
-          terminalResponse = QueryResponse.success(
-            output: output.isEmpty ? '[empty-output]' : output,
-            modelUsed: event.model ?? modelUsed,
-          );
-          break;
-        case ProviderStreamEventType.error:
-          terminalResponse = QueryResponse.failure(
-            error: event.error ??
-                const RuntimeError(
-                  code: RuntimeErrorCode.providerFailure,
-                  message: 'provider stream failed',
-                  source: 'query_loop',
-                  retriable: true,
-                ),
-            output: event.output ?? '[ERROR] provider stream failed',
-            modelUsed: event.model ?? modelUsed,
-          );
-          break;
-      }
-
-      if (terminalResponse != null) {
-        break;
-      }
-    }
-
-    if (terminalResponse != null) {
-      return terminalResponse;
-    }
-
-    final output = outputBuffer.toString();
-    if (output.isNotEmpty) {
-      return QueryResponse.success(
-        output: output,
-        modelUsed: modelUsed,
-      );
-    }
-
-    return QueryResponse.failure(
-      error: const RuntimeError(
-        code: RuntimeErrorCode.providerFailure,
-        message: 'provider stream ended without terminal event',
-        source: 'query_loop',
-        retriable: false,
-      ),
-      output: '[ERROR] provider stream ended unexpectedly',
-      modelUsed: modelUsed,
+      history: conversation.history,
+      transcript: conversation.transcript,
     );
   }
 

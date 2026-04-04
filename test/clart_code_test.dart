@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:clart_code/clart_code.dart';
 import 'package:clart_code/src/cli/repl_command_dispatcher.dart';
+import 'package:clart_code/src/cli/workspace_store.dart';
 import 'package:test/test.dart';
 
 class _FakeReplCommandSession implements ReplCommandSession {
@@ -19,6 +21,67 @@ class _FakeReplCommandSession implements ReplCommandSession {
   void clearConversation() {
     conversationCleared = true;
   }
+}
+
+class _CapturedRunResult {
+  const _CapturedRunResult({
+    required this.code,
+    required this.output,
+  });
+
+  final int code;
+  final String output;
+}
+
+Future<_CapturedRunResult> _capturePrintOutput(
+  Future<int> Function() action,
+) async {
+  final lines = <String>[];
+  final code = await runZoned(
+    action,
+    zoneSpecification: ZoneSpecification(
+      print: (_, __, ___, String line) {
+        lines.add(line);
+      },
+    ),
+  );
+  return _CapturedRunResult(code: code, output: lines.join('\n'));
+}
+
+Future<void> _runGit(
+  String workingDirectory,
+  List<String> args,
+) async {
+  final result = await Process.run(
+    'git',
+    args,
+    workingDirectory: workingDirectory,
+  );
+  if (result.exitCode != 0) {
+    fail('git ${args.join(' ')} failed: ${result.stderr}');
+  }
+}
+
+Future<void> _initDirtyGitWorkspace(Directory tempDir) async {
+  await _runGit(tempDir.path, const ['init']);
+  await _runGit(
+    tempDir.path,
+    const ['config', 'user.email', 'clart-test@example.com'],
+  );
+  await _runGit(
+    tempDir.path,
+    const ['config', 'user.name', 'Clart Test'],
+  );
+
+  final trackedFile = File('${tempDir.path}/tracked.txt');
+  await trackedFile.writeAsString('hello\n');
+  await _runGit(tempDir.path, const ['add', 'tracked.txt']);
+  await _runGit(tempDir.path, const ['commit', '-m', 'initial']);
+
+  await trackedFile.writeAsString('hello\nworld\n');
+  await File('${tempDir.path}/new_file.dart').writeAsString(
+    "void main() {\n  print('hi');\n}\n",
+  );
 }
 
 void main() {
@@ -77,6 +140,41 @@ void main() {
         trustFile.deleteSync();
       }
     }
+  });
+
+  test('start welcome screen shows tips and recent activity areas', () async {
+    final trustFile = File(
+      '${Directory.systemTemp.path}/clart_trust_welcome_${DateTime.now().microsecondsSinceEpoch}.json',
+    );
+
+    try {
+      final result = await _capturePrintOutput(() {
+        return runCli([
+          'start',
+          '--yes',
+          '--no-repl',
+          '--trust-file',
+          trustFile.path,
+        ]);
+      });
+
+      expect(result.code, 0);
+      expect(result.output, contains('Tips for getting started'));
+      expect(result.output, contains('Recent activity'));
+      expect(result.output, contains('Welcome back!'));
+    } finally {
+      if (trustFile.existsSync()) {
+        trustFile.deleteSync();
+      }
+    }
+  });
+
+  test('help shows rich as the default interactive ui', () async {
+    final result = await _capturePrintOutput(() => runCli(['help']));
+
+    expect(result.code, 0);
+    expect(result.output,
+        contains('--ui MODE            plain|rich (default rich)'));
   });
 
   test('auth command writes provider key and host into config file', () async {
@@ -165,6 +263,39 @@ void main() {
     expect(buildProviderSetupHint(openAiReady), isNull);
   });
 
+  test('applyProviderSetup returns masked summary lines', () async {
+    final configFile = File(
+      '${Directory.systemTemp.path}/clart_apply_cfg_${DateTime.now().microsecondsSinceEpoch}.json',
+    );
+
+    try {
+      final result = applyProviderSetup(
+        current: AppConfig(
+          provider: ProviderKind.local,
+          configPath: configFile.path,
+        ),
+        provider: ProviderKind.openai,
+        apiKey: 'sk-apply-123456',
+        baseUrl: 'https://openai.apply.example.com/v1',
+        model: 'gpt-4.1-mini',
+      );
+
+      expect(result.config.provider, ProviderKind.openai);
+      expect(result.status, 'Initialized provider config.');
+      expect(result.lines, contains('provider=openai'));
+      expect(result.lines, contains('model=gpt-4.1-mini'));
+      expect(
+        result.lines,
+        contains('openai.apiKey=***********3456'),
+      );
+      expect(configFile.existsSync(), true);
+    } finally {
+      if (configFile.existsSync()) {
+        configFile.deleteSync();
+      }
+    }
+  });
+
   test('config loader auto-loads .clart/config.json', () async {
     final oldCwd = Directory.current;
     final tempDir = await Directory.systemTemp.createTemp(
@@ -202,6 +333,30 @@ void main() {
     }
   });
 
+  test('claude request body includes explicit disabled thinking config', () {
+    final body = buildClaudeRequestBodyForTest(
+      request: const QueryRequest(
+        messages: [
+          ChatMessage(role: MessageRole.system, text: 'You are helpful.'),
+          ChatMessage(role: MessageRole.user, text: 'hello'),
+        ],
+        model: 'claude-test-model',
+      ),
+      fallbackModel: 'claude-fallback-model',
+    );
+
+    expect(body['model'], 'claude-test-model');
+    expect(body['max_tokens'], 1024);
+    expect(body['thinking'], {'type': 'disabled'});
+    expect(body['system'], 'You are helpful.');
+    expect(
+      body['messages'],
+      [
+        {'role': 'user', 'content': 'hello'},
+      ],
+    );
+  });
+
   test('conversation session builds next request from prior turns', () {
     final session = ConversationSession();
 
@@ -230,6 +385,38 @@ void main() {
     expect(reset.request, isNotNull);
     expect(reset.request!.messages.length, 1);
     expect(reset.request!.messages.first.text, 'fresh start');
+  });
+
+  test(
+      'conversation session keeps typed transcript separate from model history',
+      () {
+    final session = ConversationSession();
+
+    session.appendTranscriptMessages(const [
+      TranscriptMessage.localCommand('/status'),
+      TranscriptMessage.localCommandStdout('provider=local'),
+    ]);
+
+    expect(session.history, isEmpty);
+    expect(
+      session.transcript.map((message) => message.kind).toList(),
+      [
+        TranscriptMessageKind.localCommand,
+        TranscriptMessageKind.localCommandStdout,
+      ],
+    );
+
+    session.recordHistoryTurn(prompt: 'hello', output: 'hi there');
+    expect(
+      session.history
+          .map((message) => '${message.role.name}:${message.text}')
+          .toList(),
+      [
+        'user:hello',
+        'assistant:hi there',
+      ],
+    );
+    expect(session.transcript, hasLength(2));
   });
 
   test('prompt submitter reuses conversation history for query submissions',
@@ -271,7 +458,10 @@ void main() {
     expect(processed.isQuery, true);
     expect(processed.request, isNotNull);
     expect(processed.transcriptMessages.length, 1);
-    expect(processed.transcriptMessages.first.kind, TranscriptMessageKind.user);
+    expect(
+      processed.transcriptMessages.first.kind,
+      TranscriptMessageKind.userPrompt,
+    );
     expect(processed.transcriptMessages.first.text, 'hello');
   });
 
@@ -282,15 +472,22 @@ void main() {
       onSlashCommand: (_) => const LocalCommandResult(
         status: 'Displayed status.',
         messages: [
-          TranscriptMessage.system('provider=local'),
+          TranscriptMessage.localCommandStdout('provider=local'),
         ],
       ),
     );
 
     expect(processed.kind, ProcessUserInputKind.localCommand);
     expect(processed.status, 'Displayed status.');
-    expect(processed.transcriptMessages.length, 1);
-    expect(processed.transcriptMessages.first.text, 'provider=local');
+    expect(processed.transcriptMessages.length, 2);
+    expect(processed.transcriptMessages.first.kind,
+        TranscriptMessageKind.localCommand);
+    expect(processed.transcriptMessages.first.text, '/status');
+    expect(
+      processed.transcriptMessages.last.kind,
+      TranscriptMessageKind.localCommandStdout,
+    );
+    expect(processed.transcriptMessages.last.text, 'provider=local');
   });
 
   test('repl slash dispatcher clears conversation for /clear', () {
@@ -315,6 +512,226 @@ void main() {
     expect(result, isNotNull);
     expect(result!.status, 'Model switched.');
     expect(session.config.model, 'claude-sonnet');
+  });
+
+  test('repl slash dispatcher help includes doctor and diff', () {
+    final session = _FakeReplCommandSession(
+      config: const AppConfig(provider: ProviderKind.local),
+    );
+
+    final result = executeReplSlashCommand('/help', session);
+
+    expect(result, isNotNull);
+    final lines = result!.messages.map((message) => message.text).toList();
+    expect(lines, contains('/doctor   Show workspace/provider diagnostics'));
+    expect(lines, contains('/diff     Show current git workspace summary'));
+    expect(lines, contains('/mcp      Show local MCP server registry'));
+    expect(lines, contains('/session  Show current active session snapshot'));
+  });
+
+  test('repl slash dispatcher renders doctor report', () async {
+    final oldCwd = Directory.current;
+    final tempDir = await Directory.systemTemp.createTemp('clart_repl_doctor_');
+
+    try {
+      await _initDirtyGitWorkspace(tempDir);
+      Directory.current = tempDir;
+      final session = _FakeReplCommandSession(
+        config: const AppConfig(provider: ProviderKind.local),
+      );
+
+      final result = executeReplSlashCommand('/doctor', session);
+
+      expect(result, isNotNull);
+      expect(result!.status, 'Displayed doctor report.');
+      final lines = result.messages.map((message) => message.text).toList();
+      expect(lines, contains('provider=local'));
+      expect(lines, contains('git.repository=true'));
+      expect(lines, contains('git.status=dirty'));
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('repl slash dispatcher renders diff summary', () async {
+    final oldCwd = Directory.current;
+    final tempDir = await Directory.systemTemp.createTemp('clart_repl_diff_');
+
+    try {
+      await _initDirtyGitWorkspace(tempDir);
+      Directory.current = tempDir;
+      final session = _FakeReplCommandSession(
+        config: const AppConfig(provider: ProviderKind.local),
+      );
+
+      final result = executeReplSlashCommand('/diff', session);
+
+      expect(result, isNotNull);
+      expect(result!.status, 'Displayed diff summary.');
+      final lines = result.messages.map((message) => message.text).toList();
+      expect(lines, contains('git.files=2'));
+      expect(lines, contains('- tracked.txt [modified] (+1/-0)'));
+      expect(lines, contains('- new_file.dart [untracked]'));
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('repl slash dispatcher renders workspace memory', () async {
+    final oldCwd = Directory.current;
+    final tempDir = await Directory.systemTemp.createTemp('clart_repl_memory_');
+
+    try {
+      Directory.current = tempDir;
+      writeWorkspaceMemory('remember this');
+      final session = _FakeReplCommandSession(
+        config: const AppConfig(provider: ProviderKind.local),
+      );
+
+      final result = executeReplSlashCommand('/memory', session);
+
+      expect(result, isNotNull);
+      expect(result!.status, 'Displayed workspace memory.');
+      expect(result.messages.single.text, 'remember this');
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('repl slash dispatcher renders workspace tasks', () async {
+    final oldCwd = Directory.current;
+    final tempDir = await Directory.systemTemp.createTemp('clart_repl_tasks_');
+
+    try {
+      Directory.current = tempDir;
+      addWorkspaceTask('ship mvp');
+      completeWorkspaceTask(1);
+      addWorkspaceTask('write docs');
+      final session = _FakeReplCommandSession(
+        config: const AppConfig(provider: ProviderKind.local),
+      );
+
+      final result = executeReplSlashCommand('/tasks', session);
+
+      expect(result, isNotNull);
+      expect(result!.status, 'Displayed workspace tasks.');
+      final lines = result.messages.map((message) => message.text).toList();
+      expect(lines, contains('[x] #1 ship mvp'));
+      expect(lines, contains('[ ] #2 write docs'));
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('repl slash dispatcher renders workspace permissions', () async {
+    final oldCwd = Directory.current;
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_repl_permissions_');
+
+    try {
+      Directory.current = tempDir;
+      writeDefaultToolPermissionMode(ToolPermissionMode.deny);
+      final session = _FakeReplCommandSession(
+        config: const AppConfig(provider: ProviderKind.local),
+      );
+
+      final result = executeReplSlashCommand('/permissions', session);
+
+      expect(result, isNotNull);
+      expect(result!.status, 'Displayed permissions.');
+      expect(result.messages.single.text, 'permissions.default=deny');
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('repl slash dispatcher renders MCP servers', () async {
+    final oldCwd = Directory.current;
+    final tempDir = await Directory.systemTemp.createTemp('clart_repl_mcp_');
+
+    try {
+      Directory.current = tempDir;
+      upsertWorkspaceMcpServer(
+        const WorkspaceMcpServer(
+          name: 'local',
+          transport: 'stdio',
+          target: 'node server.js',
+        ),
+      );
+      final session = _FakeReplCommandSession(
+        config: const AppConfig(provider: ProviderKind.local),
+      );
+
+      final result = executeReplSlashCommand('/mcp', session);
+
+      expect(result, isNotNull);
+      expect(result!.status, 'Displayed MCP servers.');
+      expect(result.messages.single.text, 'local\tstdio\tnode server.js');
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('repl slash dispatcher renders active session snapshot', () async {
+    final oldCwd = Directory.current;
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_repl_session_');
+
+    try {
+      Directory.current = tempDir;
+      writeWorkspaceSession(
+        buildWorkspaceSessionSnapshot(
+          id: 'session-1',
+          provider: 'local',
+          model: 'mock-model',
+          history: const [
+            ChatMessage(role: MessageRole.user, text: 'hello'),
+            ChatMessage(role: MessageRole.assistant, text: 'hi'),
+          ],
+          transcript: const [
+            TranscriptMessage.userPrompt('hello'),
+            TranscriptMessage.assistant('hi'),
+          ],
+        ),
+      );
+      final session = _FakeReplCommandSession(
+        config: const AppConfig(provider: ProviderKind.local),
+      );
+
+      final result = executeReplSlashCommand('/session', session);
+
+      expect(result, isNotNull);
+      expect(result!.status, 'Displayed session.');
+      final lines = result.messages.map((message) => message.text).toList();
+      expect(lines, contains('id=session-1'));
+      expect(lines, contains('provider=local'));
+      expect(lines, contains('model=mock-model'));
+      expect(lines, contains('history.messages=2'));
+      expect(lines, contains('transcript.messages=2'));
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
   });
 
   test('chat without prompt exits with error', () async {
@@ -472,6 +889,318 @@ void main() {
       'echo hello',
     ]);
     expect(code, 1);
+  });
+
+  test('memory command persists workspace memory file', () async {
+    final oldCwd = Directory.current;
+    final tempDir = await Directory.systemTemp.createTemp('clart_memory_');
+
+    try {
+      Directory.current = tempDir;
+      expect(await runCli(['memory', 'set', 'project', 'notes']), 0);
+      expect(await runCli(['memory', 'append', 'next', 'step']), 0);
+
+      final memoryFile = File('${tempDir.path}/.clart/memory.md');
+      expect(memoryFile.existsSync(), true);
+      expect(await memoryFile.readAsString(), 'project notes\nnext step');
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('tasks command persists and completes workspace tasks', () async {
+    final oldCwd = Directory.current;
+    final tempDir = await Directory.systemTemp.createTemp('clart_tasks_');
+
+    try {
+      Directory.current = tempDir;
+      expect(await runCli(['tasks', 'add', 'ship', 'mvp']), 0);
+      expect(await runCli(['tasks', 'done', '1']), 0);
+
+      final taskFile = File('${tempDir.path}/.clart/tasks.json');
+      final decoded =
+          jsonDecode(await taskFile.readAsString()) as List<dynamic>;
+      expect(decoded, hasLength(1));
+      expect((decoded.first as Map<String, dynamic>)['done'], true);
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('permissions command persists default mode for tool command', () async {
+    final oldCwd = Directory.current;
+    final tempDir = await Directory.systemTemp.createTemp('clart_permissions_');
+
+    try {
+      Directory.current = tempDir;
+      expect(await runCli(['permissions', 'set', 'deny']), 0);
+      expect(await runCli(['tool', 'shell', 'pwd']), 1);
+
+      final permissionsFile = File('${tempDir.path}/.clart/permissions.json');
+      final decoded = jsonDecode(await permissionsFile.readAsString());
+      expect((decoded as Map<String, dynamic>)['mode'], 'deny');
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('export command writes workspace snapshot', () async {
+    final oldCwd = Directory.current;
+    final tempDir = await Directory.systemTemp.createTemp('clart_export_');
+
+    try {
+      Directory.current = tempDir;
+      expect(await runCli(['memory', 'set', 'remember this']), 0);
+      expect(await runCli(['tasks', 'add', 'write', 'docs']), 0);
+      expect(
+          await runCli(['mcp', 'add', 'local', 'stdio', 'node server.js']), 0);
+      final exportPath = '${tempDir.path}/snapshot.json';
+
+      expect(await runCli(['export', '--out', exportPath]), 0);
+
+      final decoded = jsonDecode(await File(exportPath).readAsString())
+          as Map<String, dynamic>;
+      expect(decoded['memory'], 'remember this');
+      expect(decoded['tasks'] as List<dynamic>, hasLength(1));
+      expect(decoded['mcpServers'] as List<dynamic>, hasLength(1));
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('diff command emits git workspace json snapshot', () async {
+    final oldCwd = Directory.current;
+    final tempDir = await Directory.systemTemp.createTemp('clart_diff_');
+
+    try {
+      await _initDirtyGitWorkspace(tempDir);
+      Directory.current = tempDir;
+
+      final result = await _capturePrintOutput(
+        () => runCli(['diff', '--json']),
+      );
+
+      expect(result.code, 0);
+      final decoded = jsonDecode(result.output) as Map<String, dynamic>;
+      expect(decoded['isGitRepository'], true);
+      expect(decoded['hasChanges'], true);
+      expect(decoded['filesChanged'], 2);
+      expect(decoded['untrackedFiles'], 1);
+
+      final files = decoded['files'] as List<dynamic>;
+      expect(
+        files.any(
+          (file) => (file as Map<String, dynamic>)['path'] == 'tracked.txt',
+        ),
+        true,
+      );
+      expect(
+        files.any(
+          (file) => (file as Map<String, dynamic>)['path'] == 'new_file.dart',
+        ),
+        true,
+      );
+      expect((decoded['patch'] as String), contains('tracked.txt'));
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('review command runs against current git workspace diff', () async {
+    final oldCwd = Directory.current;
+    final tempDir = await Directory.systemTemp.createTemp('clart_review_');
+
+    try {
+      await _initDirtyGitWorkspace(tempDir);
+      Directory.current = tempDir;
+
+      final result = await _capturePrintOutput(
+        () => runCli(['review']),
+      );
+
+      expect(result.code, 0);
+      expect(result.output, contains('echo: You are reviewing'));
+      expect(result.output, contains('tracked.txt'));
+      expect(result.output, contains('new_file.dart'));
+
+      final sessionsDir = Directory('${tempDir.path}/.clart/sessions');
+      expect(sessionsDir.existsSync(), true);
+      final sessionFiles = sessionsDir
+          .listSync()
+          .whereType<File>()
+          .where((file) => file.path.endsWith('.json'))
+          .toList();
+      expect(sessionFiles, hasLength(1));
+
+      final snapshot = jsonDecode(
+        await sessionFiles.first.readAsString(),
+      ) as Map<String, dynamic>;
+      expect((snapshot['history'] as List<dynamic>), hasLength(2));
+      expect((snapshot['transcript'] as List<dynamic>), hasLength(2));
+      expect(snapshot['title'], contains('You are reviewing the current git'));
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('review --prompt-only prints generated review prompt', () async {
+    final oldCwd = Directory.current;
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_review_prompt_');
+
+    try {
+      await _initDirtyGitWorkspace(tempDir);
+      Directory.current = tempDir;
+
+      final result = await _capturePrintOutput(
+        () => runCli(['review', '--prompt-only', 'focus', 'tests']),
+      );
+
+      expect(result.code, 0);
+      expect(result.output, contains('Extra review instructions: focus tests'));
+      expect(result.output, contains('Tracked file patch:'));
+      expect(result.output, contains('Untracked file previews:'));
+      expect(result.output, contains('new_file.dart'));
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('chat persists session and resume updates same snapshot', () async {
+    final oldCwd = Directory.current;
+    final tempDir = await Directory.systemTemp.createTemp('clart_session_');
+
+    try {
+      Directory.current = tempDir;
+      expect(await runCli(['chat', 'hello']), 0);
+
+      final sessionsDir = Directory('${tempDir.path}/.clart/sessions');
+      expect(sessionsDir.existsSync(), true);
+      final sessionFiles = sessionsDir
+          .listSync()
+          .whereType<File>()
+          .where((file) => file.path.endsWith('.json'))
+          .toList();
+      expect(sessionFiles, hasLength(1));
+
+      final initialSnapshot = jsonDecode(
+        await sessionFiles.first.readAsString(),
+      ) as Map<String, dynamic>;
+      expect((initialSnapshot['history'] as List<dynamic>), hasLength(2));
+      expect((initialSnapshot['transcript'] as List<dynamic>), hasLength(2));
+
+      expect(await runCli(['resume', '--last', 'how are you']), 0);
+
+      final resumedSnapshot = jsonDecode(
+        await sessionFiles.first.readAsString(),
+      ) as Map<String, dynamic>;
+      expect((resumedSnapshot['history'] as List<dynamic>), hasLength(4));
+      expect(
+        ((resumedSnapshot['history'] as List<dynamic>).last
+            as Map<String, dynamic>)['text'],
+        'echo: hello\nhow are you',
+      );
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('share command exports active session as markdown', () async {
+    final oldCwd = Directory.current;
+    final tempDir = await Directory.systemTemp.createTemp('clart_share_');
+
+    try {
+      Directory.current = tempDir;
+      expect(await runCli(['chat', 'hello share']), 0);
+      final outputPath = '${tempDir.path}/session.md';
+
+      expect(await runCli(['share', '--out', outputPath]), 0);
+
+      final markdown = await File(outputPath).readAsString();
+      expect(markdown, contains('# hello share'));
+      expect(markdown, contains('## Transcript'));
+      expect(markdown, contains('assistant'));
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('doctor reports git workspace state', () async {
+    final oldCwd = Directory.current;
+    final tempDir = await Directory.systemTemp.createTemp('clart_doctor_');
+
+    try {
+      await _initDirtyGitWorkspace(tempDir);
+      Directory.current = tempDir;
+
+      final result = await _capturePrintOutput(
+        () => runCli(['doctor']),
+      );
+
+      expect(result.code, 0);
+      expect(result.output, contains('git.repository=true'));
+      expect(result.output, contains('git.status=dirty'));
+      expect(result.output, contains('git.files=2'));
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('export command includes git workspace snapshot', () async {
+    final oldCwd = Directory.current;
+    final tempDir = await Directory.systemTemp.createTemp('clart_export_git_');
+
+    try {
+      await _initDirtyGitWorkspace(tempDir);
+      Directory.current = tempDir;
+      final exportPath = '${tempDir.path}/snapshot.json';
+
+      expect(await runCli(['export', '--out', exportPath]), 0);
+
+      final decoded = jsonDecode(await File(exportPath).readAsString())
+          as Map<String, dynamic>;
+      final git = decoded['git'] as Map<String, dynamic>;
+      expect(git['isGitRepository'], true);
+      expect(git['hasChanges'], true);
+      expect(git['filesChanged'], 2);
+      expect(git['untrackedFiles'], 1);
+      expect(git['files'] as List<dynamic>, hasLength(2));
+    } finally {
+      Directory.current = oldCwd;
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
   });
 
   test('repl accepts --stream-json and exits in non-interactive mode',
@@ -680,6 +1409,93 @@ void main() {
     expect(events.last.type, QueryEventType.done);
     expect(events.last.status, 'error');
   });
+
+  test('turn executor emits provider deltas and assistant transcript',
+      () async {
+    final runtime = AppRuntime(provider: _ChunkedStreamingProvider());
+    final engine = QueryEngine(runtime);
+    final executor = TurnExecutor(engine);
+    final events = <QueryEvent>[];
+
+    final result = await executor.execute(
+      request: const QueryRequest(
+        messages: [
+          ChatMessage(role: MessageRole.user, text: 'hello'),
+        ],
+      ),
+      turn: 1,
+      onEvent: events.add,
+    );
+
+    expect(result.success, true);
+    expect(result.output, 'hello world');
+    expect(result.displayOutput, 'hello world');
+    expect(result.rawOutput, 'hello world');
+    expect(result.transcriptMessages, hasLength(1));
+    expect(
+        result.transcriptMessages.first.kind, TranscriptMessageKind.assistant);
+    expect(
+      events.map((event) => event.type).toList(),
+      [
+        QueryEventType.turnStart,
+        QueryEventType.providerDelta,
+        QueryEventType.providerDelta,
+        QueryEventType.assistant,
+      ],
+    );
+  });
+
+  test('turn executor normalizes provider config errors', () async {
+    final runtime = AppRuntime(provider: _MissingConfigStreamingProvider());
+    final engine = QueryEngine(runtime);
+    final executor = TurnExecutor(engine);
+    final events = <QueryEvent>[];
+
+    final result = await executor.execute(
+      request: const QueryRequest(
+        messages: [
+          ChatMessage(role: MessageRole.user, text: 'hello'),
+        ],
+      ),
+      turn: 1,
+      onEvent: events.add,
+    );
+
+    expect(result.failed, true);
+    expect(
+      result.output,
+      'Provider is not configured. Run /init or clart_code init.',
+    );
+    expect(result.transcriptMessages.first.text, result.output);
+    expect(events.last.type, QueryEventType.error);
+    expect(events.last.output, result.output);
+  });
+
+  test('turn executor returns interrupted display output for empty partials',
+      () async {
+    final runtime = AppRuntime(provider: _SlowStreamingProvider());
+    final engine = QueryEngine(runtime);
+    final executor = TurnExecutor(engine);
+    final events = <QueryEvent>[];
+
+    final result = await executor.execute(
+      request: const QueryRequest(
+        messages: [
+          ChatMessage(role: MessageRole.user, text: 'hello'),
+        ],
+      ),
+      turn: 1,
+      onEvent: events.add,
+      interruptSignals: Stream<void>.fromFuture(Future<void>.value()),
+    );
+
+    expect(result.interrupted, true);
+    expect(result.output, isEmpty);
+    expect(result.displayOutput, '[interrupted]');
+    expect(result.transcriptMessages.first.text, '[interrupted]');
+    expect(
+        events.map((event) => event.type).toList(), [QueryEventType.turnStart]);
+  });
 }
 
 class _ThrowingProvider extends LlmProvider {
@@ -729,5 +1545,47 @@ class _ErrorStreamingProvider extends LlmProvider {
       output: '[ERROR] stream failure',
       model: 'stream-mock',
     );
+  }
+}
+
+class _MissingConfigStreamingProvider extends LlmProvider {
+  @override
+  Future<QueryResponse> run(QueryRequest request) async {
+    return QueryResponse.failure(
+      error: const RuntimeError(
+        code: RuntimeErrorCode.invalidInput,
+        message: 'missing config',
+        source: 'provider_config',
+      ),
+      output: '[ERROR] missing config',
+      modelUsed: 'config-mock',
+    );
+  }
+
+  @override
+  Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
+    yield ProviderStreamEvent.error(
+      error: const RuntimeError(
+        code: RuntimeErrorCode.invalidInput,
+        message: 'missing config',
+        source: 'provider_config',
+      ),
+      output: '[ERROR] missing config',
+      model: 'config-mock',
+    );
+  }
+}
+
+class _SlowStreamingProvider extends LlmProvider {
+  @override
+  Future<QueryResponse> run(QueryRequest request) async {
+    return QueryResponse.success(output: 'slow', modelUsed: 'slow-mock');
+  }
+
+  @override
+  Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    yield ProviderStreamEvent.textDelta(delta: 'slow', model: 'slow-mock');
+    yield ProviderStreamEvent.done(output: 'slow', model: 'slow-mock');
   }
 }

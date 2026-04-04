@@ -10,9 +10,9 @@
 - 三方库找不到等价实现时：先做接口占位，不阻塞主程序可运行，并单独列出待你确认项。
 - 不做文件级翻译：按“完整程序逐步可运行”迁移。
 
-## 当前迭代状态（Iteration 9.9，已落地）
+## 当前迭代状态（Iteration 9.10，已落地）
 
-- 已有可执行 CLI：`help/version/start/status/features/chat/print/repl/loop/tool`。
+- 已有可执行 CLI：`help/version/start/status/features/chat/print/repl/loop/tool/diff/review`。
 - 已分离运行时核心：`AppRuntime + QueryEngine + LlmProvider`。
 - 已实现命令注册表与调度器。
 - 已实现配置加载：环境变量 + `--config` JSON。
@@ -23,10 +23,24 @@
 - 已实现基础工具：`read`、`write`、`shell`（stub）。
 - 已实现最小工具权限策略：`ToolPermissionPolicy`（allow/deny）。
 - 已提供 CLI 工具入口：`tool` 命令。
+- 已实现 git 工作区状态最小版：
+  - 当前仓库识别
+  - working tree 文件清单/增删行统计
+  - tracked patch 读取
+  - 小体积 untracked 文件预览
+- 已新增 `diff` 命令：
+  - `diff --json`
+  - `diff --stat`
+  - `diff --name-only`
+- 已新增 `review` 命令：
+  - 基于当前 git diff 构造最小 code review prompt
+  - 复用现有 `PromptSubmitter + UserInputProcessor + TurnExecutor` 执行链
+  - `review --prompt-only` 可直接查看生成的 review prompt
+  - review 结果会像 `chat` 一样落盘为本地 session
 - 已实现启动体验最小版：`start` 命令（目录信任 + 欢迎屏 + REPL 进入）。
 - 已实现无参默认启动到 `start`，并在交互终端自动进入 REPL。
 - 已实现 REPL 流式回显（provider `textDelta` 增量输出）。
-- 已实现 REPL 最小命令：`/help`、`/model`、`/provider`、`/clear`、`/exit`。
+- 已实现 REPL 最小命令：`/help`、`/model`、`/provider`、`/status`、`/doctor`、`/diff`、`/memory`、`/tasks`、`/permissions`、`/mcp`、`/session`、`/clear`、`/exit`。
 - 已实现 `/status` 命令（查看当前 provider/model）。
 - 已支持 REPL 运行期切换 model/provider（后续请求生效）。
 - 已新增统一输入提交链路：
@@ -72,6 +86,8 @@
   - `OpenAiApiProvider`（最小 SDK 可用）
 - 已提供 no-op 埋点：`TelemetryService`。
 - 已提供可裁剪安全占位：`SecurityGuard`（默认关闭）。
+- `doctor/export/features/help` 已同步暴露 git workspace + diff/review 能力。
+- REPL 现已可直接查看本地 `doctor/diff/memory/tasks/permissions/mcp/session` 摘要，无需退出交互模式。
 
 ## MVP P0 进度看板（供新会话直接续接）
 
@@ -80,6 +96,8 @@
 - [x] provider 缺配置引导：启动与切换时提示 `Run /init`
 - [x] rich 输入稳定性：UTF-8 解码 + CJK 宽度光标/换行
 - [x] 统一输入主链路第一阶段：submitter / processor / slash dispatcher 拆分
+- [x] 工作区状态最小闭环：memory/tasks/permissions/mcp/session/git diff
+- [x] 基础代码审查主干：`review` 基于当前 working tree 执行一轮
 - [ ] rich `/init` 逐步向导（避免在命令行明文显示 key）
 - [ ] 真实 LLM 失败文案细化（按网络/鉴权/host 分类）
 - [ ] 首轮用户引导文案（从 local echo 到真实模型的最短路径）
@@ -204,10 +222,12 @@
 ## 下一步执行（我将继续）
 
 下一步进入 MVP P0 主链路（见 `docs/claudecode-mvp-minimal-flow.md`）：
-- 继续补齐 `/init` 交互向导细节（rich 模式下逐步式引导输入）。
+- 已补齐 `/init` 交互向导细节（rich 模式下逐步式引导输入，API key 掩码显示）。
 - 启动阶段提示文案细化（按 provider 错误类型给更具体建议）。
 - 继续将 `processUserInput` 对齐到 `claude-code`：
-  - 从 `runner` 再抽离 turn executor
-  - 增加 typed transcript/local-command/tool-result message
-  - 让 `chat / repl / loop / stream-json` 共用同一 turn 执行器
+  - 已从 `runner` 抽离 `TurnExecutor`
+  - 已增加 typed transcript/local-command/tool-result message 基础类型
+  - 已让 `chat / repl / loop / stream-json` 共用同一 turn 执行器
+  - 已让 `ConversationSession` 同时维护 query history 与 typed transcript
+- 已补齐最小 git 工作区状态与 `diff/review` 命令闭环。
 - REPL 主循环可用性收敛（真实 LLM 往返 + 错误提示 + 中断语义稳定）。

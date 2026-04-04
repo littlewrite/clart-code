@@ -13,6 +13,8 @@ import '../core/prompt_submitter.dart';
 import '../core/query_engine.dart';
 import '../core/query_events.dart';
 import '../core/query_loop.dart';
+import '../core/transcript.dart';
+import '../core/turn_executor.dart';
 import '../providers/llm_provider.dart';
 import '../runtime/app_runtime.dart';
 import '../services/security_guard.dart';
@@ -21,8 +23,11 @@ import '../tools/tool_models.dart';
 import '../tools/tool_permissions.dart';
 import '../ui/startup_experience.dart';
 import 'command_registry.dart';
+import 'git_workspace.dart';
+import 'local_reports.dart';
 import 'provider_setup.dart';
 import 'repl_command_dispatcher.dart';
+import 'workspace_store.dart';
 
 class ParsedCli {
   const ParsedCli({
@@ -148,6 +153,61 @@ Future<int> runCli(List<String> args) async {
       handler: _runToolCommand,
     ),
     RegisteredCommand(
+      name: 'doctor',
+      description: 'Show workspace/config diagnostics',
+      handler: _runDoctorCommand,
+    ),
+    RegisteredCommand(
+      name: 'diff',
+      description: 'Show current git workspace diff summary',
+      handler: _runDiffCommand,
+    ),
+    RegisteredCommand(
+      name: 'review',
+      description: 'Run minimal code review against current git diff',
+      handler: _runReviewCommand,
+    ),
+    RegisteredCommand(
+      name: 'memory',
+      description: 'Manage simple workspace memory file',
+      handler: _runMemoryCommand,
+    ),
+    RegisteredCommand(
+      name: 'tasks',
+      description: 'Manage simple local task list',
+      handler: _runTasksCommand,
+    ),
+    RegisteredCommand(
+      name: 'permissions',
+      description: 'Show/set default tool permission mode',
+      handler: _runPermissionsCommand,
+    ),
+    RegisteredCommand(
+      name: 'export',
+      description: 'Export workspace snapshot as JSON',
+      handler: _runExportCommand,
+    ),
+    RegisteredCommand(
+      name: 'session',
+      description: 'Inspect local session snapshots',
+      handler: _runSessionCommand,
+    ),
+    RegisteredCommand(
+      name: 'resume',
+      description: 'Resume a saved local session with a new prompt',
+      handler: _runResumeCommand,
+    ),
+    RegisteredCommand(
+      name: 'share',
+      description: 'Export a saved session as JSON or Markdown',
+      handler: _runShareCommand,
+    ),
+    RegisteredCommand(
+      name: 'mcp',
+      description: 'Manage simple local MCP server registry',
+      handler: _runMcpCommand,
+    ),
+    RegisteredCommand(
       name: 'status',
       description: 'Show runtime status/config snapshot',
       handler: (ctx) async {
@@ -177,6 +237,12 @@ Future<int> runCli(List<String> args) async {
         print('- tool abstraction + serial scheduler');
         print('- built-in tools: read/write/shell-stub');
         print('- tool permission policy (allow|deny)');
+        print('- persisted default tool permission mode');
+        print('- workspace memory/tasks/export/doctor commands');
+        print('- git workspace state summary + diff command');
+        print('- minimal review command against current git diff');
+        print('- local session/resume/share snapshots');
+        print('- simple local MCP registry command');
         print('- telemetry no-op shell');
         return 0;
       },
@@ -216,7 +282,7 @@ Future<int> _unknownCommand(CommandContext context) async {
 
 Future<int> _runReplCommand(CommandContext context) async {
   var streamJson = false;
-  var uiMode = _ReplUiMode.plain;
+  var uiMode = _ReplUiMode.rich;
 
   var i = 0;
   while (i < context.args.length) {
@@ -594,6 +660,15 @@ Future<int> _runLoopCommand(CommandContext context) async {
     model: context.config.model,
     continuationPromptBuilder: _autoContinuePromptBuilder,
   );
+  writeWorkspaceSession(
+    buildWorkspaceSessionSnapshot(
+      id: createWorkspaceSessionId(),
+      provider: context.config.provider.name,
+      model: context.config.model,
+      history: result.history,
+      transcript: result.transcript,
+    ),
+  );
 
   if (!streamJson) {
     print(result.lastOutput);
@@ -609,7 +684,7 @@ Future<int> _runStartCommand(CommandContext context) async {
   var assumeTrusted = false;
   var denyTrust = false;
   var noRepl = false;
-  var uiMode = _ReplUiMode.plain;
+  var uiMode = _ReplUiMode.rich;
   String? trustFilePath;
 
   var i = 0;
@@ -717,13 +792,16 @@ String? _autoContinuePromptBuilder(
 class _ReplSessionState implements ReplCommandSession {
   _ReplSessionState({
     required this.config,
+    String? sessionId,
     ConversationSession? conversation,
-  }) : conversation = conversation ?? ConversationSession() {
+  })  : sessionId = sessionId ?? createWorkspaceSessionId(),
+        conversation = conversation ?? ConversationSession() {
     submitter = PromptSubmitter(conversation: this.conversation);
   }
 
   @override
   AppConfig config;
+  final String sessionId;
   final ConversationSession conversation;
   late final PromptSubmitter submitter;
 
@@ -743,6 +821,24 @@ class _ReplSessionState implements ReplCommandSession {
   void clearConversation() {
     conversation.clear();
   }
+}
+
+void _persistConversationSnapshot({
+  required String sessionId,
+  required AppConfig config,
+  required ConversationSession conversation,
+}) {
+  final existing = readWorkspaceSession(sessionId);
+  writeWorkspaceSession(
+    buildWorkspaceSessionSnapshot(
+      id: sessionId,
+      provider: config.provider.name,
+      model: config.model,
+      history: conversation.history,
+      transcript: conversation.transcript,
+      createdAt: existing?.createdAt,
+    ),
+  );
 }
 
 QueryEngine _buildRuntimeEngine(CommandContext context, AppConfig config) {
@@ -788,13 +884,17 @@ void _renderPlainTranscriptMessages(List<TranscriptMessage> messages) {
 
 _RichMessageRole _mapTranscriptMessageRole(TranscriptMessageKind kind) {
   switch (kind) {
-    case TranscriptMessageKind.user:
+    case TranscriptMessageKind.userPrompt:
       return _RichMessageRole.user;
     case TranscriptMessageKind.assistant:
       return _RichMessageRole.assistant;
-    case TranscriptMessageKind.system:
     case TranscriptMessageKind.localCommand:
+    case TranscriptMessageKind.localCommandStdout:
+    case TranscriptMessageKind.toolResult:
+    case TranscriptMessageKind.system:
       return _RichMessageRole.system;
+    case TranscriptMessageKind.localCommandStderr:
+      return _RichMessageRole.error;
   }
 }
 
@@ -860,9 +960,25 @@ Future<int> _runInteractiveRepl(
         if (localResult.clearScreen && stdout.hasTerminal) {
           stdout.write('\x1B[2J\x1B[H');
         }
+        session.conversation.appendTranscriptMessages(
+          processed.transcriptMessages,
+        );
+        _persistConversationSnapshot(
+          sessionId: session.sessionId,
+          config: session.config,
+          conversation: session.conversation,
+        );
         _renderPlainTranscriptMessages(processed.transcriptMessages);
         continue;
       case ProcessUserInputKind.invalid:
+        session.conversation.appendTranscriptMessages(
+          processed.transcriptMessages,
+        );
+        _persistConversationSnapshot(
+          sessionId: session.sessionId,
+          config: session.config,
+          conversation: session.conversation,
+        );
         print('${processed.errorText} (try /help)');
         continue;
       case ProcessUserInputKind.query:
@@ -881,12 +997,25 @@ Future<int> _runInteractiveRepl(
             processed.request!,
           );
     if (result.success || result.interrupted) {
-      final output = result.output.isEmpty ? '[empty-output]' : result.output;
-      session.conversation.recordTurn(
+      session.conversation.appendTranscriptMessages([
+        ...processed.transcriptMessages,
+        ...result.transcriptMessages,
+      ]);
+      session.conversation.recordHistoryTurn(
         prompt: processed.submission.raw,
-        output: output,
+        output: result.displayOutput,
       );
+    } else {
+      session.conversation.appendTranscriptMessages([
+        ...processed.transcriptMessages,
+        ...result.transcriptMessages,
+      ]);
     }
+    _persistConversationSnapshot(
+      sessionId: session.sessionId,
+      config: session.config,
+      conversation: session.conversation,
+    );
     if (!result.success && !result.interrupted) {
       lastCode = 1;
     }
@@ -907,18 +1036,16 @@ class _RichMessage {
   final String text;
 }
 
-class _ReplStreamTurnResult {
-  const _ReplStreamTurnResult({
-    required this.success,
-    required this.output,
-    this.interrupted = false,
-    this.modelUsed,
-  });
-
-  final bool success;
-  final String output;
-  final bool interrupted;
-  final String? modelUsed;
+String _maskRichSecretInputForDisplay(String raw) {
+  final buffer = StringBuffer();
+  for (final codeUnit in raw.codeUnits) {
+    if (codeUnit == 0x0A || codeUnit == 0x0D) {
+      buffer.writeCharCode(codeUnit);
+    } else {
+      buffer.write('*');
+    }
+  }
+  return buffer.toString();
 }
 
 enum _RichInputEventType { submit, breakSignal, eof }
@@ -1192,34 +1319,13 @@ Future<int> _runRichInteractiveRepl(
   console.hideCursor();
   try {
     while (true) {
-      var draftInput = '';
-      var draftCursor = 0;
-      _renderRichRepl(
+      final inputEvent = _promptRichInput(
         console,
         context,
         session,
         transcript,
         status: status,
-        inputBuffer: draftInput,
-        inputCursor: draftCursor,
-      );
-
-      final inputEvent = _readRichInput(
-        console,
         history: inputHistory,
-        onDraftChanged: (draft, cursor) {
-          draftInput = draft;
-          draftCursor = cursor;
-          _renderRichRepl(
-            console,
-            context,
-            session,
-            transcript,
-            status: status,
-            inputBuffer: draftInput,
-            inputCursor: draftCursor,
-          );
-        },
       );
       if (inputEvent.type == _RichInputEventType.eof) {
         status = 'Session ended.';
@@ -1242,6 +1348,18 @@ Future<int> _runRichInteractiveRepl(
       }
       pendingExitHintAt = null;
       final rawInput = inputEvent.text ?? '';
+      if (rawInput.trim() == '/init') {
+        if (inputHistory.isEmpty || inputHistory.last != rawInput) {
+          inputHistory.add(rawInput);
+        }
+        status = _runRichInitWizard(
+          console,
+          context,
+          session,
+          transcript,
+        );
+        continue;
+      }
       final processed = _processReplInput(session, rawInput);
       if (processed.kind == ProcessUserInputKind.ignore) {
         status = 'Ready.';
@@ -1257,6 +1375,14 @@ Future<int> _runRichInteractiveRepl(
 
       if (processed.kind == ProcessUserInputKind.invalid) {
         status = processed.status ?? 'Invalid input.';
+        session.conversation.appendTranscriptMessages(
+          processed.transcriptMessages,
+        );
+        _persistConversationSnapshot(
+          sessionId: session.sessionId,
+          config: session.config,
+          conversation: session.conversation,
+        );
         transcript.add(
           _RichMessage(
             role: _RichMessageRole.error,
@@ -1271,6 +1397,14 @@ Future<int> _runRichInteractiveRepl(
         if (localResult.clearTranscript) {
           transcript.clear();
         }
+        session.conversation.appendTranscriptMessages(
+          processed.transcriptMessages,
+        );
+        _persistConversationSnapshot(
+          sessionId: session.sessionId,
+          config: session.config,
+          conversation: session.conversation,
+        );
         _appendRichTranscriptMessages(
           transcript,
           processed.transcriptMessages,
@@ -1327,28 +1461,38 @@ Future<int> _runRichInteractiveRepl(
       );
 
       if (result.success) {
-        final output = result.output.isEmpty ? '[empty-output]' : result.output;
-        session.conversation.recordTurn(
+        session.conversation.appendTranscriptMessages([
+          ...processed.transcriptMessages,
+          ...result.transcriptMessages,
+        ]);
+        session.conversation.recordHistoryTurn(
           prompt: prompt,
-          output: output,
+          output: result.displayOutput,
         );
         transcript[assistantIndex] = _RichMessage(
           role: _RichMessageRole.assistant,
-          text: output,
+          text: result.displayOutput,
         );
         status = 'Done.';
       } else if (result.interrupted) {
-        final output = result.output.isEmpty ? '[interrupted]' : result.output;
-        session.conversation.recordTurn(
+        session.conversation.appendTranscriptMessages([
+          ...processed.transcriptMessages,
+          ...result.transcriptMessages,
+        ]);
+        session.conversation.recordHistoryTurn(
           prompt: prompt,
-          output: output,
+          output: result.displayOutput,
         );
         transcript[assistantIndex] = _RichMessage(
           role: _RichMessageRole.assistant,
-          text: output,
+          text: result.displayOutput,
         );
         status = 'Interrupted.';
       } else {
+        session.conversation.appendTranscriptMessages([
+          ...processed.transcriptMessages,
+          ...result.transcriptMessages,
+        ]);
         transcript[assistantIndex] = _RichMessage(
           role: _RichMessageRole.error,
           text: result.output,
@@ -1356,6 +1500,11 @@ Future<int> _runRichInteractiveRepl(
         status = 'Provider error.';
         lastCode = 1;
       }
+      _persistConversationSnapshot(
+        sessionId: session.sessionId,
+        config: session.config,
+        conversation: session.conversation,
+      );
     }
   } finally {
     console.resetColorAttributes();
@@ -1365,6 +1514,234 @@ Future<int> _runRichInteractiveRepl(
   }
 
   return lastCode;
+}
+
+String _providerApiKey(AppConfig config, ProviderKind provider) {
+  switch (provider) {
+    case ProviderKind.local:
+      return '';
+    case ProviderKind.claude:
+      return config.claudeApiKey?.trim() ?? '';
+    case ProviderKind.openai:
+      return config.openAiApiKey?.trim() ?? '';
+  }
+}
+
+String? _providerBaseUrl(AppConfig config, ProviderKind provider) {
+  switch (provider) {
+    case ProviderKind.local:
+      return null;
+    case ProviderKind.claude:
+      return config.claudeBaseUrl?.trim();
+    case ProviderKind.openai:
+      return config.openAiBaseUrl?.trim();
+  }
+}
+
+_RichInputEvent _promptRichInput(
+  Console console,
+  CommandContext context,
+  _ReplSessionState session,
+  List<_RichMessage> transcript, {
+  required String status,
+  List<String> history = const [],
+  bool maskInput = false,
+}) {
+  var draftInput = '';
+  var draftCursor = 0;
+  _renderRichRepl(
+    console,
+    context,
+    session,
+    transcript,
+    status: status,
+    inputBuffer: draftInput,
+    inputCursor: draftCursor,
+  );
+
+  return _readRichInput(
+    console,
+    history: history,
+    displayTransform: maskInput ? _maskRichSecretInputForDisplay : null,
+    onDraftChanged: (draft, cursor) {
+      draftInput = draft;
+      draftCursor = cursor;
+      _renderRichRepl(
+        console,
+        context,
+        session,
+        transcript,
+        status: status,
+        inputBuffer: draftInput,
+        inputCursor: draftCursor,
+      );
+    },
+  );
+}
+
+String _runRichInitWizard(
+  Console console,
+  CommandContext context,
+  _ReplSessionState session,
+  List<_RichMessage> transcript,
+) {
+  ProviderKind? selectedProvider;
+  while (selectedProvider == null) {
+    final remoteDefault = session.config.provider == ProviderKind.local
+        ? null
+        : session.config.provider;
+    final event = _promptRichInput(
+      console,
+      context,
+      session,
+      transcript,
+      status: remoteDefault == null
+          ? 'Init 1/4: provider (claude/openai). Ctrl+C cancels.'
+          : 'Init 1/4: provider (claude/openai). Enter keeps ${remoteDefault.name}. Ctrl+C cancels.',
+    );
+    if (event.type == _RichInputEventType.breakSignal ||
+        event.type == _RichInputEventType.eof) {
+      final messages = const [
+        TranscriptMessage.localCommand('/init'),
+        TranscriptMessage.localCommandStderr('init cancelled.'),
+      ];
+      session.conversation.appendTranscriptMessages(messages);
+      _persistConversationSnapshot(
+        sessionId: session.sessionId,
+        config: session.config,
+        conversation: session.conversation,
+      );
+      _appendRichTranscriptMessages(transcript, messages);
+      return 'Init cancelled.';
+    }
+    final raw = event.text?.trim() ?? '';
+    if (raw.isEmpty && remoteDefault != null) {
+      selectedProvider = remoteDefault;
+      break;
+    }
+    final parsed = parseProviderKind(raw);
+    if (parsed != null && parsed != ProviderKind.local) {
+      selectedProvider = parsed;
+      break;
+    }
+  }
+  final provider = selectedProvider;
+
+  final currentApiKey = _providerApiKey(session.config, provider);
+  String? apiKey;
+  while (apiKey == null) {
+    final event = _promptRichInput(
+      console,
+      context,
+      session,
+      transcript,
+      status: currentApiKey.isEmpty
+          ? 'Init 2/4: API key for ${provider.name}. Input is masked. Ctrl+C cancels.'
+          : 'Init 2/4: API key for ${provider.name}. Enter keeps current key. Input is masked. Ctrl+C cancels.',
+      maskInput: true,
+    );
+    if (event.type == _RichInputEventType.breakSignal ||
+        event.type == _RichInputEventType.eof) {
+      final messages = const [
+        TranscriptMessage.localCommand('/init'),
+        TranscriptMessage.localCommandStderr('init cancelled.'),
+      ];
+      session.conversation.appendTranscriptMessages(messages);
+      _persistConversationSnapshot(
+        sessionId: session.sessionId,
+        config: session.config,
+        conversation: session.conversation,
+      );
+      _appendRichTranscriptMessages(transcript, messages);
+      return 'Init cancelled.';
+    }
+    final raw = event.text?.trim() ?? '';
+    if (raw.isEmpty && currentApiKey.isNotEmpty) {
+      apiKey = currentApiKey;
+      break;
+    }
+    if (raw.isNotEmpty) {
+      apiKey = raw;
+    }
+  }
+  final effectiveApiKey = apiKey;
+
+  final currentBaseUrl = _providerBaseUrl(session.config, provider);
+  final baseUrlEvent = _promptRichInput(
+    console,
+    context,
+    session,
+    transcript,
+    status: currentBaseUrl?.isNotEmpty == true
+        ? 'Init 3/4: base URL (optional). Enter keeps current: $currentBaseUrl'
+        : 'Init 3/4: base URL (optional). Enter leaves default.',
+  );
+  if (baseUrlEvent.type == _RichInputEventType.breakSignal ||
+      baseUrlEvent.type == _RichInputEventType.eof) {
+    final messages = const [
+      TranscriptMessage.localCommand('/init'),
+      TranscriptMessage.localCommandStderr('init cancelled.'),
+    ];
+    session.conversation.appendTranscriptMessages(messages);
+    _persistConversationSnapshot(
+      sessionId: session.sessionId,
+      config: session.config,
+      conversation: session.conversation,
+    );
+    _appendRichTranscriptMessages(transcript, messages);
+    return 'Init cancelled.';
+  }
+  final enteredBaseUrl = baseUrlEvent.text?.trim() ?? '';
+  final baseUrl = enteredBaseUrl.isEmpty ? currentBaseUrl : enteredBaseUrl;
+
+  final currentModel = session.config.model?.trim();
+  final modelEvent = _promptRichInput(
+    console,
+    context,
+    session,
+    transcript,
+    status: currentModel?.isNotEmpty == true
+        ? 'Init 4/4: model (optional). Enter keeps current: $currentModel'
+        : 'Init 4/4: model (optional). Enter leaves provider default.',
+  );
+  if (modelEvent.type == _RichInputEventType.breakSignal ||
+      modelEvent.type == _RichInputEventType.eof) {
+    final messages = const [
+      TranscriptMessage.localCommand('/init'),
+      TranscriptMessage.localCommandStderr('init cancelled.'),
+    ];
+    session.conversation.appendTranscriptMessages(messages);
+    _persistConversationSnapshot(
+      sessionId: session.sessionId,
+      config: session.config,
+      conversation: session.conversation,
+    );
+    _appendRichTranscriptMessages(transcript, messages);
+    return 'Init cancelled.';
+  }
+  final enteredModel = modelEvent.text?.trim() ?? '';
+  final model = enteredModel.isEmpty ? currentModel : enteredModel;
+
+  final applied = applyProviderSetup(
+    current: session.config,
+    provider: provider,
+    apiKey: effectiveApiKey,
+    baseUrl: baseUrl?.isEmpty == true ? null : baseUrl,
+    model: model?.isEmpty == true ? null : model,
+  );
+  session.config = applied.config;
+  final messages = [
+    const TranscriptMessage.localCommand('/init'),
+    ...applied.lines.map(TranscriptMessage.localCommandStdout),
+  ];
+  session.conversation.appendTranscriptMessages(messages);
+  _persistConversationSnapshot(
+    sessionId: session.sessionId,
+    config: session.config,
+    conversation: session.conversation,
+  );
+  _appendRichTranscriptMessages(transcript, messages);
+  return applied.status;
 }
 
 void _renderRichRepl(
@@ -1379,6 +1756,7 @@ void _renderRichRepl(
   final width = min(console.windowWidth, 140);
   final inner = width - 2;
   final height = console.windowHeight;
+  final headerBody = _buildRichHeaderBody(session, inner);
   final composerInnerWidth = max(8, inner - 4);
   final composerView = buildRichComposerView(
     inputBuffer,
@@ -1387,7 +1765,7 @@ void _renderRichRepl(
     maxLines: 6,
   );
 
-  final headerRows = 8;
+  final headerRows = headerBody.length + 3;
   final footerRows = 4 + composerView.visibleLines.length;
   final transcriptStart = headerRows;
   final transcriptRows = max(3, height - headerRows - footerRows);
@@ -1405,33 +1783,11 @@ void _renderRichRepl(
     0,
     '╭${_fillTitle('─── Clart Code v0.3.0 ', inner)}╮',
   );
-  _writeRow(
-    console,
-    1,
-    '│${_fitRow(' Welcome back!  /help for commands', inner)}│',
-  );
-  _writeRow(
-    console,
-    2,
-    '│${_fitRow(' Workspace: ${Directory.current.path}', inner)}│',
-  );
-  _writeRow(
-    console,
-    3,
-    '│${_fitRow(' Provider: ${session.provider.name}   Model: ${session.model ?? 'default'}', inner)}│',
-  );
-  _writeRow(
-    console,
-    4,
-    '│${_fitRow(' Stream mode: provider delta -> CLI', inner)}│',
-  );
-  _writeRow(console, 5, '│${_fitRow('', inner)}│');
-  _writeRow(
-    console,
-    6,
-    '╰${'─' * inner}╯',
-  );
-  _writeRow(console, 7, '─' * width);
+  for (var i = 0; i < headerBody.length; i++) {
+    _writeRow(console, i + 1, '│${headerBody[i]}│');
+  }
+  _writeRow(console, headerBody.length + 1, '╰${'─' * inner}╯');
+  _writeRow(console, headerBody.length + 2, '─' * width);
 
   for (var i = 0; i < transcriptRows; i++) {
     final line = i < visible.length ? visible[i] : '';
@@ -1468,6 +1824,51 @@ void _renderRichRepl(
   console.cursorPosition = Coordinate(cursorRow, cursorCol);
 }
 
+List<String> _buildRichHeaderBody(_ReplSessionState session, int innerWidth) {
+  final columnGap = 3;
+  final leftWidth = max(32, min(52, (innerWidth - columnGap) ~/ 2));
+  final rightWidth = innerWidth - leftWidth - columnGap;
+  final providerHint = buildProviderSetupHint(session.config);
+  final savedSessions = listWorkspaceSessions();
+  final recentSession = readWorkspaceSession(session.sessionId) ??
+      (savedSessions.isEmpty ? null : savedSessions.first);
+
+  final leftColumn = [
+    '',
+    _centerHeaderLine('Welcome back!', leftWidth),
+    '',
+    _centerHeaderLine('▐▛███▜▌', leftWidth),
+    _centerHeaderLine('▝▜█████▛▘', leftWidth),
+    _centerHeaderLine('▘▘ ▝▝', leftWidth),
+    '',
+    ' ${session.provider.name} · ${session.model ?? 'default'}',
+    ' ${_truncateDisplayPath(Directory.current.path, max(12, leftWidth - 2))}',
+  ];
+  final rightColumn = [
+    'Tips for getting started',
+    providerHint ?? 'Provider ready. Enter to send.',
+    '',
+    'Session',
+    'id=${session.sessionId}',
+    recentSession == null
+        ? 'No saved activity yet'
+        : 'last=${recentSession.title}',
+    '',
+    '/help for commands',
+    'Ctrl+J newline · Ctrl+C interrupt',
+  ];
+  final rows = max(leftColumn.length, rightColumn.length);
+  final lines = <String>[];
+  for (var i = 0; i < rows; i++) {
+    final left = i < leftColumn.length ? leftColumn[i] : '';
+    final right = i < rightColumn.length ? rightColumn[i] : '';
+    lines.add(
+      '${_fitRow(left, leftWidth)} │ ${_fitRow(right, rightWidth)}',
+    );
+  }
+  return lines;
+}
+
 List<String> _buildRichTranscriptLines(
     List<_RichMessage> transcript, int width) {
   final lines = <String>[];
@@ -1495,6 +1896,7 @@ List<String> _buildRichTranscriptLines(
 _RichInputEvent _readRichInput(
   Console console, {
   required List<String> history,
+  String Function(String draft)? displayTransform,
   required void Function(String draft, int cursor) onDraftChanged,
 }) {
   final draft = RichComposerBuffer();
@@ -1502,9 +1904,11 @@ _RichInputEvent _readRichInput(
   int? historyIndex;
   var historyStash = '';
 
+  String displayDraft() => displayTransform?.call(draft.text) ?? draft.text;
+
   void applyHistoryValue(String value) {
     draft.setText(value);
-    onDraftChanged(draft.text, draft.cursor);
+    onDraftChanged(displayDraft(), draft.cursor);
   }
 
   void clearHistoryBrowse() {
@@ -1545,7 +1949,7 @@ _RichInputEvent _readRichInput(
 
   void onEditChange() {
     clearHistoryBrowse();
-    onDraftChanged(draft.text, draft.cursor);
+    onDraftChanged(displayDraft(), draft.cursor);
   }
 
   console.showCursor();
@@ -1604,37 +2008,37 @@ _RichInputEvent _readRichInput(
           case ControlCharacter.arrowLeft:
           case ControlCharacter.ctrlB:
             if (draft.moveLeft()) {
-              onDraftChanged(draft.text, draft.cursor);
+              onDraftChanged(displayDraft(), draft.cursor);
             }
             continue;
           case ControlCharacter.arrowRight:
           case ControlCharacter.ctrlF:
             if (draft.moveRight()) {
-              onDraftChanged(draft.text, draft.cursor);
+              onDraftChanged(displayDraft(), draft.cursor);
             }
             continue;
           case ControlCharacter.home:
           case ControlCharacter.ctrlA:
             if (draft.moveLineStart()) {
-              onDraftChanged(draft.text, draft.cursor);
+              onDraftChanged(displayDraft(), draft.cursor);
             }
             continue;
           case ControlCharacter.end:
           case ControlCharacter.ctrlE:
             if (draft.moveLineEnd()) {
-              onDraftChanged(draft.text, draft.cursor);
+              onDraftChanged(displayDraft(), draft.cursor);
             }
             continue;
           case ControlCharacter.arrowUp:
             if (draft.moveUp()) {
-              onDraftChanged(draft.text, draft.cursor);
+              onDraftChanged(displayDraft(), draft.cursor);
             } else {
               moveHistoryUp();
             }
             continue;
           case ControlCharacter.arrowDown:
             if (draft.moveDown()) {
-              onDraftChanged(draft.text, draft.cursor);
+              onDraftChanged(displayDraft(), draft.cursor);
             } else {
               moveHistoryDown();
             }
@@ -1818,6 +2222,27 @@ String _fillTitle(String title, int width) {
   return title + ('─' * (width - titleWidth));
 }
 
+String _centerHeaderLine(String value, int width) {
+  final valueWidth = _displayWidth(value);
+  if (valueWidth >= width) {
+    return _fitRow(value, width);
+  }
+  final leftPadding = max(0, (width - valueWidth) ~/ 2);
+  return _fitRow('${' ' * leftPadding}$value', width);
+}
+
+String _truncateDisplayPath(String value, int width) {
+  if (_displayWidth(value) <= width || width <= 0) {
+    return value;
+  }
+  if (width <= 1) {
+    return _takeDisplayWidth(value, width);
+  }
+  final suffixLength = min(value.length, max(1, width - 1));
+  final suffix = value.substring(value.length - suffixLength);
+  return '…$suffix';
+}
+
 String _takeDisplayWidth(String value, int width) {
   if (width <= 0 || value.isEmpty) {
     return '';
@@ -1906,210 +2331,48 @@ String? _readPlainInputWithContinuation() {
   }
 }
 
-Future<_ReplStreamTurnResult> _runReplTurnCollectStream(
+Stream<void>? _watchSigintInterrupts() {
+  if (!stdin.hasTerminal) {
+    return null;
+  }
+  try {
+    return ProcessSignal.sigint.watch().map<void>((_) {});
+  } catch (_) {
+    return null;
+  }
+}
+
+Future<TurnExecutionResult> _runReplTurnCollectStream(
   QueryEngine engine,
   QueryRequest request, {
   bool allowInterrupt = false,
   void Function()? onInterrupt,
+  void Function(QueryEvent event)? onEvent,
   void Function(String delta, String? modelUsed)? onDelta,
 }) async {
-  final outputBuffer = StringBuffer();
-  final completer = Completer<_ReplStreamTurnResult>();
-  var completed = false;
-  var modelUsed = request.model;
-  late final StreamSubscription<ProviderStreamEvent> streamSub;
-  StreamSubscription<ProcessSignal>? sigintSub;
-
-  void complete(_ReplStreamTurnResult value) {
-    if (completed) {
-      return;
-    }
-    completed = true;
-    completer.complete(value);
-  }
-
-  streamSub = engine.runStream(request).listen(
-    (event) {
-      if (event.model != null && event.model!.isNotEmpty) {
-        modelUsed = event.model;
-      }
-      switch (event.type) {
-        case ProviderStreamEventType.textDelta:
-          final delta = event.delta ?? '';
-          if (delta.isNotEmpty) {
-            outputBuffer.write(delta);
-            onDelta?.call(delta, modelUsed);
-          }
-          break;
-        case ProviderStreamEventType.done:
-          complete(
-            _ReplStreamTurnResult(
-              success: true,
-              output: (event.output ?? outputBuffer.toString()),
-              modelUsed: event.model ?? modelUsed,
-            ),
-          );
-          break;
-        case ProviderStreamEventType.error:
-          final output = _renderProviderErrorOutput(event);
-          complete(
-            _ReplStreamTurnResult(
-              success: false,
-              output: output,
-              modelUsed: event.model ?? modelUsed,
-            ),
-          );
-          break;
-      }
-    },
-    onError: (Object error) {
-      complete(
-        _ReplStreamTurnResult(
-          success: false,
-          output: '[ERROR] provider stream failed: $error',
-          modelUsed: modelUsed,
-        ),
-      );
-    },
-    onDone: () {
-      if (completed) {
-        return;
-      }
-      final collected = outputBuffer.toString();
-      if (collected.isNotEmpty) {
-        complete(
-          _ReplStreamTurnResult(
-            success: true,
-            output: collected,
-            modelUsed: modelUsed,
-          ),
-        );
-      } else {
-        complete(
-          _ReplStreamTurnResult(
-            success: false,
-            output: '[ERROR] provider stream ended unexpectedly',
-            modelUsed: modelUsed,
-          ),
-        );
-      }
-    },
-    cancelOnError: false,
+  return TurnExecutor(engine).execute(
+    request: request,
+    turn: 1,
+    onEvent: onEvent,
+    onDelta: onDelta,
+    interruptSignals: allowInterrupt ? _watchSigintInterrupts() : null,
+    onInterrupt: onInterrupt,
   );
-
-  if (allowInterrupt && stdin.hasTerminal) {
-    try {
-      sigintSub = ProcessSignal.sigint.watch().listen((_) {
-        onInterrupt?.call();
-        complete(
-          _ReplStreamTurnResult(
-            success: false,
-            output: outputBuffer.toString(),
-            interrupted: true,
-            modelUsed: modelUsed,
-          ),
-        );
-        unawaited(streamSub.cancel());
-      });
-    } catch (_) {
-      // Keep stream path available if signal watching is unsupported.
-    }
-  }
-
-  final result = await completer.future;
-  await sigintSub?.cancel();
-  await streamSub.cancel();
-  return result;
 }
 
-String _renderProviderErrorOutput(ProviderStreamEvent event) {
-  if (event.error?.source == 'provider_config') {
-    return 'Provider is not configured. Run /init or clart_code init.';
-  }
-  if (event.output?.trim().isNotEmpty == true) {
-    return event.output!;
-  }
-  return event.error?.message ?? '[ERROR] provider stream failed';
-}
-
-Future<_ReplStreamTurnResult> _runReplTurnJson(
+Future<TurnExecutionResult> _runReplTurnJson(
   QueryEngine engine,
   QueryRequest request,
 ) async {
-  print(
-    jsonEncode(
-      QueryEvent(type: QueryEventType.turnStart, turn: 1).toJson(),
-    ),
-  );
-
   final result = await _runReplTurnCollectStream(
     engine,
     request,
     allowInterrupt: stdin.hasTerminal,
-    onDelta: (delta, modelUsed) {
-      print(
-        jsonEncode(
-          QueryEvent(
-            type: QueryEventType.providerDelta,
-            turn: 1,
-            delta: delta,
-            model: modelUsed,
-          ).toJson(),
-        ),
-      );
+    onEvent: (event) {
+      print(jsonEncode(event.toJson()));
     },
   );
 
-  if (result.success) {
-    print(
-      jsonEncode(
-        QueryEvent(
-          type: QueryEventType.assistant,
-          turn: 1,
-          output: result.output,
-          model: result.modelUsed ?? request.model,
-        ).toJson(),
-      ),
-    );
-    print(
-      jsonEncode(
-        QueryEvent(
-          type: QueryEventType.done,
-          turns: 1,
-          output: result.output,
-          model: result.modelUsed ?? request.model,
-          status: 'ok',
-        ).toJson(),
-      ),
-    );
-    return result;
-  }
-
-  if (result.interrupted) {
-    print(
-      jsonEncode(
-        QueryEvent(
-          type: QueryEventType.done,
-          turns: 1,
-          output: result.output,
-          model: result.modelUsed ?? request.model,
-          status: 'ok',
-        ).toJson(),
-      ),
-    );
-    return result;
-  }
-
-  print(
-    jsonEncode(
-      QueryEvent(
-        type: QueryEventType.error,
-        turn: 1,
-        output: result.output,
-        model: result.modelUsed ?? request.model,
-      ).toJson(),
-    ),
-  );
   print(
     jsonEncode(
       QueryEvent(
@@ -2117,14 +2380,14 @@ Future<_ReplStreamTurnResult> _runReplTurnJson(
         turns: 1,
         output: result.output,
         model: result.modelUsed ?? request.model,
-        status: 'error',
+        status: result.failed ? 'error' : 'ok',
       ).toJson(),
     ),
   );
   return result;
 }
 
-Future<_ReplStreamTurnResult> _runReplTurnStreamText(
+Future<TurnExecutionResult> _runReplTurnStreamText(
   QueryEngine engine,
   QueryRequest request,
 ) async {
@@ -2146,8 +2409,8 @@ Future<_ReplStreamTurnResult> _runReplTurnStreamText(
     return result;
   }
   if (result.interrupted) {
-    if (!printedAnyDelta && result.output.isNotEmpty) {
-      stdout.write(result.output);
+    if (!printedAnyDelta && result.rawOutput.isNotEmpty) {
+      stdout.write(result.rawOutput);
       stdout.writeln('');
     } else if (printedAnyDelta) {
       stdout.writeln('');
@@ -2162,8 +2425,618 @@ Future<_ReplStreamTurnResult> _runReplTurnStreamText(
   return result;
 }
 
+Future<int> _runDoctorCommand(CommandContext context) async {
+  final gitState = await readGitWorkspaceState();
+  for (final line in buildDoctorReportLines(
+    context.config,
+    gitState: gitState,
+  )) {
+    print(line);
+  }
+  return 0;
+}
+
+Future<int> _runMemoryCommand(CommandContext context) async {
+  if (context.args.isEmpty || context.args.first == 'show') {
+    final memory = readWorkspaceMemory();
+    print(memory.isEmpty ? '[empty-memory]' : memory);
+    return 0;
+  }
+
+  final subcommand = context.args.first;
+  switch (subcommand) {
+    case 'set':
+      final text = context.args.skip(1).join(' ');
+      if (text.trim().isEmpty) {
+        print('error: memory set requires text');
+        return 2;
+      }
+      writeWorkspaceMemory(text);
+      print('memory saved to ${workspaceMemoryPath()}');
+      return 0;
+    case 'append':
+      final text = context.args.skip(1).join(' ');
+      if (text.trim().isEmpty) {
+        print('error: memory append requires text');
+        return 2;
+      }
+      final current = readWorkspaceMemory();
+      final next = current.trim().isEmpty ? text : '$current\n$text';
+      writeWorkspaceMemory(next);
+      print('memory appended to ${workspaceMemoryPath()}');
+      return 0;
+    case 'clear':
+      writeWorkspaceMemory('');
+      print('memory cleared');
+      return 0;
+    default:
+      print(
+          'error: memory usage: memory [show|set <text>|append <text>|clear]');
+      return 2;
+  }
+}
+
+Future<int> _runTasksCommand(CommandContext context) async {
+  if (context.args.isEmpty || context.args.first == 'list') {
+    final tasks = readWorkspaceTasks();
+    if (tasks.isEmpty) {
+      print('[no-tasks]');
+      return 0;
+    }
+    for (final task in tasks) {
+      final marker = task.done ? 'x' : ' ';
+      print('[$marker] #${task.id} ${task.text}');
+    }
+    return 0;
+  }
+
+  final subcommand = context.args.first;
+  switch (subcommand) {
+    case 'add':
+      final text = context.args.skip(1).join(' ');
+      if (text.trim().isEmpty) {
+        print('error: tasks add requires text');
+        return 2;
+      }
+      final task = addWorkspaceTask(text);
+      print('task added: #${task.id} ${task.text}');
+      return 0;
+    case 'done':
+      if (context.args.length < 2) {
+        print('error: tasks done requires an id');
+        return 2;
+      }
+      final id = int.tryParse(context.args[1]);
+      if (id == null || id < 1) {
+        print('error: task id must be a positive integer');
+        return 2;
+      }
+      final updated = completeWorkspaceTask(id);
+      if (updated == null) {
+        print('error: task #$id not found');
+        return 1;
+      }
+      print('task completed: #${updated.id} ${updated.text}');
+      return 0;
+    case 'clear':
+      clearWorkspaceTasks();
+      print('tasks cleared');
+      return 0;
+    default:
+      print('error: tasks usage: tasks [list|add <text>|done <id>|clear]');
+      return 2;
+  }
+}
+
+Future<int> _runPermissionsCommand(CommandContext context) async {
+  if (context.args.isEmpty || context.args.first == 'show') {
+    final mode = readDefaultToolPermissionMode();
+    print('defaultToolPermission=${mode.name}');
+    print('config=${workspacePermissionsPath()}');
+    return 0;
+  }
+
+  if (context.args.first != 'set' || context.args.length < 2) {
+    print('error: permissions usage: permissions [show|set allow|deny]');
+    return 2;
+  }
+
+  final mode = _parseToolPermissionMode(context.args[1]);
+  if (mode == null) {
+    print('error: permissions set requires allow|deny');
+    return 2;
+  }
+  writeDefaultToolPermissionMode(mode);
+  print('default tool permission saved: ${mode.name}');
+  return 0;
+}
+
+Future<int> _runExportCommand(CommandContext context) async {
+  String? outputPath;
+  var i = 0;
+  while (i < context.args.length) {
+    final token = context.args[i];
+    if (token == '--out') {
+      if (i + 1 >= context.args.length) {
+        print('error: --out requires a path');
+        return 2;
+      }
+      outputPath = context.args[i + 1];
+      i += 2;
+      continue;
+    }
+    if (token.startsWith('--')) {
+      print('error: unknown option for export: $token');
+      return 2;
+    }
+    outputPath ??= token;
+    i += 1;
+  }
+
+  final gitState = await readGitWorkspaceState();
+
+  final snapshot = {
+    'exportedAt': DateTime.now().toUtc().toIso8601String(),
+    'workspace': Directory.current.path,
+    'config': {
+      'provider': context.config.provider.name,
+      'model': context.config.model,
+      'configPath': context.config.configPath,
+    },
+    'providerHint': buildProviderSetupHint(context.config),
+    'memory': readWorkspaceMemory(),
+    'tasks': readWorkspaceTasks().map((task) => task.toJson()).toList(),
+    'defaultToolPermission': readDefaultToolPermissionMode().name,
+    'mcpServers':
+        readWorkspaceMcpServers().map((server) => server.toJson()).toList(),
+    'git': {
+      'isGitRepository': gitState.isGitRepository,
+      'rootPath': gitState.rootPath,
+      'baseRef': gitState.baseRef,
+      'hasChanges': gitState.hasChanges,
+      'filesChanged': gitState.filesChanged,
+      'untrackedFiles': gitState.untrackedFiles,
+      'linesAdded': gitState.linesAdded,
+      'linesRemoved': gitState.linesRemoved,
+      'files': gitState.files.map((file) => file.toJson()).toList(),
+    },
+  };
+  final encoded = const JsonEncoder.withIndent('  ').convert(snapshot);
+
+  if (outputPath == null || outputPath.trim().isEmpty) {
+    print(encoded);
+    return 0;
+  }
+
+  final file = File(outputPath);
+  file.parent.createSync(recursive: true);
+  file.writeAsStringSync(encoded);
+  print('workspace snapshot exported to ${file.path}');
+  return 0;
+}
+
+Future<int> _runDiffCommand(CommandContext context) async {
+  var asJson = false;
+  var statOnly = false;
+  var namesOnly = false;
+
+  for (final token in context.args) {
+    switch (token) {
+      case '--json':
+        asJson = true;
+        break;
+      case '--stat':
+        statOnly = true;
+        break;
+      case '--name-only':
+        namesOnly = true;
+        break;
+      default:
+        print('error: diff usage: diff [--json|--stat|--name-only]');
+        return 2;
+    }
+  }
+
+  final modeCount =
+      [asJson, statOnly, namesOnly].where((enabled) => enabled).length;
+  if (modeCount > 1) {
+    print('error: diff options are mutually exclusive');
+    return 2;
+  }
+
+  final state = await readGitWorkspaceState();
+  if (!state.isGitRepository) {
+    print('error: current workspace is not a git repository');
+    return 1;
+  }
+
+  if (asJson) {
+    print(const JsonEncoder.withIndent('  ').convert(state.toJson()));
+    return 0;
+  }
+
+  if (namesOnly) {
+    if (!state.hasChanges) {
+      print('[clean-worktree]');
+      return 0;
+    }
+    for (final file in state.files) {
+      print(file.path);
+    }
+    return 0;
+  }
+
+  print(
+    renderGitWorkspaceSummary(
+      state,
+      includePatch: !statOnly,
+      includeUntrackedPreview: !statOnly,
+    ),
+  );
+  return 0;
+}
+
+Future<int> _runReviewCommand(CommandContext context) async {
+  var promptOnly = false;
+  final extraInstructionTokens = <String>[];
+
+  for (final token in context.args) {
+    if (token == '--prompt-only') {
+      promptOnly = true;
+      continue;
+    }
+    extraInstructionTokens.add(token);
+  }
+
+  final state = await readGitWorkspaceState();
+  if (!state.isGitRepository) {
+    print('error: current workspace is not a git repository');
+    return 1;
+  }
+  if (!state.hasChanges) {
+    print('[clean-worktree]');
+    return 0;
+  }
+
+  final reviewPrompt = buildReviewPrompt(
+    state,
+    extraInstructions: extraInstructionTokens.join(' ').trim(),
+  );
+  if (promptOnly) {
+    print(reviewPrompt);
+    return 0;
+  }
+
+  final submission = PromptSubmitter().submit(
+    reviewPrompt,
+    model: context.config.model,
+  );
+  final processed = const UserInputProcessor().process(submission);
+  if (!processed.isQuery) {
+    print('error: review prompt could not be constructed');
+    return 2;
+  }
+
+  final result = await TurnExecutor(context.engine).execute(
+    request: processed.request!,
+    turn: 1,
+    emitTurnStart: false,
+  );
+  final transcript = [
+    ...processed.transcriptMessages,
+    ...result.transcriptMessages,
+  ];
+  final history = result.success || result.interrupted
+      ? processed.request!.messages.followedBy([
+          if (result.displayOutput.isNotEmpty)
+            ChatMessage(
+              role: MessageRole.assistant,
+              text: result.displayOutput,
+            ),
+        ]).toList()
+      : processed.request!.messages;
+  writeWorkspaceSession(
+    buildWorkspaceSessionSnapshot(
+      id: createWorkspaceSessionId(),
+      provider: context.config.provider.name,
+      model: context.config.model,
+      history: history,
+      transcript: transcript,
+    ),
+  );
+  print(result.output);
+  return result.success ? 0 : 1;
+}
+
+WorkspaceSessionSnapshot? _resolveRequestedSession(
+  String? requestedId,
+) {
+  final effectiveId = requestedId?.trim().isNotEmpty == true
+      ? requestedId!.trim()
+      : readActiveWorkspaceSessionId();
+  if (effectiveId == null || effectiveId.isEmpty) {
+    return null;
+  }
+  return readWorkspaceSession(effectiveId);
+}
+
+Future<int> _runSessionCommand(CommandContext context) async {
+  if (context.args.isEmpty || context.args.first == 'list') {
+    final sessions = listWorkspaceSessions();
+    if (sessions.isEmpty) {
+      print('[no-sessions]');
+      return 0;
+    }
+    final activeId = readActiveWorkspaceSessionId();
+    for (final session in sessions) {
+      final activeMarker = session.id == activeId ? '*' : ' ';
+      print(
+        '$activeMarker ${session.id}\t${session.provider}\t${session.model ?? 'default'}\t${session.title}',
+      );
+    }
+    return 0;
+  }
+
+  final subcommand = context.args.first;
+  if (subcommand == 'show' || subcommand == 'current') {
+    String? id;
+    var asJson = false;
+    for (final token in context.args.skip(1)) {
+      if (token == '--json') {
+        asJson = true;
+      } else {
+        id ??= token;
+      }
+    }
+    final snapshot =
+        _resolveRequestedSession(subcommand == 'current' ? null : id);
+    if (snapshot == null) {
+      print('error: session not found');
+      return 1;
+    }
+    if (asJson) {
+      print(const JsonEncoder.withIndent('  ').convert(snapshot.toJson()));
+      return 0;
+    }
+    print('id=${snapshot.id}');
+    print('title=${snapshot.title}');
+    print('provider=${snapshot.provider}');
+    print('model=${snapshot.model ?? 'default'}');
+    print('createdAt=${snapshot.createdAt}');
+    print('updatedAt=${snapshot.updatedAt}');
+    print('history.messages=${snapshot.history.length}');
+    print('transcript.messages=${snapshot.transcript.length}');
+    return 0;
+  }
+
+  print(
+      'error: session usage: session [list|show <id> [--json]|current [--json]]');
+  return 2;
+}
+
+Future<int> _runResumeCommand(CommandContext context) async {
+  if (context.args.isEmpty) {
+    print('error: resume usage: resume [--last|<id>] <prompt>');
+    return 2;
+  }
+
+  String? requestedId;
+  final promptTokens = <String>[];
+  for (final token in context.args) {
+    if (token == '--last' && requestedId == null) {
+      requestedId = readActiveWorkspaceSessionId();
+      continue;
+    }
+    if (requestedId == null && promptTokens.isEmpty) {
+      final direct = readWorkspaceSession(token);
+      if (direct != null) {
+        requestedId = direct.id;
+        continue;
+      }
+    }
+    promptTokens.add(token);
+  }
+
+  final prompt = promptTokens.join(' ').trim();
+  if (prompt.isEmpty) {
+    print('error: resume requires prompt text');
+    return 2;
+  }
+
+  final snapshot = _resolveRequestedSession(requestedId);
+  if (snapshot == null) {
+    print('error: session not found');
+    return 1;
+  }
+
+  final resumedConfig = context.config.copyWith(
+    provider: parseProviderKind(snapshot.provider) ?? context.config.provider,
+    model: snapshot.model ?? context.config.model,
+  );
+  final conversation = ConversationSession(
+    initialMessages: snapshot.history,
+    initialTranscript: snapshot.transcript,
+  );
+  final submission = PromptSubmitter(conversation: conversation).submit(
+    prompt,
+    model: resumedConfig.model,
+  );
+  final processed = const UserInputProcessor().process(submission);
+  if (!processed.isQuery) {
+    print('error: resume only accepts plain prompt text');
+    return 2;
+  }
+
+  final engine = _buildRuntimeEngine(context, resumedConfig);
+  final result = await TurnExecutor(engine).execute(
+    request: processed.request!,
+    turn: 1,
+  );
+  conversation.appendTranscriptMessages([
+    ...processed.transcriptMessages,
+    ...result.transcriptMessages,
+  ]);
+  if (result.success || result.interrupted) {
+    conversation.recordHistoryTurn(
+      prompt: processed.submission.raw,
+      output: result.displayOutput,
+    );
+  }
+  final existing = readWorkspaceSession(snapshot.id);
+  writeWorkspaceSession(
+    buildWorkspaceSessionSnapshot(
+      id: snapshot.id,
+      provider: resumedConfig.provider.name,
+      model: resumedConfig.model,
+      history: conversation.history,
+      transcript: conversation.transcript,
+      createdAt: existing?.createdAt ?? snapshot.createdAt,
+    ),
+  );
+  print(result.output);
+  return result.success ? 0 : 1;
+}
+
+Future<int> _runShareCommand(CommandContext context) async {
+  String? requestedId;
+  String? outputPath;
+  var format = 'md';
+
+  var i = 0;
+  while (i < context.args.length) {
+    final token = context.args[i];
+    if (token == '--format') {
+      if (i + 1 >= context.args.length) {
+        print('error: --format requires md|json');
+        return 2;
+      }
+      format = context.args[i + 1].trim();
+      i += 2;
+      continue;
+    }
+    if (token == '--out') {
+      if (i + 1 >= context.args.length) {
+        print('error: --out requires a path');
+        return 2;
+      }
+      outputPath = context.args[i + 1];
+      i += 2;
+      continue;
+    }
+    if (requestedId == null) {
+      requestedId = token;
+      i += 1;
+      continue;
+    }
+    print('error: share usage: share [<id>] [--format md|json] [--out PATH]');
+    return 2;
+  }
+
+  if (format != 'md' && format != 'json') {
+    print('error: share --format must be md|json');
+    return 2;
+  }
+
+  final snapshot = _resolveRequestedSession(requestedId);
+  if (snapshot == null) {
+    print('error: session not found');
+    return 1;
+  }
+
+  final content = format == 'json'
+      ? const JsonEncoder.withIndent('  ').convert(snapshot.toJson())
+      : renderWorkspaceSessionMarkdown(snapshot);
+
+  if (outputPath == null || outputPath.trim().isEmpty) {
+    print(content);
+    return 0;
+  }
+
+  final file = File(outputPath);
+  file.parent.createSync(recursive: true);
+  file.writeAsStringSync(content);
+  print('session shared to ${file.path}');
+  return 0;
+}
+
+Future<int> _runMcpCommand(CommandContext context) async {
+  if (context.args.isEmpty || context.args.first == 'list') {
+    final servers = readWorkspaceMcpServers();
+    if (servers.isEmpty) {
+      print('[no-mcp-servers]');
+      return 0;
+    }
+    for (final server in servers) {
+      print('${server.name}\t${server.transport}\t${server.target}');
+    }
+    return 0;
+  }
+
+  final subcommand = context.args.first;
+  switch (subcommand) {
+    case 'add':
+      if (context.args.length < 4) {
+        print(
+            'error: mcp add usage: mcp add <name> <stdio|sse|http|ws> <target>');
+        return 2;
+      }
+      final name = context.args[1].trim();
+      final transport = context.args[2].trim();
+      final target = context.args.sublist(3).join(' ').trim();
+      if (name.isEmpty || target.isEmpty) {
+        print('error: mcp add requires non-empty name and target');
+        return 2;
+      }
+      if (!_isSupportedMcpTransport(transport)) {
+        print('error: mcp transport must be stdio|sse|http|ws');
+        return 2;
+      }
+      upsertWorkspaceMcpServer(
+        WorkspaceMcpServer(
+          name: name,
+          transport: transport,
+          target: target,
+        ),
+      );
+      print('mcp server saved: $name');
+      return 0;
+    case 'remove':
+      if (context.args.length < 2) {
+        print('error: mcp remove requires a name');
+        return 2;
+      }
+      final removed = removeWorkspaceMcpServer(context.args[1].trim());
+      if (!removed) {
+        print('error: mcp server not found: ${context.args[1].trim()}');
+        return 1;
+      }
+      print('mcp server removed: ${context.args[1].trim()}');
+      return 0;
+    case 'clear':
+      writeWorkspaceMcpServers(const []);
+      print('mcp servers cleared');
+      return 0;
+    default:
+      print(
+          'error: mcp usage: mcp [list|add <name> <transport> <target>|remove <name>|clear]');
+      return 2;
+  }
+}
+
+bool _isSupportedMcpTransport(String raw) {
+  switch (raw) {
+    case 'stdio':
+    case 'sse':
+    case 'http':
+    case 'ws':
+      return true;
+    default:
+      return false;
+  }
+}
+
 Future<int> _runToolCommand(CommandContext context) async {
-  var permissionMode = ToolPermissionMode.allow;
+  var permissionMode = readDefaultToolPermissionMode();
   var i = 0;
 
   while (i < context.args.length && context.args[i].startsWith('--')) {
@@ -2422,12 +3295,23 @@ Commands:
   version              Show version
   start [opts]         Trust gate + welcome + REPL
   status               Show current runtime config
+  doctor               Show workspace/config diagnostics
+  diff [opts]          Show current git workspace diff
   features             Show implemented migration features
   init [opts]          Initialize provider config (provider/key/host/model)
   chat <prompt>        One-shot prompt
   print <prompt>       Alias of chat
   loop [opts] <prompt> Multi-turn loop
+  review [opts]        Review current git workspace changes
   auth [opts]          Save provider auth config (provider + key + host)
+  memory [...]         Manage workspace memory file
+  tasks [...]          Manage simple local task list
+  permissions [...]    Show/set default tool permission mode
+  export [opts]        Export workspace snapshot as JSON
+  session [...]        Inspect saved local sessions
+  resume [...]         Resume a saved session with a new prompt
+  share [opts]         Export a saved session as JSON/Markdown
+  mcp [...]            Manage simple local MCP registry
   tool [opts] ...      Run minimal tool executor
   repl [opts]          Interactive mode
 
@@ -2446,7 +3330,7 @@ Loop opts:
 
 Repl opts:
   --stream-json        Print turn events as json lines
-  --ui MODE            plain|rich (default plain)
+  --ui MODE            plain|rich (default rich)
 
 Auth opts:
   --provider NAME      claude|openai (required unless current provider is set)
@@ -2454,6 +3338,14 @@ Auth opts:
   --base-url URL       Provider host/base URL
   --config PATH        Output config path (default: ./.clart/config.json)
   --show               Show current auth summary only
+
+Diff opts:
+  --json               Print structured git workspace snapshot
+  --stat               Print summary without patch body
+  --name-only          Print changed file paths only
+
+Review opts:
+  --prompt-only        Print generated review prompt without executing model
 
 Init opts:
   --provider NAME      claude|openai (prompted if missing in terminal)
@@ -2463,7 +3355,32 @@ Init opts:
   --config PATH        Output config path (default: ./.clart/config.json)
 
 Tool opts:
-  --permission MODE    allow|deny (default allow)
+  --permission MODE    allow|deny (default: persisted mode or allow)
+
+Memory usage:
+  memory [show|set <text>|append <text>|clear]
+
+Tasks usage:
+  tasks [list|add <text>|done <id>|clear]
+
+Permissions usage:
+  permissions [show|set allow|deny]
+
+Export opts:
+  --out PATH           Write workspace snapshot to file instead of stdout
+
+Session usage:
+  session [list|show <id> [--json]|current [--json]]
+
+Resume usage:
+  resume [--last|<id>] <prompt>
+
+Share opts:
+  --format FORMAT      md|json (default md)
+  --out PATH           Write exported session to file instead of stdout
+
+MCP usage:
+  mcp [list|add <name> <transport> <target>|remove <name>|clear]
 
 Tool usage:
   tool read <path>
@@ -2474,7 +3391,7 @@ Start opts:
   --yes                Trust current folder and proceed
   --no                 Exit immediately
   --no-repl            Render welcome only, skip REPL
-  --ui MODE            plain|rich (default plain)
+  --ui MODE            plain|rich (default rich)
   --trust-file PATH    Override trust storage path (for tests/CI)
 
 Notes:

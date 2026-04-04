@@ -85,6 +85,18 @@ class InlineInitCommandParseResult {
   final String? error;
 }
 
+class ProviderSetupApplyResult {
+  const ProviderSetupApplyResult({
+    required this.config,
+    required this.status,
+    required this.lines,
+  });
+
+  final AppConfig config;
+  final String status;
+  final List<String> lines;
+}
+
 InlineInitCommandParseResult parseInlineInitCommand(String input) {
   final tokens = input.trim().split(RegExp(r'\s+'));
   if (tokens.length < 3) {
@@ -162,6 +174,35 @@ AppConfig saveProviderSetup({
     current.copyWith(configPath: resolvedPath),
     next,
   ).copyWith(configPath: resolvedPath);
+}
+
+ProviderSetupApplyResult applyProviderSetup({
+  required AppConfig current,
+  required ProviderKind provider,
+  required String apiKey,
+  String? baseUrl,
+  String? model,
+}) {
+  final nextConfig = saveProviderSetup(
+    current: current,
+    provider: provider,
+    apiKey: apiKey,
+    baseUrl: baseUrl,
+    model: model,
+  );
+  final hint = buildProviderSetupHint(nextConfig);
+  final lines = <String>[
+    'configured ${provider.name} -> ${nextConfig.configPath ?? defaultConfigPath(cwd: Directory.current.path)}',
+    'provider=${nextConfig.provider.name}',
+    'model=${nextConfig.model ?? 'default'}',
+    ...providerConfigSummaryLines(nextConfig),
+  ];
+  lines.add(hint == null ? 'init complete.' : 'hint: $hint');
+  return ProviderSetupApplyResult(
+    config: nextConfig,
+    status: hint ?? 'Initialized provider config.',
+    lines: lines,
+  );
 }
 
 String? buildProviderSetupHint(AppConfig config) {

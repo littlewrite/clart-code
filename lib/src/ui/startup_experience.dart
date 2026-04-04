@@ -6,6 +6,7 @@ import 'package:dart_console/dart_console.dart';
 import 'package:interact_cli/interact_cli.dart';
 import 'package:mason_logger/mason_logger.dart';
 
+import '../cli/workspace_store.dart';
 import '../core/app_config.dart';
 
 class TrustDecision {
@@ -117,22 +118,87 @@ class StartupExperience {
     final model = config.model ?? 'default';
     final width = _panelWidth();
     final innerWidth = width - 2;
+    final columnGap = 3;
+    final leftWidth = max(32, min(52, (innerWidth - columnGap) ~/ 2));
+    final rightWidth = innerWidth - leftWidth - columnGap;
+    final leftColumn = _buildWelcomeLeftColumn(
+      cwd: cwd,
+      provider: provider,
+      model: model,
+      width: leftWidth,
+    );
+    final rightColumn = _buildWelcomeRightColumn(
+      cwd: cwd,
+      config: config,
+      width: rightWidth,
+    );
+    final bodyRows = max(leftColumn.length, rightColumn.length);
 
     print('');
     print('╭${_fillTitle('─── Clart Code v$version ', innerWidth)}╮');
-    print('│${_fitLine(' Welcome back!', innerWidth)}│');
-    print(
-      '│${_fitLine(' Tip: run /init in REPL (or clart_code init) to configure LLM.', innerWidth)}│',
-    );
-    print('│${_fitLine('', innerWidth)}│');
-    print('│${_fitLine(' Provider: $provider', innerWidth)}│');
-    print('│${_fitLine(' Model: $model', innerWidth)}│');
-    print('│${_fitLine(' Workspace: $cwd', innerWidth)}│');
+    for (var i = 0; i < bodyRows; i++) {
+      final left = i < leftColumn.length ? leftColumn[i] : '';
+      final right = i < rightColumn.length ? rightColumn[i] : '';
+      print(
+        '│${_fitLine(left, leftWidth)} │ ${_fitLine(right, rightWidth)}│',
+      );
+    }
     print('╰${'─' * innerWidth}╯');
     print('');
-    print('  /model to switch model');
+    print(
+      '  /init to configure provider · /model to switch model · /status for diagnostics',
+    );
     print('');
     print('> Try "create a util logging.py that..."');
+  }
+
+  List<String> _buildWelcomeLeftColumn({
+    required String cwd,
+    required String provider,
+    required String model,
+    required int width,
+  }) {
+    return [
+      '',
+      _centerLine('Welcome back!', width),
+      '',
+      _centerLine('▐▛███▜▌', width),
+      _centerLine('▝▜█████▛▘', width),
+      _centerLine('▘▘ ▝▝', width),
+      '',
+      ' $provider · $model',
+      ' ${_truncatePath(cwd, max(12, width - 2))}',
+    ];
+  }
+
+  List<String> _buildWelcomeRightColumn({
+    required String cwd,
+    required AppConfig config,
+    required int width,
+  }) {
+    final sessions = listWorkspaceSessions(cwd: cwd);
+    final activeId = readActiveWorkspaceSessionId(cwd: cwd);
+    final activeSession = activeId == null
+        ? (sessions.isEmpty ? null : sessions.first)
+        : readWorkspaceSession(activeId, cwd: cwd) ??
+            (sessions.isEmpty ? null : sessions.first);
+    final openTasks =
+        readWorkspaceTasks(cwd: cwd).where((task) => !task.done).length;
+    final hint = buildProviderHint(config);
+
+    return [
+      'Tips for getting started',
+      hint ?? 'Provider looks ready. Ask a question below.',
+      '',
+      'Recent activity',
+      activeSession == null
+          ? 'No recent activity'
+          : '${activeSession.provider}/${activeSession.model ?? 'default'}',
+      activeSession == null ? '' : activeSession.title,
+      '',
+      'Open tasks: $openTasks',
+      '/help for shortcuts',
+    ];
   }
 
   bool _promptForTrust(String directoryPath) {
@@ -195,9 +261,44 @@ class StartupExperience {
     }
     return title + ('─' * (width - title.length));
   }
+
+  String _centerLine(String value, int width) {
+    if (value.length >= width) {
+      return _fitLine(value, width);
+    }
+    final leftPadding = max(0, (width - value.length) ~/ 2);
+    return _fitLine('${' ' * leftPadding}$value', width);
+  }
+
+  String _truncatePath(String path, int width) {
+    if (path.length <= width) {
+      return path;
+    }
+    if (width <= 1) {
+      return path.substring(0, width);
+    }
+    return '…${path.substring(path.length - width + 1)}';
+  }
 }
 
 String defaultTrustStorePath({String? cwd}) {
   final base = cwd ?? Directory.current.path;
   return '$base/.clart/trust.json';
+}
+
+String? buildProviderHint(AppConfig config) {
+  switch (config.provider) {
+    case ProviderKind.local:
+      return 'Run /init to connect a real model provider.';
+    case ProviderKind.claude:
+      if (config.claudeApiKey?.trim().isEmpty ?? true) {
+        return 'Claude API key missing. Run /init.';
+      }
+      return null;
+    case ProviderKind.openai:
+      if (config.openAiApiKey?.trim().isEmpty ?? true) {
+        return 'OpenAI API key missing. Run /init.';
+      }
+      return null;
+  }
 }

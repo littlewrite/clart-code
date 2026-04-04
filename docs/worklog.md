@@ -111,6 +111,96 @@
   - provider 增量事件在 `stream-json` 路径可见
   - provider 流错误路径返回失败状态
 
+## 2026-04-04 / Iteration 9.7（闭环优先）
+
+- 切换策略：优先扩大“简单版可闭环功能面”，暂缓早期细节抛光。
+- 新增 workspace 状态层：`./.clart/`
+  - `memory.md`
+  - `tasks.json`
+  - `permissions.json`
+  - `mcp_servers.json`
+- 新增命令：
+  - `doctor`
+  - `memory`
+  - `tasks`
+  - `permissions`
+  - `export`
+  - `mcp`
+- `tool` 命令默认权限模式现在会读取工作区持久化设置；`permissions set allow|deny` 可影响后续 `tool` 执行。
+- `export --out PATH` 可导出当前工作区快照（config/memory/tasks/permissions/mcp）。
+- 新增测试覆盖：
+  - memory 持久化
+  - tasks add/done
+  - persisted permissions -> tool 默认权限链路
+  - export snapshot
+
+## 2026-04-04 / Iteration 9.8（本地 session 闭环）
+
+- 新增本地 session 存储：
+  - `./.clart/sessions/<id>.json`
+  - `./.clart/active_session.json`
+- `chat / repl / loop` 现在会把会话 history + typed transcript 落盘为本地 session 快照。
+- 新增命令：
+  - `session [list|show|current]`
+  - `resume [--last|<id>] <prompt>`
+  - `share [<id>] [--format md|json] [--out PATH]`
+- `resume` 会基于保存的 history 继续构造下一轮 `QueryRequest`，形成最小本地多轮恢复链路。
+- `share` 支持把 session 导出为 Markdown 或 JSON，便于查看/传递。
+- 新增测试覆盖：
+  - chat -> session file
+  - resume -> 更新同一 session
+  - share -> Markdown 导出
+
+## 2026-04-04 / Iteration 9.10（git workspace + review 最小闭环）
+
+- 新增 git 工作区状态读取层：
+  - 当前目录是否为 git repo
+  - `HEAD` 对比 working tree 的 tracked diff
+  - 变更文件列表 / 增删行统计
+  - 小体积 untracked 文件预览
+- 新增命令：
+  - `diff [--json|--stat|--name-only]`
+  - `review [--prompt-only] [extra instructions...]`
+- `review` 采用最小实现策略：
+  - 不做独立审查引擎；
+  - 直接把当前 git 状态拼成 review prompt；
+  - 复用现有 `PromptSubmitter -> UserInputProcessor -> TurnExecutor` 执行一轮。
+- `doctor` 现在会输出 git repo/dirty/files/untracked/linesAdded/linesRemoved。
+- `export` 现在会携带 git workspace 摘要，便于后续 session/workspace 联动。
+- `help/features` 文案已同步更新，避免 CLI 能力和文档基线脱节。
+- 新增测试覆盖：
+  - `diff --json`
+  - `review`
+  - `review --prompt-only`
+  - `doctor` git 状态输出
+  - `export` 包含 git 快照
+
+## 2026-04-04 / Iteration 9.11（REPL 本地工作区命令补齐）
+
+- `review` 执行后现在也会写入本地 session，和 `chat` / `loop` 一样可被 `session/share` 复用。
+- REPL 新增同步本地命令：
+  - `/doctor`
+  - `/diff`
+  - `/memory`
+  - `/tasks`
+  - `/permissions`
+  - `/mcp`
+  - `/session`
+- 采用最小实现策略：
+  - 不改 REPL 现有 sync slash command 接口；
+  - 仅补不依赖模型的本地工作区命令；
+  - `git` 工作区读取补充 sync 版本，供 REPL 直接调用。
+- 抽出本地诊断报告构建函数，避免 CLI `doctor` 与 REPL `/doctor` 各写一套。
+- 新增测试覆盖：
+  - `/help` 包含 `doctor/diff`
+  - `/doctor`
+  - `/diff`
+  - `/memory`
+  - `/tasks`
+  - `/permissions`
+  - `/mcp`
+  - `/session`
+
 ## 2026-04-03 / Iteration 9.1（交互补齐）
 
 - 修复默认启动体验：`fvm dart run ./bin/clart_code.dart` 不再停在欢迎页后退出。
@@ -259,8 +349,15 @@
 
 ## 下一步
 
-- 继续补齐 `/init` 的 rich 模式逐步向导体验（避免内联明文 key 输入）。
-- 继续把 `processUserInput` 向 `claude-code` 靠拢：
-  - 增加更完整的 typed transcript/tool/local-command message
-  - 让 `chat / repl / loop / stream-json` 共用统一 turn executor
+- 已补齐 `/init` 的 rich 模式逐步向导体验：
+  - rich REPL 输入层支持掩码显示，用于 API key 输入
+  - 在 rich 模式输入 `/init` 时，会进入 provider/api key/baseUrl/model 的逐步向导
+  - API key 不再以普通命令文本形式回显到富文本输入区
+  - `/init` 的配置落盘与摘要输出已抽到 `applyProviderSetup`
+- 已完成 `processUserInput` 主链路的进一步收口：
+  - 新增 `TurnExecutor`，统一 `chat / repl / loop / stream-json` 的单 turn 执行
+  - provider stream 消费、`providerDelta/assistant/error` 事件发射、中断处理已统一
+  - provider config 错误文案统一归一为 `Provider is not configured. Run /init or clart_code init.`
+  - `TranscriptMessage` 已独立为 core 类型，并细化为 `userPrompt/localCommand/localCommandStdout/localCommandStderr/assistant/toolResult/system`
+  - `ConversationSession` 已开始保存 typed transcript；local command / invalid / failed query 会进入 transcript，但不会污染后续模型 history
 - 收敛真实 LLM 往返链路与错误提示文案（网络/鉴权/host 分类），再进入 Iteration 10。

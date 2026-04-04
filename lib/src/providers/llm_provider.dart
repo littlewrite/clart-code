@@ -92,6 +92,16 @@ abstract class LlmProvider {
   }
 }
 
+Map<String, Object?> buildClaudeRequestBodyForTest({
+  required QueryRequest request,
+  String? fallbackModel,
+}) {
+  return _buildClaudeRequestBodyPayload(
+    request: request,
+    fallbackModel: fallbackModel,
+  );
+}
+
 class LocalEchoProvider extends LlmProvider {
   @override
   Future<QueryResponse> run(QueryRequest request) async {
@@ -150,17 +160,21 @@ class ClaudeApiProvider extends LlmProvider {
       if (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300) {
         final responseText = await httpResponse.transform(utf8.decoder).join();
         final responseMap = _decodeJsonObject(responseText);
-        yield ProviderStreamEvent.error(
-          error: RuntimeError(
-            code: _mapClaudeHttpCode(httpResponse.statusCode),
-            message: _extractClaudeErrorMessage(
-              responseMap: responseMap,
-              fallbackStatusCode: httpResponse.statusCode,
-            ),
-            source: 'claude_http',
-            retriable: httpResponse.statusCode >= 500,
+        final runtimeError = RuntimeError(
+          code: _mapClaudeHttpCode(httpResponse.statusCode),
+          message: _extractClaudeErrorMessage(
+            responseMap: responseMap,
+            fallbackStatusCode: httpResponse.statusCode,
           ),
-          output: '[ERROR] Claude request failed',
+          source: 'claude_http',
+          retriable: httpResponse.statusCode >= 500,
+        );
+        yield ProviderStreamEvent.error(
+          error: runtimeError,
+          output: _formatClaudeErrorOutput(
+            runtimeError,
+            statusCode: httpResponse.statusCode,
+          ),
           model: modelUsed,
         );
         return;
@@ -225,14 +239,13 @@ class ClaudeApiProvider extends LlmProvider {
         );
       }
     } catch (error) {
+      final runtimeError = _mapClaudeTransportError(
+        error,
+        source: 'claude_stream',
+      );
       yield ProviderStreamEvent.error(
-        error: RuntimeError(
-          code: RuntimeErrorCode.providerFailure,
-          message: '$error',
-          source: 'claude_stream',
-          retriable: true,
-        ),
-        output: '[ERROR] Claude request failed',
+        error: runtimeError,
+        output: _formatClaudeErrorOutput(runtimeError),
         model: modelUsed,
       );
     } finally {
@@ -279,28 +292,31 @@ class ClaudeApiProvider extends LlmProvider {
         );
       }
 
-      return QueryResponse.failure(
-        error: RuntimeError(
-          code: _mapClaudeHttpCode(httpResponse.statusCode),
-          message: _extractClaudeErrorMessage(
-            responseMap: responseMap,
-            fallbackStatusCode: httpResponse.statusCode,
-          ),
-          source: 'claude_http',
-          retriable: httpResponse.statusCode >= 500,
+      final runtimeError = RuntimeError(
+        code: _mapClaudeHttpCode(httpResponse.statusCode),
+        message: _extractClaudeErrorMessage(
+          responseMap: responseMap,
+          fallbackStatusCode: httpResponse.statusCode,
         ),
-        output: '[ERROR] Claude request failed',
+        source: 'claude_http',
+        retriable: httpResponse.statusCode >= 500,
+      );
+      return QueryResponse.failure(
+        error: runtimeError,
+        output: _formatClaudeErrorOutput(
+          runtimeError,
+          statusCode: httpResponse.statusCode,
+        ),
         modelUsed: requestedModel,
       );
     } catch (error) {
+      final runtimeError = _mapClaudeTransportError(
+        error,
+        source: 'claude_http',
+      );
       return QueryResponse.failure(
-        error: RuntimeError(
-          code: RuntimeErrorCode.providerFailure,
-          message: '$error',
-          source: 'claude_http',
-          retriable: true,
-        ),
-        output: '[ERROR] Claude request failed',
+        error: runtimeError,
+        output: _formatClaudeErrorOutput(runtimeError),
         modelUsed: requestedModel,
       );
     } finally {
@@ -322,36 +338,10 @@ class ClaudeApiProvider extends LlmProvider {
   }
 
   Map<String, Object?> _buildClaudeRequestBody(QueryRequest request) {
-    final systemMessages = <String>[];
-    final messages = <Map<String, Object?>>[];
-
-    for (final message in request.messages) {
-      switch (message.role) {
-        case MessageRole.system:
-          systemMessages.add(message.text);
-          break;
-        case MessageRole.user:
-          messages.add({'role': 'user', 'content': message.text});
-          break;
-        case MessageRole.assistant:
-          messages.add({'role': 'assistant', 'content': message.text});
-          break;
-        case MessageRole.tool:
-          messages.add({'role': 'user', 'content': '[tool] ${message.text}'});
-          break;
-      }
-    }
-
-    if (messages.isEmpty) {
-      messages.add({'role': 'user', 'content': ''});
-    }
-
-    return {
-      'model': _resolveClaudeModel(request),
-      'max_tokens': _defaultClaudeMaxTokens,
-      if (systemMessages.isNotEmpty) 'system': systemMessages.join('\n'),
-      'messages': messages,
-    };
+    return _buildClaudeRequestBodyPayload(
+      request: request,
+      fallbackModel: model,
+    );
   }
 
   String _resolveClaudeModel(QueryRequest request) {
@@ -433,18 +423,19 @@ class ClaudeApiProvider extends LlmProvider {
     var terminal = false;
 
     if (payloadType == 'error' || eventName == 'error') {
+      final runtimeError = RuntimeError(
+        code: RuntimeErrorCode.providerFailure,
+        message: _extractClaudeErrorMessage(
+          responseMap: payload,
+          fallbackStatusCode: 500,
+        ),
+        source: 'claude_stream',
+        retriable: true,
+      );
       events.add(
         ProviderStreamEvent.error(
-          error: RuntimeError(
-            code: RuntimeErrorCode.providerFailure,
-            message: _extractClaudeErrorMessage(
-              responseMap: payload,
-              fallbackStatusCode: 500,
-            ),
-            source: 'claude_stream',
-            retriable: true,
-          ),
-          output: '[ERROR] Claude request failed',
+          error: runtimeError,
+          output: _formatClaudeErrorOutput(runtimeError),
           model: modelUsed,
         ),
       );
@@ -504,6 +495,78 @@ class ClaudeApiProvider extends LlmProvider {
     return 'Claude request failed with status $fallbackStatusCode';
   }
 
+  RuntimeError _mapClaudeTransportError(
+    Object error, {
+    required String source,
+  }) {
+    if (error is SocketException) {
+      return RuntimeError(
+        code: RuntimeErrorCode.providerFailure,
+        message:
+            'Network error while reaching Claude API. Check your base URL, proxy, or internet connection.',
+        source: source,
+        retriable: true,
+      );
+    }
+    if (error is HandshakeException) {
+      return RuntimeError(
+        code: RuntimeErrorCode.providerFailure,
+        message:
+            'TLS handshake failed while reaching Claude API. Check HTTPS certificates or the configured base URL.',
+        source: source,
+        retriable: true,
+      );
+    }
+    return RuntimeError(
+      code: RuntimeErrorCode.providerFailure,
+      message: '$error',
+      source: source,
+      retriable: true,
+    );
+  }
+
+  String _formatClaudeErrorOutput(
+    RuntimeError error, {
+    int? statusCode,
+  }) {
+    if (error.message.contains('thinking type should be enabled or disabled')) {
+      return '[ERROR] Claude-compatible endpoint rejected the request thinking mode. Clart now sends thinking=disabled by default; re-check the selected model/base URL if this continues.';
+    }
+    if (statusCode != null) {
+      if (statusCode == 400) {
+        return '[ERROR] Claude request was rejected (HTTP 400): ${error.message}';
+      }
+      if (statusCode == 401 || statusCode == 403) {
+        return '[ERROR] Claude authentication failed (HTTP $statusCode). Check your API key and base URL.';
+      }
+      if (statusCode == 404) {
+        return '[ERROR] Claude endpoint not found (HTTP 404). Check whether the configured base URL points to a Claude-compatible /v1/messages endpoint.';
+      }
+      if (statusCode == 405) {
+        return '[ERROR] Claude endpoint rejected the HTTP method (HTTP 405). Check whether the configured base URL is correct.';
+      }
+      if (statusCode == 408 || statusCode == 429) {
+        return '[ERROR] Claude request was throttled or timed out (HTTP $statusCode): ${error.message}';
+      }
+      if (statusCode >= 500) {
+        return '[ERROR] Claude API/network error (HTTP $statusCode): ${error.message}';
+      }
+      return '[ERROR] Claude request failed (HTTP $statusCode): ${error.message}';
+    }
+    if (error.code == RuntimeErrorCode.permissionDenied) {
+      return '[ERROR] Claude authentication failed. Check your API key and base URL.';
+    }
+    if (error.message.contains('invalid x-api-key')) {
+      return '[ERROR] Claude authentication failed. Check your API key.';
+    }
+    if (error.message.contains('Network error while reaching Claude API') ||
+        error.message
+            .contains('TLS handshake failed while reaching Claude API')) {
+      return '[ERROR] Could not reach Claude API. Check your network and base URL.';
+    }
+    return '[ERROR] Could not reach Claude API. Check your network and base URL.';
+  }
+
   RuntimeErrorCode _mapClaudeHttpCode(int statusCode) {
     if (statusCode == 400) {
       return RuntimeErrorCode.invalidInput;
@@ -519,6 +582,44 @@ const String _defaultClaudeBaseUrl = 'https://api.anthropic.com';
 const String _anthropicApiVersion = '2023-06-01';
 const String _defaultClaudeModel = 'claude-3-5-sonnet-latest';
 const int _defaultClaudeMaxTokens = 1024;
+
+Map<String, Object?> _buildClaudeRequestBodyPayload({
+  required QueryRequest request,
+  String? fallbackModel,
+}) {
+  final resolvedModel = request.model ?? fallbackModel ?? _defaultClaudeModel;
+  final systemMessages = <String>[];
+  final messages = <Map<String, Object?>>[];
+
+  for (final message in request.messages) {
+    switch (message.role) {
+      case MessageRole.system:
+        systemMessages.add(message.text);
+        break;
+      case MessageRole.user:
+        messages.add({'role': 'user', 'content': message.text});
+        break;
+      case MessageRole.assistant:
+        messages.add({'role': 'assistant', 'content': message.text});
+        break;
+      case MessageRole.tool:
+        messages.add({'role': 'user', 'content': '[tool] ${message.text}'});
+        break;
+    }
+  }
+
+  if (messages.isEmpty) {
+    messages.add({'role': 'user', 'content': ''});
+  }
+
+  return {
+    'model': resolvedModel,
+    'max_tokens': _defaultClaudeMaxTokens,
+    'thinking': const {'type': 'disabled'},
+    if (systemMessages.isNotEmpty) 'system': systemMessages.join('\n'),
+    'messages': messages,
+  };
+}
 
 class _ClaudeStreamPayloadParseResult {
   const _ClaudeStreamPayloadParseResult({
