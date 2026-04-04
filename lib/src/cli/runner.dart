@@ -520,21 +520,31 @@ Future<int> _runInitCommand(CommandContext context) async {
       print('error: --provider must be claude|openai');
       return 2;
     }
-  } else if (existing.provider != ProviderKind.local) {
-    providerKind = existing.provider;
-  }
-
-  if (providerKind == null) {
+  } else {
+    final currentRemoteProvider =
+        existing.provider == ProviderKind.local ? null : existing.provider;
     if (!stdin.hasTerminal) {
-      print('error: missing provider; set --provider claude|openai');
-      return 2;
-    }
-    stdout.write('Provider (claude/openai): ');
-    final selected = stdin.readLineSync()?.trim();
-    providerKind = parseProviderKind(selected);
-    if (providerKind == null || providerKind == ProviderKind.local) {
-      print('error: provider must be claude|openai');
-      return 2;
+      providerKind = currentRemoteProvider;
+      if (providerKind == null) {
+        print('error: missing provider; set --provider claude|openai');
+        return 2;
+      }
+    } else {
+      stdout.write(
+        currentRemoteProvider == null
+            ? 'Provider (claude/openai): '
+            : 'Provider (claude/openai, Enter to keep ${currentRemoteProvider.name}): ',
+      );
+      final selected = stdin.readLineSync()?.trim() ?? '';
+      if (selected.isEmpty && currentRemoteProvider != null) {
+        providerKind = currentRemoteProvider;
+      } else {
+        providerKind = parseProviderKind(selected);
+      }
+      if (providerKind == null || providerKind == ProviderKind.local) {
+        print('error: provider must be claude|openai');
+        return 2;
+      }
     }
   }
 

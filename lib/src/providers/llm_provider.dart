@@ -1,8 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:dart_openai/dart_openai.dart';
-
 import '../core/models.dart';
 import '../core/runtime_error.dart';
 
@@ -100,6 +98,34 @@ Map<String, Object?> buildClaudeRequestBodyForTest({
     request: request,
     fallbackModel: fallbackModel,
   );
+}
+
+Map<String, Object?> buildOpenAiResponsesRequestBodyForTest({
+  required QueryRequest request,
+  String? fallbackModel,
+}) {
+  return _buildOpenAiResponsesRequestBodyPayload(
+    request: request,
+    fallbackModel: fallbackModel,
+  );
+}
+
+String extractOpenAiResponsesOutputForTest(Map<String, Object?> responseMap) {
+  return _extractOpenAiResponsesOutput(responseMap);
+}
+
+List<ProviderStreamEvent> parseOpenAiResponsesStreamPayloadEventsForTest({
+  required String rawPayload,
+  String? eventName,
+  String currentModel = 'test-model',
+}) {
+  final result = _parseOpenAiResponsesStreamPayload(
+    rawPayload: rawPayload,
+    eventName: eventName,
+    currentModel: currentModel,
+    outputBuffer: StringBuffer(),
+  );
+  return result.events;
 }
 
 class LocalEchoProvider extends LlmProvider {
@@ -348,17 +374,6 @@ class ClaudeApiProvider extends LlmProvider {
     return request.model ?? model ?? _defaultClaudeModel;
   }
 
-  Map<String, Object?> _decodeJsonObject(String raw) {
-    if (raw.trim().isEmpty) {
-      return const {};
-    }
-    final decoded = jsonDecode(raw);
-    if (decoded is Map<String, dynamic>) {
-      return decoded;
-    }
-    return const {};
-  }
-
   String _extractClaudeOutput(Map<String, Object?> responseMap) {
     final content = responseMap['content'];
     if (content is! List) {
@@ -580,8 +595,19 @@ class ClaudeApiProvider extends LlmProvider {
 
 const String _defaultClaudeBaseUrl = 'https://api.anthropic.com';
 const String _anthropicApiVersion = '2023-06-01';
-const String _defaultClaudeModel = 'claude-3-5-sonnet-latest';
+const String _defaultClaudeModel = 'claude-sonnet-4-6';
 const int _defaultClaudeMaxTokens = 1024;
+
+Map<String, Object?> _decodeJsonObject(String raw) {
+  if (raw.trim().isEmpty) {
+    return const {};
+  }
+  final decoded = jsonDecode(raw);
+  if (decoded is Map<String, dynamic>) {
+    return decoded;
+  }
+  return const {};
+}
 
 Map<String, Object?> _buildClaudeRequestBodyPayload({
   required QueryRequest request,
@@ -661,56 +687,115 @@ class OpenAiApiProvider extends LlmProvider {
       return;
     }
 
-    OpenAI.apiKey = apiKey;
-    OpenAI.showLogs = false;
-    OpenAI.showResponsesLogs = false;
-    if (baseUrl != null && baseUrl!.trim().isNotEmpty) {
-      OpenAI.baseUrl = baseUrl!;
-    }
-
-    final messages = request.messages.map(_toOpenAiMessage).toList();
+    final client = HttpClient();
     final outputBuffer = StringBuffer();
+    var modelUsed = chosenModel;
+    var emittedTerminalEvent = false;
 
     try {
-      final stream = OpenAI.instance.chat.createStream(
-        model: chosenModel,
-        messages: messages,
-      );
-      await for (final chunk in stream) {
-        final deltaText = chunk.choices
-            .map((choice) => choice.delta.content ?? const [])
-            .expand((items) => items)
-            .map((item) => item?.text ?? '')
-            .where((text) => text.isNotEmpty)
-            .join();
+      final uri = _buildOpenAiResponsesUri(baseUrl);
+      final body = _buildOpenAiResponsesRequestBody(request)..['stream'] = true;
+      final httpRequest = await client.postUrl(uri);
+      httpRequest.headers
+          .set(HttpHeaders.contentTypeHeader, 'application/json');
+      httpRequest.headers
+          .set(HttpHeaders.authorizationHeader, 'Bearer ${apiKey.trim()}');
+      httpRequest.add(utf8.encode(jsonEncode(body)));
 
-        if (deltaText.isEmpty) {
-          continue;
-        }
-
-        outputBuffer.write(deltaText);
-        yield ProviderStreamEvent.textDelta(
-          delta: deltaText,
-          model: chosenModel,
+      final httpResponse = await httpRequest.close();
+      if (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300) {
+        final responseText = await httpResponse.transform(utf8.decoder).join();
+        final responseMap = _decodeJsonObject(responseText);
+        final runtimeError = RuntimeError(
+          code: _mapOpenAiHttpCode(httpResponse.statusCode),
+          message: _extractOpenAiErrorMessage(
+            responseMap: responseMap,
+            fallbackStatusCode: httpResponse.statusCode,
+          ),
+          source: 'openai_http',
+          retriable: httpResponse.statusCode >= 500,
         );
+        yield ProviderStreamEvent.error(
+          error: runtimeError,
+          output: _formatOpenAiErrorOutput(
+            runtimeError,
+            statusCode: httpResponse.statusCode,
+          ),
+          model: modelUsed,
+        );
+        return;
       }
 
-      final output = outputBuffer.toString();
-      yield ProviderStreamEvent.done(
-        output: output.isEmpty ? '[empty-output]' : output,
-        model: chosenModel,
-      );
+      String? eventName;
+      final dataLines = <String>[];
+
+      await for (final line in httpResponse
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())) {
+        final trimmed = line.trimRight();
+        if (trimmed.isEmpty) {
+          if (dataLines.isNotEmpty) {
+            final parsed = _parseOpenAiResponsesStreamPayload(
+              rawPayload: dataLines.join('\n').trim(),
+              eventName: eventName,
+              currentModel: modelUsed,
+              outputBuffer: outputBuffer,
+            );
+            dataLines.clear();
+            modelUsed = parsed.modelUsed;
+            for (final event in parsed.events) {
+              yield event;
+            }
+            if (parsed.terminal) {
+              emittedTerminalEvent = true;
+              break;
+            }
+          }
+          eventName = null;
+          continue;
+        }
+        if (trimmed.startsWith('event:')) {
+          eventName = trimmed.substring(6).trim();
+          continue;
+        }
+        if (trimmed.startsWith('data:')) {
+          dataLines.add(trimmed.substring(5).trim());
+        }
+      }
+
+      if (!emittedTerminalEvent && dataLines.isNotEmpty) {
+        final parsed = _parseOpenAiResponsesStreamPayload(
+          rawPayload: dataLines.join('\n').trim(),
+          eventName: eventName,
+          currentModel: modelUsed,
+          outputBuffer: outputBuffer,
+        );
+        modelUsed = parsed.modelUsed;
+        for (final event in parsed.events) {
+          yield event;
+        }
+        emittedTerminalEvent = parsed.terminal;
+      }
+
+      if (!emittedTerminalEvent) {
+        final output = outputBuffer.toString();
+        yield ProviderStreamEvent.done(
+          output: output.isEmpty ? '[empty-output]' : output,
+          model: modelUsed,
+        );
+      }
     } catch (error) {
-      yield ProviderStreamEvent.error(
-        error: RuntimeError(
-          code: RuntimeErrorCode.providerFailure,
-          message: '$error',
-          source: 'openai_sdk_stream',
-          retriable: true,
-        ),
-        output: '[ERROR] OpenAI request failed',
-        model: chosenModel,
+      final runtimeError = _mapOpenAiTransportError(
+        error,
+        source: 'openai_stream',
       );
+      yield ProviderStreamEvent.error(
+        error: runtimeError,
+        output: _formatOpenAiErrorOutput(runtimeError),
+        model: modelUsed,
+      );
+    } finally {
+      client.close(force: true);
     }
   }
 
@@ -730,64 +815,405 @@ class OpenAiApiProvider extends LlmProvider {
       );
     }
 
-    OpenAI.apiKey = apiKey;
-    OpenAI.showLogs = false;
-    OpenAI.showResponsesLogs = false;
-    if (baseUrl != null && baseUrl!.trim().isNotEmpty) {
-      OpenAI.baseUrl = baseUrl!;
-    }
-
-    final messages = request.messages.map(_toOpenAiMessage).toList();
+    final client = HttpClient();
 
     try {
-      final completion = await OpenAI.instance.chat.create(
-        model: chosenModel,
-        messages: messages,
-      );
-      final text = completion.choices
-          .map((choice) => choice.message.content ?? const [])
-          .expand((items) => items)
-          .map((item) => item.text ?? '')
-          .where((text) => text.isNotEmpty)
-          .join('\n');
+      final uri = _buildOpenAiResponsesUri(baseUrl);
+      final body = _buildOpenAiResponsesRequestBody(request);
+      final httpRequest = await client.postUrl(uri);
+      httpRequest.headers
+          .set(HttpHeaders.contentTypeHeader, 'application/json');
+      httpRequest.headers
+          .set(HttpHeaders.authorizationHeader, 'Bearer ${apiKey.trim()}');
+      httpRequest.add(utf8.encode(jsonEncode(body)));
 
-      return QueryResponse.success(
-        output: text.isEmpty ? '[empty-output]' : text,
+      final httpResponse = await httpRequest.close();
+      final responseText = await httpResponse.transform(utf8.decoder).join();
+      final responseMap = _decodeJsonObject(responseText);
+
+      if (httpResponse.statusCode >= 200 && httpResponse.statusCode < 300) {
+        final output = _extractOpenAiResponsesOutput(responseMap);
+        return QueryResponse.success(
+          output: output.isEmpty ? '[empty-output]' : output,
+          modelUsed: responseMap['model'] as String? ?? chosenModel,
+        );
+      }
+
+      final runtimeError = RuntimeError(
+        code: _mapOpenAiHttpCode(httpResponse.statusCode),
+        message: _extractOpenAiErrorMessage(
+          responseMap: responseMap,
+          fallbackStatusCode: httpResponse.statusCode,
+        ),
+        source: 'openai_http',
+        retriable: httpResponse.statusCode >= 500,
+      );
+
+      return QueryResponse.failure(
+        error: runtimeError,
+        output: _formatOpenAiErrorOutput(
+          runtimeError,
+          statusCode: httpResponse.statusCode,
+        ),
         modelUsed: chosenModel,
       );
     } catch (error) {
+      final runtimeError = _mapOpenAiTransportError(
+        error,
+        source: 'openai_http',
+      );
       return QueryResponse.failure(
-        error: RuntimeError(
-          code: RuntimeErrorCode.providerFailure,
-          message: '$error',
-          source: 'openai_sdk',
-          retriable: true,
-        ),
-        output: '[ERROR] OpenAI request failed',
+        error: runtimeError,
+        output: _formatOpenAiErrorOutput(runtimeError),
         modelUsed: chosenModel,
+      );
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Uri _buildOpenAiResponsesUri(String? configuredBaseUrl) {
+    final rawBase =
+        (configuredBaseUrl == null || configuredBaseUrl.trim().isEmpty)
+            ? _defaultOpenAiBaseUrl
+            : configuredBaseUrl.trim();
+    final normalizedBase = rawBase.endsWith('/')
+        ? rawBase.substring(0, rawBase.length - 1)
+        : rawBase;
+    final endpoint =
+        normalizedBase.endsWith('/v1') ? '/responses' : '/v1/responses';
+    return Uri.parse('$normalizedBase$endpoint');
+  }
+
+  Map<String, Object?> _buildOpenAiResponsesRequestBody(QueryRequest request) {
+    return _buildOpenAiResponsesRequestBodyPayload(
+      request: request,
+      fallbackModel: model,
+    );
+  }
+}
+
+const String _defaultOpenAiBaseUrl = 'https://api.openai.com';
+
+class _OpenAiResponsesStreamPayloadParseResult {
+  const _OpenAiResponsesStreamPayloadParseResult({
+    required this.modelUsed,
+    required this.events,
+    required this.terminal,
+  });
+
+  final String modelUsed;
+  final List<ProviderStreamEvent> events;
+  final bool terminal;
+}
+
+Map<String, Object?> _buildOpenAiResponsesRequestBodyPayload({
+  required QueryRequest request,
+  String? fallbackModel,
+}) {
+  final resolvedModel = request.model ?? fallbackModel ?? 'gpt-4o-mini';
+  final input = <Map<String, Object?>>[];
+
+  for (final message in request.messages) {
+    final text = switch (message.role) {
+      MessageRole.tool => '[tool] ${message.text}',
+      _ => message.text,
+    };
+
+    input.add({
+      'role': _toOpenAiResponsesRole(message.role),
+      'content': [
+        {
+          'type': _toOpenAiResponsesContentType(message.role),
+          'text': text,
+        },
+      ],
+    });
+  }
+
+  if (input.isEmpty) {
+    input.add({
+      'role': 'user',
+      'content': [
+        {'type': 'input_text', 'text': ''},
+      ],
+    });
+  }
+
+  return {
+    'model': resolvedModel,
+    'input': input,
+  };
+}
+
+String _toOpenAiResponsesRole(MessageRole role) {
+  switch (role) {
+    case MessageRole.system:
+      return 'system';
+    case MessageRole.user:
+      return 'user';
+    case MessageRole.assistant:
+      return 'assistant';
+    case MessageRole.tool:
+      return 'user';
+  }
+}
+
+String _toOpenAiResponsesContentType(MessageRole role) {
+  switch (role) {
+    case MessageRole.assistant:
+      return 'output_text';
+    case MessageRole.system:
+    case MessageRole.user:
+    case MessageRole.tool:
+      return 'input_text';
+  }
+}
+
+String _extractOpenAiResponsesOutput(Map<String, Object?> responseMap) {
+  final nestedResponse = responseMap['response'];
+  if (nestedResponse is Map<String, dynamic>) {
+    final nestedOutput = _extractOpenAiResponsesOutput(
+      Map<String, Object?>.from(nestedResponse),
+    );
+    if (nestedOutput.isNotEmpty) {
+      return nestedOutput;
+    }
+  }
+
+  final directText = responseMap['output_text'];
+  if (directText is String && directText.trim().isNotEmpty) {
+    return directText.trim();
+  }
+
+  final output = responseMap['output'];
+  if (output is! List) {
+    return '';
+  }
+
+  final chunks = <String>[];
+  for (final item in output.whereType<Map>()) {
+    final content = item['content'];
+    if (content is! List) {
+      continue;
+    }
+    for (final part in content.whereType<Map>()) {
+      final text = part['text'];
+      if (text is String && text.isNotEmpty) {
+        chunks.add(text);
+        continue;
+      }
+      final refusal = part['refusal'];
+      if (refusal is String && refusal.isNotEmpty) {
+        chunks.add(refusal);
+      }
+    }
+  }
+  return chunks.join('\n').trim();
+}
+
+String? _extractOpenAiResponsesModel(Map<String, Object?> responseMap) {
+  final response = responseMap['response'];
+  if (response is Map<String, dynamic>) {
+    final model = response['model'];
+    if (model is String && model.isNotEmpty) {
+      return model;
+    }
+  }
+  final model = responseMap['model'];
+  if (model is String && model.isNotEmpty) {
+    return model;
+  }
+  return null;
+}
+
+String _extractOpenAiResponsesDeltaText(Map<String, Object?> responseMap) {
+  final delta = responseMap['delta'];
+  if (delta is String && delta.isNotEmpty) {
+    return delta;
+  }
+  return '';
+}
+
+_OpenAiResponsesStreamPayloadParseResult _parseOpenAiResponsesStreamPayload({
+  required String rawPayload,
+  required String? eventName,
+  required String currentModel,
+  required StringBuffer outputBuffer,
+}) {
+  if (rawPayload.isEmpty || rawPayload == '[DONE]') {
+    return _OpenAiResponsesStreamPayloadParseResult(
+      modelUsed: currentModel,
+      events: const [],
+      terminal: rawPayload == '[DONE]',
+    );
+  }
+
+  final payload = _decodeJsonObject(rawPayload);
+  final effectiveType = eventName ?? payload['type'] as String?;
+  var modelUsed = _extractOpenAiResponsesModel(payload) ?? currentModel;
+  final events = <ProviderStreamEvent>[];
+  var terminal = false;
+
+  if (effectiveType == 'error' ||
+      effectiveType == 'response.failed' ||
+      effectiveType == 'response.incomplete') {
+    final runtimeError = RuntimeError(
+      code: RuntimeErrorCode.providerFailure,
+      message: _extractOpenAiErrorMessage(
+        responseMap: payload,
+        fallbackStatusCode: 500,
+      ),
+      source: 'openai_stream',
+      retriable: true,
+    );
+    events.add(
+      ProviderStreamEvent.error(
+        error: runtimeError,
+        output: _formatOpenAiErrorOutput(runtimeError),
+        model: modelUsed,
+      ),
+    );
+    terminal = true;
+    return _OpenAiResponsesStreamPayloadParseResult(
+      modelUsed: modelUsed,
+      events: events,
+      terminal: terminal,
+    );
+  }
+
+  if (effectiveType == 'response.output_text.delta') {
+    final deltaText = _extractOpenAiResponsesDeltaText(payload);
+    if (deltaText.isNotEmpty) {
+      outputBuffer.write(deltaText);
+      events.add(
+        ProviderStreamEvent.textDelta(
+          delta: deltaText,
+          model: modelUsed,
+        ),
       );
     }
   }
 
-  OpenAIChatCompletionChoiceMessageModel _toOpenAiMessage(ChatMessage message) {
-    return OpenAIChatCompletionChoiceMessageModel(
-      role: _toOpenAiRole(message.role),
-      content: [
-        OpenAIChatCompletionChoiceMessageContentItemModel.text(message.text),
-      ],
-    );
-  }
-
-  OpenAIChatMessageRole _toOpenAiRole(MessageRole role) {
-    switch (role) {
-      case MessageRole.system:
-        return OpenAIChatMessageRole.system;
-      case MessageRole.user:
-        return OpenAIChatMessageRole.user;
-      case MessageRole.assistant:
-        return OpenAIChatMessageRole.assistant;
-      case MessageRole.tool:
-        return OpenAIChatMessageRole.tool;
+  if (effectiveType == 'response.refusal.delta') {
+    final deltaText = _extractOpenAiResponsesDeltaText(payload);
+    if (deltaText.isNotEmpty) {
+      outputBuffer.write(deltaText);
+      events.add(
+        ProviderStreamEvent.textDelta(
+          delta: deltaText,
+          model: modelUsed,
+        ),
+      );
     }
   }
+
+  if (effectiveType == 'response.completed') {
+    final completedOutput = _extractOpenAiResponsesOutput(payload);
+    final output =
+        completedOutput.isNotEmpty ? completedOutput : outputBuffer.toString();
+    events.add(
+      ProviderStreamEvent.done(
+        output: output.isEmpty ? '[empty-output]' : output,
+        model: modelUsed,
+      ),
+    );
+    terminal = true;
+  }
+
+  return _OpenAiResponsesStreamPayloadParseResult(
+    modelUsed: modelUsed,
+    events: events,
+    terminal: terminal,
+  );
+}
+
+String _extractOpenAiErrorMessage({
+  required Map<String, Object?> responseMap,
+  required int fallbackStatusCode,
+}) {
+  final errorObj = responseMap['error'];
+  if (errorObj is Map<String, dynamic>) {
+    final message = errorObj['message'];
+    if (message is String && message.isNotEmpty) {
+      return message;
+    }
+  }
+  return 'OpenAI request failed with status $fallbackStatusCode';
+}
+
+RuntimeErrorCode _mapOpenAiHttpCode(int statusCode) {
+  if (statusCode == 400) {
+    return RuntimeErrorCode.invalidInput;
+  }
+  if (statusCode == 401 || statusCode == 403) {
+    return RuntimeErrorCode.permissionDenied;
+  }
+  return RuntimeErrorCode.providerFailure;
+}
+
+RuntimeError _mapOpenAiTransportError(
+  Object error, {
+  required String source,
+}) {
+  if (error is SocketException) {
+    return RuntimeError(
+      code: RuntimeErrorCode.providerFailure,
+      message:
+          'Network error while reaching OpenAI API. Check your base URL, proxy, or internet connection.',
+      source: source,
+      retriable: true,
+    );
+  }
+  if (error is HandshakeException) {
+    return RuntimeError(
+      code: RuntimeErrorCode.providerFailure,
+      message:
+          'TLS handshake failed while reaching OpenAI API. Check HTTPS certificates or the configured base URL.',
+      source: source,
+      retriable: true,
+    );
+  }
+  return RuntimeError(
+    code: RuntimeErrorCode.providerFailure,
+    message: '$error',
+    source: source,
+    retriable: true,
+  );
+}
+
+String _formatOpenAiErrorOutput(
+  RuntimeError error, {
+  int? statusCode,
+}) {
+  if (statusCode != null) {
+    if (statusCode == 400) {
+      return '[ERROR] OpenAI request was rejected (HTTP 400): ${error.message}';
+    }
+    if (statusCode == 401 || statusCode == 403) {
+      return '[ERROR] OpenAI authentication failed (HTTP $statusCode). Check your API key and base URL.';
+    }
+    if (statusCode == 404) {
+      return '[ERROR] OpenAI endpoint not found (HTTP 404). Check whether the configured base URL points to an OpenAI-compatible /v1/responses endpoint.';
+    }
+    if (statusCode == 405) {
+      return '[ERROR] OpenAI endpoint rejected the HTTP method (HTTP 405). Check whether the configured base URL is correct.';
+    }
+    if (statusCode == 408 || statusCode == 429) {
+      return '[ERROR] OpenAI request was throttled or timed out (HTTP $statusCode): ${error.message}';
+    }
+    if (statusCode >= 500) {
+      return '[ERROR] OpenAI API/network error (HTTP $statusCode): ${error.message}';
+    }
+    return '[ERROR] OpenAI request failed (HTTP $statusCode): ${error.message}';
+  }
+  if (error.code == RuntimeErrorCode.permissionDenied) {
+    return '[ERROR] OpenAI authentication failed. Check your API key and base URL.';
+  }
+  if (error.message.contains('Network error while reaching OpenAI API') ||
+      error.message
+          .contains('TLS handshake failed while reaching OpenAI API')) {
+    return '[ERROR] Could not reach OpenAI API. Check your network and base URL.';
+  }
+  return '[ERROR] OpenAI request failed: ${error.message}';
 }
