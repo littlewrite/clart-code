@@ -12,9 +12,11 @@ class ToolScheduler {
   }) async {
     final results = <ToolExecutionResult>[];
 
-    // Iteration 4 baseline:
-    // keep deterministic serial execution while preserving executionHint
-    // metadata on each tool for a future parallel scheduler.
+    // Group invocations by execution hint for concurrent scheduling
+    final parallelSafeGroup = <(ToolInvocation, Tool)>[];
+    final serialOnlyGroup = <(ToolInvocation, Tool)>[];
+
+    // First pass: validate permissions and group by execution hint
     for (final invocation in invocations) {
       if (!permissionPolicy.canExecute(invocation.name)) {
         results.add(
@@ -39,19 +41,41 @@ class ToolScheduler {
         continue;
       }
 
-      try {
-        results.add(await tool.run(invocation));
-      } catch (error) {
-        results.add(
-          ToolExecutionResult.failure(
-            tool: invocation.name,
-            errorCode: 'tool_runtime_error',
-            errorMessage: '$error',
-          ),
-        );
+      if (tool.executionHint == ToolExecutionHint.parallelSafe) {
+        parallelSafeGroup.add((invocation, tool));
+      } else {
+        serialOnlyGroup.add((invocation, tool));
       }
     }
 
+    // Execute parallel-safe tools concurrently
+    if (parallelSafeGroup.isNotEmpty) {
+      final parallelResults = await Future.wait(
+        parallelSafeGroup.map((pair) => _executeToolSafely(pair.$2, pair.$1)),
+      );
+      results.addAll(parallelResults);
+    }
+
+    // Execute serial-only tools sequentially
+    for (final (invocation, tool) in serialOnlyGroup) {
+      results.add(await _executeToolSafely(tool, invocation));
+    }
+
     return results;
+  }
+
+  Future<ToolExecutionResult> _executeToolSafely(
+    Tool tool,
+    ToolInvocation invocation,
+  ) async {
+    try {
+      return await tool.run(invocation);
+    } catch (error) {
+      return ToolExecutionResult.failure(
+        tool: invocation.name,
+        errorCode: 'tool_runtime_error',
+        errorMessage: '$error',
+      );
+    }
   }
 }

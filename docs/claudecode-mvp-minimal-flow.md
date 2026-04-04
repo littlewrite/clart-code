@@ -90,6 +90,7 @@ Day 3:
 
 ## 8. 下个会话计划（可直接执行）
 
-1. 实现 rich `/init` 向导（逐步采集 provider/key/baseUrl/model）。
-2. 统一 provider 错误提示分级（配置缺失/鉴权失败/网络失败）。
-3. 做一次端到端手测脚本（local/openai/claude 各一条）并补文档。
+1. 添加单元测试覆盖核心模块（query_engine, turn_executor, providers）。
+2. 实现 Tool 并发分组调度（当前仅串行）。
+3. 实现 Task 后台任务系统（基础版）。
+4. 做一次端到端手测脚本（local/openai/claude 各一条）并补文档。

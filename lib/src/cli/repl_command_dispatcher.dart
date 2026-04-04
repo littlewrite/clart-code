@@ -54,6 +54,8 @@ LocalCommandResult? executeReplSlashCommand(
         TranscriptMessage.localCommandStdout(
             '- Rich UI: Ctrl+J inserts newline (true multiline composer)'),
         TranscriptMessage.localCommandStdout(
+            '- Rich UI: paste keeps embedded newlines'),
+        TranscriptMessage.localCommandStdout(
             '- Rich UI: Ctrl+P / Ctrl+N browse input history'),
         TranscriptMessage.localCommandStdout(
             '- Ctrl+C interrupts current streaming response'),

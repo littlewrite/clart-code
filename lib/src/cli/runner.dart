@@ -1294,6 +1294,41 @@ class RichInputUtf8Decoder {
   }
 }
 
+enum RichInputTokenKind { eof, text, control, paste }
+
+class RichInputToken {
+  const RichInputToken._({
+    required this.kind,
+    this.text,
+    this.controlChar,
+  });
+
+  const RichInputToken.text(String value)
+      : this._(kind: RichInputTokenKind.text, text: value);
+
+  const RichInputToken.paste(String value)
+      : this._(kind: RichInputTokenKind.paste, text: value);
+
+  const RichInputToken.control(ControlCharacter value)
+      : this._(kind: RichInputTokenKind.control, controlChar: value);
+
+  const RichInputToken.eof() : this._(kind: RichInputTokenKind.eof);
+
+  final RichInputTokenKind kind;
+  final String? text;
+  final ControlCharacter? controlChar;
+}
+
+RichInputToken parseRichInputBytesForTest(List<int> bytes) {
+  var index = 0;
+  return _readRichInputToken(() {
+    if (index >= bytes.length) {
+      return -1;
+    }
+    return bytes[index++];
+  });
+}
+
 Future<int> _runRichInteractiveRepl(
   CommandContext context, {
   required _ReplSessionState session,
@@ -1804,7 +1839,7 @@ void _renderRichRepl(
   _writeRow(
     console,
     statusRow + 2,
-    '╭${_fillTitle('── Message (Enter=send, Ctrl+J=newline, Up/Down=cursor/history, Ctrl+P/N=history) ', inner)}╮',
+    '╭${_fillTitle('── Message (Enter=send, Ctrl+J=newline, paste multiline ok, Up/Down=cursor/history, Ctrl+P/N=history) ', inner)}╮',
   );
   for (var i = 0; i < composerView.visibleLines.length; i++) {
     final prefix = i == composerView.cursorRow ? ' > ' : '   ';
@@ -1952,124 +1987,327 @@ _RichInputEvent _readRichInput(
     onDraftChanged(displayDraft(), draft.cursor);
   }
 
+  if (stdout.hasTerminal) {
+    stdout.write(_enableBracketedPasteMode);
+  }
+  console.rawMode = true;
   console.showCursor();
   try {
     while (true) {
-      final key = console.readKey();
-      if (key.isControl) {
-        utf8Decoder.reset();
-        switch (key.controlChar) {
-          case ControlCharacter.enter:
-            return _RichInputEvent.submit(draft.text);
-          case ControlCharacter.ctrlJ:
-            if (draft.insert('\n')) {
-              onEditChange();
-            }
+      final token = _readRichInputToken(_stdinReadByteSync);
+      switch (token.kind) {
+        case RichInputTokenKind.eof:
+          return _RichInputEvent.eof();
+        case RichInputTokenKind.paste:
+        case RichInputTokenKind.text:
+          final text = token.text ?? '';
+          if (text.isEmpty) {
             continue;
-          case ControlCharacter.ctrlC:
-            return _RichInputEvent.breakSignal(
-              hadDraft: draft.text.trim().isNotEmpty,
-            );
-          case ControlCharacter.ctrlD:
-            if (draft.text.isEmpty) {
-              return _RichInputEvent.eof();
-            }
-            if (draft.deleteForward()) {
-              onEditChange();
-            }
-            continue;
-          case ControlCharacter.backspace:
-          case ControlCharacter.ctrlH:
-            if (draft.backspace()) {
-              onEditChange();
-            }
-            continue;
-          case ControlCharacter.delete:
-            if (draft.deleteForward()) {
-              onEditChange();
-            }
-            continue;
-          case ControlCharacter.ctrlU:
-            if (draft.deleteToLineStart()) {
-              onEditChange();
-            }
-            continue;
-          case ControlCharacter.ctrlK:
-            if (draft.deleteToLineEnd()) {
-              onEditChange();
-            }
-            continue;
-          case ControlCharacter.wordBackspace:
-          case ControlCharacter.ctrlW:
-            if (draft.deleteWordBackward()) {
-              onEditChange();
-            }
-            continue;
-          case ControlCharacter.arrowLeft:
-          case ControlCharacter.ctrlB:
-            if (draft.moveLeft()) {
-              onDraftChanged(displayDraft(), draft.cursor);
-            }
-            continue;
-          case ControlCharacter.arrowRight:
-          case ControlCharacter.ctrlF:
-            if (draft.moveRight()) {
-              onDraftChanged(displayDraft(), draft.cursor);
-            }
-            continue;
-          case ControlCharacter.home:
-          case ControlCharacter.ctrlA:
-            if (draft.moveLineStart()) {
-              onDraftChanged(displayDraft(), draft.cursor);
-            }
-            continue;
-          case ControlCharacter.end:
-          case ControlCharacter.ctrlE:
-            if (draft.moveLineEnd()) {
-              onDraftChanged(displayDraft(), draft.cursor);
-            }
-            continue;
-          case ControlCharacter.arrowUp:
-            if (draft.moveUp()) {
-              onDraftChanged(displayDraft(), draft.cursor);
-            } else {
+          }
+          if (draft.insert(text)) {
+            onEditChange();
+          }
+          continue;
+        case RichInputTokenKind.control:
+          utf8Decoder.reset();
+          switch (token.controlChar ?? ControlCharacter.unknown) {
+            case ControlCharacter.enter:
+              return _RichInputEvent.submit(draft.text);
+            case ControlCharacter.ctrlJ:
+              if (draft.insert('\n')) {
+                onEditChange();
+              }
+              continue;
+            case ControlCharacter.ctrlC:
+              return _RichInputEvent.breakSignal(
+                hadDraft: draft.text.trim().isNotEmpty,
+              );
+            case ControlCharacter.ctrlD:
+              if (draft.text.isEmpty) {
+                return _RichInputEvent.eof();
+              }
+              if (draft.deleteForward()) {
+                onEditChange();
+              }
+              continue;
+            case ControlCharacter.backspace:
+            case ControlCharacter.ctrlH:
+              if (draft.backspace()) {
+                onEditChange();
+              }
+              continue;
+            case ControlCharacter.delete:
+              if (draft.deleteForward()) {
+                onEditChange();
+              }
+              continue;
+            case ControlCharacter.ctrlU:
+              if (draft.deleteToLineStart()) {
+                onEditChange();
+              }
+              continue;
+            case ControlCharacter.ctrlK:
+              if (draft.deleteToLineEnd()) {
+                onEditChange();
+              }
+              continue;
+            case ControlCharacter.wordBackspace:
+            case ControlCharacter.ctrlW:
+              if (draft.deleteWordBackward()) {
+                onEditChange();
+              }
+              continue;
+            case ControlCharacter.arrowLeft:
+            case ControlCharacter.ctrlB:
+              if (draft.moveLeft()) {
+                onDraftChanged(displayDraft(), draft.cursor);
+              }
+              continue;
+            case ControlCharacter.arrowRight:
+            case ControlCharacter.ctrlF:
+              if (draft.moveRight()) {
+                onDraftChanged(displayDraft(), draft.cursor);
+              }
+              continue;
+            case ControlCharacter.home:
+            case ControlCharacter.ctrlA:
+              if (draft.moveLineStart()) {
+                onDraftChanged(displayDraft(), draft.cursor);
+              }
+              continue;
+            case ControlCharacter.end:
+            case ControlCharacter.ctrlE:
+              if (draft.moveLineEnd()) {
+                onDraftChanged(displayDraft(), draft.cursor);
+              }
+              continue;
+            case ControlCharacter.arrowUp:
+              if (draft.moveUp()) {
+                onDraftChanged(displayDraft(), draft.cursor);
+              } else {
+                moveHistoryUp();
+              }
+              continue;
+            case ControlCharacter.arrowDown:
+              if (draft.moveDown()) {
+                onDraftChanged(displayDraft(), draft.cursor);
+              } else {
+                moveHistoryDown();
+              }
+              continue;
+            case ControlCharacter.ctrlP:
               moveHistoryUp();
-            }
-            continue;
-          case ControlCharacter.arrowDown:
-            if (draft.moveDown()) {
-              onDraftChanged(displayDraft(), draft.cursor);
-            } else {
+              continue;
+            case ControlCharacter.ctrlN:
               moveHistoryDown();
-            }
-            continue;
-          case ControlCharacter.ctrlP:
-            moveHistoryUp();
-            continue;
-          case ControlCharacter.ctrlN:
-            moveHistoryDown();
-            continue;
-          case ControlCharacter.tab:
-            if (draft.insert('\t')) {
-              onEditChange();
-            }
-            continue;
-          default:
-            continue;
-        }
-      }
-      final decoded = utf8Decoder.pushChunk(key.char);
-      if (decoded == null) {
-        continue;
-      }
-      if (draft.insert(decoded)) {
-        onEditChange();
+              continue;
+            case ControlCharacter.tab:
+              if (draft.insert('\t')) {
+                onEditChange();
+              }
+              continue;
+            default:
+              continue;
+          }
       }
     }
   } finally {
+    console.rawMode = false;
+    if (stdout.hasTerminal) {
+      stdout.write(_disableBracketedPasteMode);
+    }
     console.hideCursor();
   }
 }
+
+int _stdinReadByteSync() => stdin.readByteSync();
+
+RichInputToken _readRichInputToken(int Function() readByte) {
+  final codeUnit = _readNextNonZeroByte(readByte);
+  if (codeUnit == -1) {
+    return const RichInputToken.eof();
+  }
+  if (codeUnit >= 0x01 && codeUnit <= 0x1A) {
+    return RichInputToken.control(ControlCharacter.values[codeUnit]);
+  }
+  if (codeUnit == 0x1B) {
+    return _readRichEscapeSequence(readByte);
+  }
+  if (codeUnit == 0x7F) {
+    return const RichInputToken.control(ControlCharacter.backspace);
+  }
+  if (codeUnit == 0x00 || (codeUnit >= 0x1C && codeUnit <= 0x1F)) {
+    return const RichInputToken.control(ControlCharacter.unknown);
+  }
+  return RichInputToken.text(_decodeRichUtf8Scalar(codeUnit, readByte));
+}
+
+int _readNextNonZeroByte(int Function() readByte) {
+  while (true) {
+    final value = readByte();
+    if (value == -1 || value > 0) {
+      return value;
+    }
+  }
+}
+
+RichInputToken _readRichEscapeSequence(int Function() readByte) {
+  final next = readByte();
+  if (next == -1) {
+    return const RichInputToken.control(ControlCharacter.escape);
+  }
+  if (next == 0x7F) {
+    return const RichInputToken.control(ControlCharacter.wordBackspace);
+  }
+  if (next == 0x5B) {
+    return _readRichCsiSequence(readByte);
+  }
+  if (next == 0x4F) {
+    final third = readByte();
+    return switch (third) {
+      0x48 => const RichInputToken.control(ControlCharacter.home),
+      0x46 => const RichInputToken.control(ControlCharacter.end),
+      0x50 => const RichInputToken.control(ControlCharacter.F1),
+      0x51 => const RichInputToken.control(ControlCharacter.F2),
+      0x52 => const RichInputToken.control(ControlCharacter.F3),
+      0x53 => const RichInputToken.control(ControlCharacter.F4),
+      _ => const RichInputToken.control(ControlCharacter.unknown),
+    };
+  }
+  if (next == 0x62) {
+    return const RichInputToken.control(ControlCharacter.wordLeft);
+  }
+  if (next == 0x66) {
+    return const RichInputToken.control(ControlCharacter.wordRight);
+  }
+  return const RichInputToken.control(ControlCharacter.unknown);
+}
+
+RichInputToken _readRichCsiSequence(int Function() readByte) {
+  final bytes = <int>[];
+  while (true) {
+    final value = readByte();
+    if (value == -1) {
+      break;
+    }
+    bytes.add(value);
+    if ((value >= 0x40 && value <= 0x7E) || bytes.length >= 16) {
+      break;
+    }
+  }
+
+  final sequence = ascii.decode(bytes, allowInvalid: true);
+  if (sequence == 'A' || sequence.endsWith('A')) {
+    return const RichInputToken.control(ControlCharacter.arrowUp);
+  }
+  if (sequence == 'B' || sequence.endsWith('B')) {
+    return const RichInputToken.control(ControlCharacter.arrowDown);
+  }
+  if (sequence == 'C' || sequence.endsWith('C')) {
+    return const RichInputToken.control(ControlCharacter.arrowRight);
+  }
+  if (sequence == 'D' || sequence.endsWith('D')) {
+    return const RichInputToken.control(ControlCharacter.arrowLeft);
+  }
+  if (sequence == 'H' || sequence.endsWith('H')) {
+    return const RichInputToken.control(ControlCharacter.home);
+  }
+  if (sequence == 'F' || sequence.endsWith('F')) {
+    return const RichInputToken.control(ControlCharacter.end);
+  }
+  if (sequence == '1~' || sequence == '7~') {
+    return const RichInputToken.control(ControlCharacter.home);
+  }
+  if (sequence == '3~') {
+    return const RichInputToken.control(ControlCharacter.delete);
+  }
+  if (sequence == '4~' || sequence == '8~') {
+    return const RichInputToken.control(ControlCharacter.end);
+  }
+  if (sequence == '5~') {
+    return const RichInputToken.control(ControlCharacter.pageUp);
+  }
+  if (sequence == '6~') {
+    return const RichInputToken.control(ControlCharacter.pageDown);
+  }
+  if (sequence == '200~') {
+    return RichInputToken.paste(_readBracketedPaste(readByte));
+  }
+  return const RichInputToken.control(ControlCharacter.unknown);
+}
+
+String _readBracketedPaste(int Function() readByte) {
+  final bytes = <int>[];
+  while (true) {
+    final value = readByte();
+    if (value == -1) {
+      break;
+    }
+    bytes.add(value);
+    if (_endsWithBytes(bytes, _bracketedPasteEndBytes)) {
+      bytes.removeRange(
+        bytes.length - _bracketedPasteEndBytes.length,
+        bytes.length,
+      );
+      break;
+    }
+  }
+
+  final text = utf8.decode(bytes, allowMalformed: true);
+  return text.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+}
+
+String _decodeRichUtf8Scalar(int firstByte, int Function() readByte) {
+  final bytes = <int>[firstByte];
+  final expectedLength = _expectedUtf8Length(firstByte);
+  for (var i = 1; i < expectedLength; i++) {
+    final next = readByte();
+    if (next == -1) {
+      break;
+    }
+    bytes.add(next);
+  }
+  return utf8.decode(bytes, allowMalformed: true);
+}
+
+int _expectedUtf8Length(int firstByte) {
+  if ((firstByte & 0x80) == 0) {
+    return 1;
+  }
+  if ((firstByte & 0xE0) == 0xC0) {
+    return 2;
+  }
+  if ((firstByte & 0xF0) == 0xE0) {
+    return 3;
+  }
+  if ((firstByte & 0xF8) == 0xF0) {
+    return 4;
+  }
+  return 1;
+}
+
+bool _endsWithBytes(List<int> bytes, List<int> suffix) {
+  if (bytes.length < suffix.length) {
+    return false;
+  }
+  for (var i = 0; i < suffix.length; i++) {
+    if (bytes[bytes.length - suffix.length + i] != suffix[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const String _enableBracketedPasteMode = '\x1b[?2004h';
+const String _disableBracketedPasteMode = '\x1b[?2004l';
+const List<int> _bracketedPasteEndBytes = <int>[
+  0x1B,
+  0x5B,
+  0x32,
+  0x30,
+  0x31,
+  0x7E,
+];
 
 List<String> _wrapText(String input, int width) {
   if (input.isEmpty) {
@@ -3073,7 +3311,7 @@ Future<int> _runToolCommand(CommandContext context) async {
   }
 
   final executor = context.engine.runtime.toolExecutor.copyWith(
-    permissionPolicy: ToolPermissionPolicy(mode: permissionMode),
+    permissionPolicy: ToolPermissionPolicy(defaultMode: permissionMode),
   );
   final results = await executor.executeBatch([invocation]);
   final result = results.first;

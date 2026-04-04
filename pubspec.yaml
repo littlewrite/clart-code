@@ -12,6 +12,7 @@ dependencies:
   dart_openai: ^6.1.1
   interact_cli: ^2.4.0
   mason_logger: ^0.2.16
+  uuid: ^4.0.0
 
 dev_dependencies:
   lints: ^3.0.0

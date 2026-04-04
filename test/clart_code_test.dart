@@ -1297,6 +1297,34 @@ void main() {
     expect(decoder.pushChunk(String.fromCharCode(0xBD)), '好');
   });
 
+  test('rich input parser decodes bracketed paste with newlines', () {
+    final token = parseRichInputBytesForTest([
+      0x1B,
+      0x5B,
+      0x32,
+      0x30,
+      0x30,
+      0x7E,
+      ...utf8.encode('line1\r\nline2\nline3'),
+      0x1B,
+      0x5B,
+      0x32,
+      0x30,
+      0x31,
+      0x7E,
+    ]);
+
+    expect(token.kind, RichInputTokenKind.paste);
+    expect(token.text, 'line1\nline2\nline3');
+  });
+
+  test('rich input parser decodes utf8 printable chars', () {
+    final token = parseRichInputBytesForTest(utf8.encode('你'));
+
+    expect(token.kind, RichInputTokenKind.text);
+    expect(token.text, '你');
+  });
+
   test('query engine maps provider exception to providerFailure', () async {
     final runtime = AppRuntime(provider: _ThrowingProvider());
     final engine = QueryEngine(runtime);
