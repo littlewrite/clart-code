@@ -17,10 +17,8 @@ class McpToolWrapper implements Tool {
   @override
   String get name => mcpTool.name;
 
-  @override
   String get description => mcpTool.description;
 
-  @override
   Map<String, Object?>? get inputSchema => mcpTool.inputSchema;
 
   @override
@@ -31,7 +29,7 @@ class McpToolWrapper implements Tool {
     try {
       final result = await manager.callTool(
         name: invocation.name,
-        arguments: invocation.arguments,
+        arguments: invocation.input,
       );
 
       // MCP 工具返回格式：{ content: [...], isError?: bool }
@@ -94,11 +92,9 @@ class McpReadResourceTool implements Tool {
   @override
   String get name => 'mcp_read_resource';
 
-  @override
   String get description =>
       'Read content from an MCP resource. Use format: server://resource_uri';
 
-  @override
   Map<String, Object?>? get inputSchema => {
         'type': 'object',
         'properties': {
@@ -116,7 +112,7 @@ class McpReadResourceTool implements Tool {
   @override
   Future<ToolExecutionResult> run(ToolInvocation invocation) async {
     try {
-      final uri = invocation.arguments?['uri'] as String?;
+      final uri = invocation.input['uri'] as String?;
       if (uri == null) {
         return ToolExecutionResult.failure(
           tool: name,
@@ -151,11 +147,9 @@ class McpListResourcesTool implements Tool {
   @override
   String get name => 'mcp_list_resources';
 
-  @override
   String get description =>
       'List all available MCP resources from connected servers';
 
-  @override
   Map<String, Object?>? get inputSchema => {
         'type': 'object',
         'properties': {},

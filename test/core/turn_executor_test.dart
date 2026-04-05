@@ -8,6 +8,15 @@ import 'package:clart_code/src/providers/llm_provider.dart';
 import 'package:clart_code/src/runtime/app_runtime.dart';
 import 'package:test/test.dart';
 
+/// Echo provider whose stream waits before emitting so interrupt tests can win the race.
+class _SlowLocalEchoProvider extends LocalEchoProvider {
+  @override
+  Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    yield* super.stream(request);
+  }
+}
+
 void main() {
   group('TurnExecutor', () {
     late TurnExecutor executor;
@@ -80,18 +89,19 @@ void main() {
 
     test('execute() handles interruption', () async {
       final controller = StreamController<void>();
+      final slowRuntime = AppRuntime(provider: _SlowLocalEchoProvider());
+      final slowExecutor = TurnExecutor(QueryEngine(slowRuntime));
       final request = QueryRequest(
         messages: [
           ChatMessage(role: MessageRole.user, text: 'test'),
         ],
       );
 
-      // Schedule interrupt after a short delay
-      Future.delayed(Duration(milliseconds: 10), () {
+      Future<void>.delayed(const Duration(milliseconds: 10), () {
         controller.add(null);
       });
 
-      final result = await executor.execute(
+      final result = await slowExecutor.execute(
         request: request,
         turn: 1,
         interruptSignals: controller.stream,

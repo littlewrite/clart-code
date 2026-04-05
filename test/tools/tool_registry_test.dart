@@ -8,10 +8,8 @@ class MockTool implements Tool {
   @override
   final String name;
 
-  @override
   String get description => 'Mock tool';
 
-  @override
   Map<String, Object?>? get inputSchema => null;
 
   @override

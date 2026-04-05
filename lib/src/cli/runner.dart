@@ -59,6 +59,34 @@ class ParsedCli {
 
 enum _ReplUiMode { plain, rich }
 
+/// Rich REPL layout: mirrors Claude Code's split between main-buffer scrollback
+/// and fullscreen alternate-screen UI (`REPL.tsx` + `AlternateScreen`).
+enum _RichReplLayoutMode {
+  /// Normal stdout scrollback — welcome banner scrolls away as output grows.
+  scrollback,
+  /// Alternate screen + full redraw (fixed viewport, PgUp/PgDn scroll transcript).
+  fullscreen,
+}
+
+_RichReplLayoutMode? _parseRichReplLayoutMode(String raw) {
+  switch (raw.trim().toLowerCase()) {
+    case 'scrollback':
+    case 'main':
+      return _RichReplLayoutMode.scrollback;
+    case 'fullscreen':
+    case 'full':
+    case 'alt':
+      return _RichReplLayoutMode.fullscreen;
+    default:
+      return null;
+  }
+}
+
+/// Tracks the last painted prompt block height for ANSI "cursor up + clear down" redraws.
+class _RichScrollbackPromptPaint {
+  int promptBlockLines = 0;
+}
+
 Future<int> runCli(List<String> args) async {
   final parsed = _parseCli(args);
   if (!parsed.isOk) {
@@ -283,12 +311,32 @@ Future<int> _unknownCommand(CommandContext context) async {
 Future<int> _runReplCommand(CommandContext context) async {
   var streamJson = false;
   var uiMode = _ReplUiMode.rich;
+  var richLayoutMode = _RichReplLayoutMode.scrollback;
 
   var i = 0;
   while (i < context.args.length) {
     final token = context.args[i];
     if (token == '--stream-json') {
       streamJson = true;
+      i += 1;
+      continue;
+    }
+    if (token == '--layout') {
+      if (i + 1 >= context.args.length) {
+        print('error: --layout requires scrollback|fullscreen');
+        return 2;
+      }
+      final parsed = _parseRichReplLayoutMode(context.args[i + 1]);
+      if (parsed == null) {
+        print('error: --layout must be scrollback|fullscreen');
+        return 2;
+      }
+      richLayoutMode = parsed;
+      i += 2;
+      continue;
+    }
+    if (token == '--fullscreen') {
+      richLayoutMode = _RichReplLayoutMode.fullscreen;
       i += 1;
       continue;
     }
@@ -315,6 +363,7 @@ Future<int> _runReplCommand(CommandContext context) async {
     streamJson: streamJson,
     printIntro: true,
     uiMode: uiMode,
+    richLayoutMode: richLayoutMode,
   );
 }
 
@@ -695,6 +744,7 @@ Future<int> _runStartCommand(CommandContext context) async {
   var denyTrust = false;
   var noRepl = false;
   var uiMode = _ReplUiMode.rich;
+  var richLayoutMode = _RichReplLayoutMode.scrollback;
   String? trustFilePath;
 
   var i = 0;
@@ -721,6 +771,25 @@ Future<int> _runStartCommand(CommandContext context) async {
     }
     if (token == '--no-repl') {
       noRepl = true;
+      i += 1;
+      continue;
+    }
+    if (token == '--layout') {
+      if (i + 1 >= context.args.length) {
+        print('error: --layout requires scrollback|fullscreen');
+        return 2;
+      }
+      final parsed = _parseRichReplLayoutMode(context.args[i + 1]);
+      if (parsed == null) {
+        print('error: --layout must be scrollback|fullscreen');
+        return 2;
+      }
+      richLayoutMode = parsed;
+      i += 2;
+      continue;
+    }
+    if (token == '--fullscreen') {
+      richLayoutMode = _RichReplLayoutMode.fullscreen;
       i += 1;
       continue;
     }
@@ -785,6 +854,7 @@ Future<int> _runStartCommand(CommandContext context) async {
     streamJson: false,
     printIntro: false,
     uiMode: uiMode,
+    richLayoutMode: richLayoutMode,
   );
 }
 
@@ -922,11 +992,103 @@ void _appendRichTranscriptMessages(
   }
 }
 
+void _emitScrollbackRichMessages(Console console, List<_RichMessage> messages) {
+  if (messages.isEmpty) {
+    return;
+  }
+  final inner = max(8, min(console.windowWidth, 140) - 4);
+  for (final line in _buildRichTranscriptLines(messages, inner)) {
+    stdout.writeln(line);
+  }
+}
+
+void _clearScrollbackPromptBlockOnly(_RichScrollbackPromptPaint paint) {
+  if (paint.promptBlockLines > 0) {
+    stdout.write('\x1b[${paint.promptBlockLines}A\r\x1b[0J');
+  }
+  paint.promptBlockLines = 0;
+}
+
+void _repaintScrollbackPromptBlock({
+  required Console console,
+  required _ReplSessionState session,
+  required _RichScrollbackPromptPaint paint,
+  required String status,
+  required String inputBuffer,
+  required int inputCursor,
+}) {
+  final width = min(console.windowWidth, 140);
+  final inner = width - 2;
+  final composerInnerWidth = max(8, inner - 4);
+  final composerView = buildRichComposerView(
+    inputBuffer,
+    inputCursor,
+    composerInnerWidth,
+    maxLines: 6,
+  );
+  final lines = <String>[
+    _fitRow('status: $status', width),
+    '─' * width,
+  ];
+  for (var i = 0; i < composerView.visibleLines.length; i++) {
+    final prefix = i == composerView.cursorRow ? ' > ' : '   ';
+    lines.add(_fitRow('$prefix${composerView.visibleLines[i]}', width));
+  }
+
+  if (paint.promptBlockLines > 0) {
+    stdout.write('\x1b[${paint.promptBlockLines}A\r\x1b[0J');
+  } else {
+    stdout.writeln('');
+  }
+  for (final line in lines) {
+    stdout.writeln(line);
+  }
+  paint.promptBlockLines = lines.length;
+
+  const composerStartLine = 2;
+  final targetLineIndex = composerStartLine + composerView.cursorRow;
+  final moveUp = lines.length - targetLineIndex;
+  if (moveUp > 0) {
+    stdout.write('\x1b[${moveUp}A');
+  }
+  final col1Based = min(
+    width,
+    max(1, 1 + 3 + composerView.cursorCol),
+  );
+  stdout.write('\x1b[${col1Based}G');
+}
+
+void _emitScrollbackWelcomeBanner(
+  Console console,
+  _ReplSessionState session, {
+  required bool printIntro,
+}) {
+  final width = min(console.windowWidth, 140);
+  final inner = width - 2;
+  final headerBody = _buildRichHeaderBody(session, inner);
+  stdout.writeln('');
+  stdout.writeln('╭${_fillTitle('─── Clart Code v0.3.0 ', inner)}╮');
+  for (final row in headerBody) {
+    stdout.writeln('│${_fitRow(row, inner)}│');
+  }
+  stdout.writeln('╰${'─' * inner}╯');
+  stdout.writeln('─' * width);
+  if (printIntro) {
+    stdout.writeln('');
+    stdout.writeln(
+      'Output below uses the terminal scroll buffer (like Claude Code outside '
+      'fullscreen). Use --layout fullscreen for a fixed header + viewport.',
+    );
+  }
+  stdout.writeln('');
+}
+
 Future<int> _runInteractiveRepl(
   CommandContext context, {
   required bool streamJson,
   required bool printIntro,
   required _ReplUiMode uiMode,
+  _RichReplLayoutMode richLayoutMode = _RichReplLayoutMode.scrollback,
 }) async {
   var lastCode = 0;
   final session = _ReplSessionState(
@@ -940,6 +1102,7 @@ Future<int> _runInteractiveRepl(
       context,
       session: session,
       printIntro: printIntro,
+      layoutMode: richLayoutMode,
     );
   }
   if (printIntro) {
@@ -1439,6 +1602,7 @@ Future<int> _runRichInteractiveRepl(
   CommandContext context, {
   required _ReplSessionState session,
   required bool printIntro,
+  required _RichReplLayoutMode layoutMode,
 }) async {
   final console = Console.scrolling(recordBlanks: false);
   if (console.windowWidth < 70 || console.windowHeight < 20) {
@@ -1447,8 +1611,12 @@ Future<int> _runRichInteractiveRepl(
       streamJson: false,
       printIntro: printIntro,
       uiMode: _ReplUiMode.plain,
+      richLayoutMode: layoutMode,
     );
   }
+  final useFullscreen = layoutMode == _RichReplLayoutMode.fullscreen;
+  final scrollbackPaint =
+      useFullscreen ? null : _RichScrollbackPromptPaint();
   final transcript = <_RichMessage>[];
   final transcriptScroll = _RichTranscriptScrollState();
   final inputHistory = <String>[];
@@ -1459,7 +1627,19 @@ Future<int> _runRichInteractiveRepl(
   DateTime? pendingExitHintAt;
   const exitHintWindow = Duration(seconds: 2);
 
-  console.hideCursor();
+  if (useFullscreen) {
+    // Fullscreen: alternate buffer + mouse (Claude Code fullscreen path).
+    stdout.write('\x1b[?1049h' // ENTER_ALT_SCREEN
+        '\x1b[?1000h'
+        '\x1b[?1002h'
+        '\x1b[?1003h'
+        '\x1b[?1006h');
+    console.hideCursor();
+  } else {
+    // Scrollback: main buffer — welcome prints once and scrolls away like TS
+    // non-fullscreen REPL (`Messages.tsx` / main-screen scrollback).
+    _emitScrollbackWelcomeBanner(console, session, printIntro: printIntro);
+  }
   try {
     while (true) {
       final inputWaitStartedAt = DateTime.now();
@@ -1471,6 +1651,8 @@ Future<int> _runRichInteractiveRepl(
         transcriptScroll: transcriptScroll,
         status: status,
         history: inputHistory,
+        layoutMode: layoutMode,
+        scrollbackPaint: scrollbackPaint,
       );
       final elapsedSincePrompt = DateTime.now().difference(inputWaitStartedAt);
       if (shouldFallbackToPlainReplOnImmediateEof(
@@ -1512,6 +1694,8 @@ Future<int> _runRichInteractiveRepl(
           context,
           session,
           transcript,
+          layoutMode: layoutMode,
+          scrollbackPaint: scrollbackPaint,
         );
         continue;
       }
@@ -1539,12 +1723,14 @@ Future<int> _runRichInteractiveRepl(
           config: session.config,
           conversation: session.conversation,
         );
-        transcript.add(
-          _RichMessage(
-            role: _RichMessageRole.error,
-            text: processed.errorText ?? 'Invalid input.',
-          ),
+        final errWidget = _RichMessage(
+          role: _RichMessageRole.error,
+          text: processed.errorText ?? 'Invalid input.',
         );
+        transcript.add(errWidget);
+        if (!useFullscreen) {
+          _emitScrollbackRichMessages(console, [errWidget]);
+        }
         continue;
       }
 
@@ -1553,6 +1739,12 @@ Future<int> _runRichInteractiveRepl(
         if (localResult.clearTranscript) {
           transcript.clear();
           transcriptScroll.pinToBottom();
+          if (!useFullscreen) {
+            final w = min(console.windowWidth, 140);
+            stdout.writeln('');
+            stdout.writeln('─' * w);
+            stdout.writeln('(conversation view cleared)');
+          }
         }
         session.conversation.appendTranscriptMessages(
           processed.transcriptMessages,
@@ -1562,33 +1754,46 @@ Future<int> _runRichInteractiveRepl(
           config: session.config,
           conversation: session.conversation,
         );
+        final before = transcript.length;
         _appendRichTranscriptMessages(
           transcript,
           processed.transcriptMessages,
         );
+        if (!useFullscreen) {
+          _emitScrollbackRichMessages(console, transcript.sublist(before));
+        }
         status = processed.status ?? 'Done.';
         continue;
       }
 
       final request = processed.request!;
       final prompt = processed.submission.raw;
+      final userStart = transcript.length;
       _appendRichTranscriptMessages(
         transcript,
         processed.transcriptMessages,
       );
+      if (!useFullscreen) {
+        _emitScrollbackRichMessages(console, transcript.sublist(userStart));
+      }
       transcript
           .add(const _RichMessage(role: _RichMessageRole.assistant, text: ''));
       status = 'Streaming response... (Ctrl+C to interrupt)';
-      _renderRichRepl(
-        console,
-        context,
-        session,
-        transcript,
-        transcriptScroll: transcriptScroll,
-        status: status,
-        inputBuffer: '',
-        inputCursor: 0,
-      );
+      if (useFullscreen) {
+        _renderRichRepl(
+          console,
+          context,
+          session,
+          transcript,
+          transcriptScroll: transcriptScroll,
+          status: status,
+          inputBuffer: '',
+          inputCursor: 0,
+        );
+      } else {
+        stdout.writeln('');
+        stdout.write('  ');
+      }
 
       final assistantIndex = transcript.length - 1;
       final turnConfig = session.config;
@@ -1606,16 +1811,20 @@ Future<int> _runRichInteractiveRepl(
             role: _RichMessageRole.assistant,
             text: '$current$delta',
           );
-          _renderRichRepl(
-            console,
-            context,
-            session,
-            transcript,
-            transcriptScroll: transcriptScroll,
-            status: 'Streaming response... (Ctrl+C to interrupt)',
-            inputBuffer: '',
-            inputCursor: 0,
-          );
+          if (useFullscreen) {
+            _renderRichRepl(
+              console,
+              context,
+              session,
+              transcript,
+              transcriptScroll: transcriptScroll,
+              status: 'Streaming response... (Ctrl+C to interrupt)',
+              inputBuffer: '',
+              inputCursor: 0,
+            );
+          } else {
+            stdout.write(delta);
+          }
         },
       );
 
@@ -1658,6 +1867,12 @@ Future<int> _runRichInteractiveRepl(
         );
         status = 'Provider error.';
         lastCode = 1;
+        if (!useFullscreen) {
+          _emitScrollbackRichMessages(console, [transcript[assistantIndex]]);
+        }
+      }
+      if (!useFullscreen) {
+        stdout.writeln('');
       }
       _persistConversationSnapshot(
         sessionId: session.sessionId,
@@ -1668,8 +1883,17 @@ Future<int> _runRichInteractiveRepl(
   } finally {
     console.resetColorAttributes();
     console.showCursor();
-    console.cursorPosition = Coordinate(console.windowHeight - 1, 0);
-    console.writeLine();
+    if (useFullscreen) {
+      console.cursorPosition = Coordinate(console.windowHeight - 1, 0);
+      console.writeLine();
+      stdout.write('\x1b[?1006l'
+          '\x1b[?1003l'
+          '\x1b[?1002l'
+          '\x1b[?1000l'
+          '\x1b[?1049l');
+    } else {
+      stdout.writeln('');
+    }
   }
 
   if (fallbackToPlain) {
@@ -1680,6 +1904,7 @@ Future<int> _runRichInteractiveRepl(
       streamJson: false,
       printIntro: printIntro,
       uiMode: _ReplUiMode.plain,
+      richLayoutMode: layoutMode,
     );
   }
 
@@ -1730,77 +1955,90 @@ _RichInputEvent _promptRichInput(
   required String status,
   List<String> history = const [],
   bool maskInput = false,
+  required _RichReplLayoutMode layoutMode,
+  _RichScrollbackPromptPaint? scrollbackPaint,
 }) {
   var draftInput = '';
   var draftCursor = 0;
-  _renderRichRepl(
-    console,
-    context,
-    session,
-    transcript,
-    transcriptScroll: transcriptScroll,
-    status: status,
-    inputBuffer: draftInput,
-    inputCursor: draftCursor,
-  );
+  final useFs = layoutMode == _RichReplLayoutMode.fullscreen;
 
-  return _readRichInput(
+  void repaint(String draft, int cursor) {
+    if (useFs) {
+      _renderRichRepl(
+        console,
+        context,
+        session,
+        transcript,
+        transcriptScroll: transcriptScroll,
+        status: status,
+        inputBuffer: draft,
+        inputCursor: cursor,
+      );
+    } else {
+      _repaintScrollbackPromptBlock(
+        console: console,
+        session: session,
+        paint: scrollbackPaint!,
+        status: status,
+        inputBuffer: draft,
+        inputCursor: cursor,
+      );
+    }
+  }
+
+  repaint(draftInput, draftCursor);
+
+  final event = _readRichInput(
     console,
     history: history,
     displayTransform: maskInput ? _maskRichSecretInputForDisplay : null,
     onDraftChanged: (draft, cursor) {
       draftInput = draft;
       draftCursor = cursor;
-      _renderRichRepl(
-        console,
-        context,
-        session,
-        transcript,
-        transcriptScroll: transcriptScroll,
-        status: status,
-        inputBuffer: draftInput,
-        inputCursor: draftCursor,
-      );
+      repaint(draft, cursor);
     },
-    onTranscriptScroll: (action) {
-      final width = min(console.windowWidth, 140);
-      final inner = width - 2;
-      final transcriptRows = _computeRichTranscriptRows(
-        console,
-        session,
-        inputBuffer: draftInput,
-        inputCursor: draftCursor,
-      );
-      final lines = _buildRichTranscriptLines(transcript, inner);
-      final didScroll = transcriptScroll.applyAction(
-        action,
-        lines,
-        transcriptRows,
-      );
-      if (!didScroll) {
-        return;
-      }
-      _renderRichRepl(
-        console,
-        context,
-        session,
-        transcript,
-        transcriptScroll: transcriptScroll,
-        status: status,
-        inputBuffer: draftInput,
-        inputCursor: draftCursor,
-      );
-    },
+    onTranscriptScroll: useFs
+        ? (action) {
+            final width = min(console.windowWidth, 140);
+            final inner = width - 2;
+            final transcriptRows = _computeRichTranscriptRows(
+              console,
+              session,
+              inputBuffer: draftInput,
+              inputCursor: draftCursor,
+            );
+            final lines = _buildRichTranscriptLines(transcript, inner);
+            final didScroll = transcriptScroll.applyAction(
+              action,
+              lines,
+              transcriptRows,
+            );
+            if (!didScroll) {
+              return;
+            }
+            repaint(draftInput, draftCursor);
+          }
+        : null,
   );
+
+  if (!useFs && scrollbackPaint != null) {
+    if (event.type == _RichInputEventType.submit) {
+      _clearScrollbackPromptBlockOnly(scrollbackPaint);
+    }
+  }
+  return event;
 }
 
 String _runRichInitWizard(
   Console console,
   CommandContext context,
   _ReplSessionState session,
-  List<_RichMessage> transcript,
-) {
+  List<_RichMessage> transcript, {
+  required _RichReplLayoutMode layoutMode,
+  _RichScrollbackPromptPaint? scrollbackPaint,
+}) {
   final transcriptScroll = _RichTranscriptScrollState();
+  final scroll = layoutMode == _RichReplLayoutMode.scrollback;
   ProviderKind? selectedProvider;
   while (selectedProvider == null) {
     final remoteDefault = session.config.provider == ProviderKind.local
@@ -1815,6 +2053,8 @@ String _runRichInitWizard(
       status: remoteDefault == null
           ? 'Init 1/4: provider (claude/openai). Ctrl+C cancels.'
           : 'Init 1/4: provider (claude/openai). Enter keeps ${remoteDefault.name}. Ctrl+C cancels.',
+      layoutMode: layoutMode,
+      scrollbackPaint: scrollbackPaint,
     );
     if (event.type == _RichInputEventType.breakSignal ||
         event.type == _RichInputEventType.eof) {
@@ -1828,7 +2068,11 @@ String _runRichInitWizard(
         config: session.config,
         conversation: session.conversation,
       );
+      final s = transcript.length;
       _appendRichTranscriptMessages(transcript, messages);
+      if (scroll) {
+        _emitScrollbackRichMessages(console, transcript.sublist(s));
+      }
       return 'Init cancelled.';
     }
     final raw = event.text?.trim() ?? '';
@@ -1857,6 +2101,8 @@ String _runRichInitWizard(
           ? 'Init 2/4: API key for ${provider.name}. Input is masked. Ctrl+C cancels.'
           : 'Init 2/4: API key for ${provider.name}. Enter keeps current key. Input is masked. Ctrl+C cancels.',
       maskInput: true,
+      layoutMode: layoutMode,
+      scrollbackPaint: scrollbackPaint,
     );
     if (event.type == _RichInputEventType.breakSignal ||
         event.type == _RichInputEventType.eof) {
@@ -1870,7 +2116,11 @@ String _runRichInitWizard(
         config: session.config,
         conversation: session.conversation,
       );
+      final s = transcript.length;
       _appendRichTranscriptMessages(transcript, messages);
+      if (scroll) {
+        _emitScrollbackRichMessages(console, transcript.sublist(s));
+      }
       return 'Init cancelled.';
     }
     final raw = event.text?.trim() ?? '';
@@ -1894,6 +2144,8 @@ String _runRichInitWizard(
     status: currentBaseUrl?.isNotEmpty == true
         ? 'Init 3/4: base URL (optional). Enter keeps current: $currentBaseUrl'
         : 'Init 3/4: base URL (optional). Enter leaves default.',
+    layoutMode: layoutMode,
+    scrollbackPaint: scrollbackPaint,
   );
   if (baseUrlEvent.type == _RichInputEventType.breakSignal ||
       baseUrlEvent.type == _RichInputEventType.eof) {
@@ -1907,7 +2159,11 @@ String _runRichInitWizard(
       config: session.config,
       conversation: session.conversation,
     );
+    final s = transcript.length;
     _appendRichTranscriptMessages(transcript, messages);
+    if (scroll) {
+      _emitScrollbackRichMessages(console, transcript.sublist(s));
+    }
     return 'Init cancelled.';
   }
   final enteredBaseUrl = baseUrlEvent.text?.trim() ?? '';
@@ -1923,6 +2179,8 @@ String _runRichInitWizard(
     status: currentModel?.isNotEmpty == true
         ? 'Init 4/4: model (optional). Enter keeps current: $currentModel'
         : 'Init 4/4: model (optional). Enter leaves provider default.',
+    layoutMode: layoutMode,
+    scrollbackPaint: scrollbackPaint,
   );
   if (modelEvent.type == _RichInputEventType.breakSignal ||
       modelEvent.type == _RichInputEventType.eof) {
@@ -1936,7 +2194,11 @@ String _runRichInitWizard(
       config: session.config,
       conversation: session.conversation,
     );
+    final s = transcript.length;
     _appendRichTranscriptMessages(transcript, messages);
+    if (scroll) {
+      _emitScrollbackRichMessages(console, transcript.sublist(s));
+    }
     return 'Init cancelled.';
   }
   final enteredModel = modelEvent.text?.trim() ?? '';
@@ -1960,7 +2222,11 @@ String _runRichInitWizard(
     config: session.config,
     conversation: session.conversation,
   );
+  final s = transcript.length;
   _appendRichTranscriptMessages(transcript, messages);
+  if (scroll) {
+    _emitScrollbackRichMessages(console, transcript.sublist(s));
+  }
   return applied.status;
 }
 
@@ -1995,6 +2261,7 @@ void _renderRichRepl(
   final transcriptView = transcriptScroll.viewFor(lines, transcriptRows);
   final statusText = _buildRichStatusLine(status, transcriptView);
 
+  console.hideCursor();
   console.clearScreen();
   console.cursorPosition = const Coordinate(0, 0);
 
@@ -2130,20 +2397,19 @@ List<String> _buildRichTranscriptLines(
   final lines = <String>[];
   for (final message in transcript) {
     final prefix = switch (message.role) {
-      _RichMessageRole.user => 'user> ',
-      _RichMessageRole.assistant => 'asst> ',
-      _RichMessageRole.system => 'sys > ',
-      _RichMessageRole.error => 'err > ',
+      _RichMessageRole.user => '❯ ',
+      _RichMessageRole.assistant => '  ',
+      _RichMessageRole.system => '⚙ ',
+      _RichMessageRole.error => '✗ ',
     };
     final wrapped = _wrapText(message.text, max(8, width - prefix.length));
     if (wrapped.isEmpty) {
       lines.add(prefix);
       continue;
     }
+    // Only show prefix on first line, no indent on continuation lines
     for (var i = 0; i < wrapped.length; i++) {
-      lines.add(i == 0
-          ? '$prefix${wrapped[i]}'
-          : '${' ' * prefix.length}${wrapped[i]}');
+      lines.add(i == 0 ? '$prefix${wrapped[i]}' : wrapped[i]);
     }
   }
   return lines;
@@ -2329,11 +2595,6 @@ _RichInputEvent _readRichInput(
             case ControlCharacter.pageDown:
               onTranscriptScroll?.call(_RichTranscriptScrollAction.pageDown);
               continue;
-            case ControlCharacter.tab:
-              if (draft.insert('\t')) {
-                onEditChange();
-              }
-              continue;
             default:
               continue;
           }
@@ -2472,6 +2733,39 @@ RichInputToken _readRichCsiSequence(int Function() readByte) {
   if (sequence == '3~') {
     return const RichInputToken.control(ControlCharacter.delete);
   }
+  // Mouse wheel events (SGR format: CSI < Cb ; Cx ; Cy M/m)
+  // Button codes: 0x40 = wheel, 0x41 = wheel down
+  if (sequence.startsWith('<')) {
+    // Parse SGR mouse sequence: <Cb;Cx;CyM or <Cb;Cx;Cym
+    final parts = sequence.substring(1).split(';');
+    if (parts.length >= 3) {
+      final button = int.tryParse(parts[0]);
+      if (button != null) {
+        // Check if it's a wheel event (0x40 = wheel up, 0x41 = wheel down)
+        if ((button & 0x43) == 0x40) {
+          return const RichInputToken.control(ControlCharacter.pageUp);
+        }
+        if ((button & 0x43) == 0x41) {
+          return const RichInputToken.control(ControlCharacter.pageDown);
+        }
+      }
+    }
+  }
+
+  // X10 mouse events (CSI M Cb Cx Cy)
+  if (bytes.isNotEmpty && bytes[0] == 'M'.codeUnitAt(0)) {
+    if (bytes.length >= 3) {
+      final button = bytes[1] - 32; // X10 encoding adds 32
+      // Check if it's a wheel event
+      if ((button & 0x43) == 0x40) {
+        return const RichInputToken.control(ControlCharacter.pageUp);
+      }
+      if ((button & 0x43) == 0x41) {
+        return const RichInputToken.control(ControlCharacter.pageDown);
+      }
+    }
+  }
+
   if (sequence == '4~' || sequence == '8~') {
     return const RichInputToken.control(ControlCharacter.end);
   }
@@ -3820,6 +4114,8 @@ Loop opts:
 Repl opts:
   --stream-json        Print turn events as json lines
   --ui MODE            plain|rich (default rich)
+  --layout MODE        scrollback|fullscreen (default scrollback; fullscreen = alt-screen UI)
+  --fullscreen         Same as --layout fullscreen
 
 Auth opts:
   --provider NAME      claude|openai (required unless current provider is set)
@@ -3881,6 +4177,8 @@ Start opts:
   --no                 Exit immediately
   --no-repl            Render welcome only, skip REPL
   --ui MODE            plain|rich (default rich)
+  --layout MODE        scrollback|fullscreen (default scrollback)
+  --fullscreen         Same as --layout fullscreen
   --trust-file PATH    Override trust storage path (for tests/CI)
 
 Notes:

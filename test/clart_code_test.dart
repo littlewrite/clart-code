@@ -206,6 +206,8 @@ void main() {
     expect(result.code, 0);
     expect(result.output,
         contains('--ui MODE            plain|rich (default rich)'));
+    expect(result.output,
+        contains('--layout MODE        scrollback|fullscreen'));
   });
 
   test('auth command writes provider key and host into config file', () async {
@@ -1241,11 +1243,16 @@ void main() {
     }
   });
 
-  test('repl accepts --stream-json and exits in non-interactive mode',
-      () async {
-    final code = await runCli(['repl', '--stream-json']);
-    expect(code, 0);
-  });
+  test(
+    'repl accepts --stream-json and exits in non-interactive mode',
+    () async {
+      final code = await runCli(['repl', '--stream-json']);
+      expect(code, 0);
+    },
+    skip: stdin.hasTerminal
+        ? '需要非 TTY 的 stdin（首读即 EOF）；在 IDE 集成终端中运行会阻塞，请用 CI 或 script 跑全量测试'
+        : null,
+  );
 
   test('repl rejects invalid ui mode', () async {
     final code = await runCli(['repl', '--ui', 'invalid']);
