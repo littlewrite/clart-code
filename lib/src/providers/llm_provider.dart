@@ -3,6 +3,8 @@ import 'dart:io';
 
 import '../core/models.dart';
 import '../core/runtime_error.dart';
+import 'http_retry.dart';
+import 'sse_parser.dart';
 
 /// Types of events emitted during streaming provider execution.
 enum ProviderStreamEventType { textDelta, done, error }
@@ -157,11 +159,17 @@ class LocalEchoProvider extends LlmProvider {
 }
 
 class ClaudeApiProvider extends LlmProvider {
-  ClaudeApiProvider({required this.apiKey, this.baseUrl, this.model});
+  ClaudeApiProvider({
+    required this.apiKey,
+    this.baseUrl,
+    this.model,
+    this.timeout,
+  });
 
   final String apiKey;
   final String? baseUrl;
   final String? model;
+  final Duration? timeout;
 
   @override
   Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
@@ -219,47 +227,12 @@ class ClaudeApiProvider extends LlmProvider {
         return;
       }
 
-      String? eventName;
-      final dataLines = <String>[];
+      await for (final sseEvent in SseParser.parse(httpResponse)) {
+        if (sseEvent.isEmpty) continue;
 
-      await for (final line in httpResponse
-          .transform(utf8.decoder)
-          .transform(const LineSplitter())) {
-        final trimmed = line.trimRight();
-        if (trimmed.isEmpty) {
-          if (dataLines.isNotEmpty) {
-            final parsed = _parseClaudeStreamPayload(
-              rawPayload: dataLines.join('\n').trim(),
-              eventName: eventName,
-              currentModel: modelUsed,
-              outputBuffer: outputBuffer,
-            );
-            dataLines.clear();
-            modelUsed = parsed.modelUsed;
-            for (final event in parsed.events) {
-              yield event;
-            }
-            if (parsed.terminal) {
-              emittedTerminalEvent = true;
-              break;
-            }
-          }
-          eventName = null;
-          continue;
-        }
-        if (trimmed.startsWith('event:')) {
-          eventName = trimmed.substring(6).trim();
-          continue;
-        }
-        if (trimmed.startsWith('data:')) {
-          dataLines.add(trimmed.substring(5).trim());
-        }
-      }
-
-      if (!emittedTerminalEvent && dataLines.isNotEmpty) {
         final parsed = _parseClaudeStreamPayload(
-          rawPayload: dataLines.join('\n').trim(),
-          eventName: eventName,
+          rawPayload: sseEvent.data,
+          eventName: sseEvent.event,
           currentModel: modelUsed,
           outputBuffer: outputBuffer,
         );
@@ -267,7 +240,10 @@ class ClaudeApiProvider extends LlmProvider {
         for (final event in parsed.events) {
           yield event;
         }
-        emittedTerminalEvent = parsed.terminal;
+        if (parsed.terminal) {
+          emittedTerminalEvent = true;
+          break;
+        }
       }
 
       if (!emittedTerminalEvent) {
@@ -308,59 +284,75 @@ class ClaudeApiProvider extends LlmProvider {
       );
     }
 
-    final client = HttpClient();
-    try {
-      final uri = _buildClaudeUri(baseUrl);
-      final body = _buildClaudeRequestBody(request);
-      final httpRequest = await client.postUrl(uri);
-      httpRequest.headers
-          .set(HttpHeaders.contentTypeHeader, 'application/json');
-      httpRequest.headers.set('x-api-key', apiKey);
-      httpRequest.headers.set('anthropic-version', _anthropicApiVersion);
-      httpRequest.add(utf8.encode(jsonEncode(body)));
+    final retryConfig = timeout != null
+        ? RetryConfig(timeout: timeout!)
+        : RetryConfig.standard;
 
-      final httpResponse = await httpRequest.close();
-      final responseText = await httpResponse.transform(utf8.decoder).join();
-      final responseMap = _decodeJsonObject(responseText);
+    return await withRetry(
+      operation: () async {
+        final client = HttpClient();
+        try {
+          final uri = _buildClaudeUri(baseUrl);
+          final body = _buildClaudeRequestBody(request);
+          final httpRequest = await client.postUrl(uri);
+          httpRequest.headers
+              .set(HttpHeaders.contentTypeHeader, 'application/json');
+          httpRequest.headers.set('x-api-key', apiKey);
+          httpRequest.headers.set('anthropic-version', _anthropicApiVersion);
+          httpRequest.add(utf8.encode(jsonEncode(body)));
 
-      if (httpResponse.statusCode >= 200 && httpResponse.statusCode < 300) {
-        final output = _extractClaudeOutput(responseMap);
-        return QueryResponse.success(
-          output: output.isEmpty ? '[empty-output]' : output,
-          modelUsed: responseMap['model'] as String? ?? requestedModel,
-        );
-      }
+          final httpResponse = await httpRequest.close();
+          final responseText = await httpResponse.transform(utf8.decoder).join();
+          final responseMap = _decodeJsonObject(responseText);
 
-      final runtimeError = RuntimeError(
-        code: _mapClaudeHttpCode(httpResponse.statusCode),
-        message: _extractClaudeErrorMessage(
-          responseMap: responseMap,
-          fallbackStatusCode: httpResponse.statusCode,
-        ),
-        source: 'claude_http',
-        retriable: httpResponse.statusCode >= 500,
-      );
-      return QueryResponse.failure(
-        error: runtimeError,
-        output: _formatClaudeErrorOutput(
-          runtimeError,
-          statusCode: httpResponse.statusCode,
-        ),
-        modelUsed: requestedModel,
-      );
-    } catch (error) {
-      final runtimeError = _mapClaudeTransportError(
-        error,
-        source: 'claude_http',
-      );
-      return QueryResponse.failure(
-        error: runtimeError,
-        output: _formatClaudeErrorOutput(runtimeError),
-        modelUsed: requestedModel,
-      );
-    } finally {
-      client.close(force: true);
-    }
+          if (httpResponse.statusCode >= 200 && httpResponse.statusCode < 300) {
+            final output = _extractClaudeOutput(responseMap);
+            return QueryResponse.success(
+              output: output.isEmpty ? '[empty-output]' : output,
+              modelUsed: responseMap['model'] as String? ?? requestedModel,
+            );
+          }
+
+          final runtimeError = RuntimeError(
+            code: _mapClaudeHttpCode(httpResponse.statusCode),
+            message: _extractClaudeErrorMessage(
+              responseMap: responseMap,
+              fallbackStatusCode: httpResponse.statusCode,
+            ),
+            source: 'claude_http',
+            retriable: httpResponse.statusCode >= 500 || httpResponse.statusCode == 429,
+          );
+          return QueryResponse.failure(
+            error: runtimeError,
+            output: _formatClaudeErrorOutput(
+              runtimeError,
+              statusCode: httpResponse.statusCode,
+            ),
+            modelUsed: requestedModel,
+          );
+        } catch (error) {
+          final runtimeError = _mapClaudeTransportError(
+            error,
+            source: 'claude_http',
+          );
+          return QueryResponse.failure(
+            error: runtimeError,
+            output: _formatClaudeErrorOutput(runtimeError),
+            modelUsed: requestedModel,
+          );
+        } finally {
+          client.close(force: true);
+        }
+      },
+      config: retryConfig,
+      shouldRetry: (error, statusCode) {
+        // Retry on network errors and retriable HTTP errors
+        if (error is QueryResponse) {
+          return error.error?.retriable ?? false;
+        }
+        return isRetriableError(error, statusCode: statusCode);
+      },
+    );
   }
 
   Uri _buildClaudeUri(String? configuredBaseUrl) {
@@ -677,11 +669,13 @@ class OpenAiApiProvider extends LlmProvider {
     required this.apiKey,
     this.baseUrl,
     this.model,
+    this.timeout,
   });
 
   final String apiKey;
   final String? baseUrl;
   final String? model;
+  final Duration? timeout;
 
   @override
   Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
@@ -739,47 +733,12 @@ class OpenAiApiProvider extends LlmProvider {
         return;
       }
 
-      String? eventName;
-      final dataLines = <String>[];
+      await for (final sseEvent in SseParser.parse(httpResponse)) {
+        if (sseEvent.isEmpty) continue;
 
-      await for (final line in httpResponse
-          .transform(utf8.decoder)
-          .transform(const LineSplitter())) {
-        final trimmed = line.trimRight();
-        if (trimmed.isEmpty) {
-          if (dataLines.isNotEmpty) {
-            final parsed = _parseOpenAiResponsesStreamPayload(
-              rawPayload: dataLines.join('\n').trim(),
-              eventName: eventName,
-              currentModel: modelUsed,
-              outputBuffer: outputBuffer,
-            );
-            dataLines.clear();
-            modelUsed = parsed.modelUsed;
-            for (final event in parsed.events) {
-              yield event;
-            }
-            if (parsed.terminal) {
-              emittedTerminalEvent = true;
-              break;
-            }
-          }
-          eventName = null;
-          continue;
-        }
-        if (trimmed.startsWith('event:')) {
-          eventName = trimmed.substring(6).trim();
-          continue;
-        }
-        if (trimmed.startsWith('data:')) {
-          dataLines.add(trimmed.substring(5).trim());
-        }
-      }
-
-      if (!emittedTerminalEvent && dataLines.isNotEmpty) {
         final parsed = _parseOpenAiResponsesStreamPayload(
-          rawPayload: dataLines.join('\n').trim(),
-          eventName: eventName,
+          rawPayload: sseEvent.data,
+          eventName: sseEvent.event,
           currentModel: modelUsed,
           outputBuffer: outputBuffer,
         );
@@ -787,7 +746,10 @@ class OpenAiApiProvider extends LlmProvider {
         for (final event in parsed.events) {
           yield event;
         }
-        emittedTerminalEvent = parsed.terminal;
+        if (parsed.terminal) {
+          emittedTerminalEvent = true;
+          break;
+        }
       }
 
       if (!emittedTerminalEvent) {
@@ -828,61 +790,77 @@ class OpenAiApiProvider extends LlmProvider {
       );
     }
 
-    final client = HttpClient();
+    final retryConfig = timeout != null
+        ? RetryConfig(timeout: timeout!)
+        : RetryConfig.standard;
 
-    try {
-      final uri = _buildOpenAiResponsesUri(baseUrl);
-      final body = _buildOpenAiResponsesRequestBody(request);
-      final httpRequest = await client.postUrl(uri);
-      httpRequest.headers
-          .set(HttpHeaders.contentTypeHeader, 'application/json');
-      httpRequest.headers
-          .set(HttpHeaders.authorizationHeader, 'Bearer ${apiKey.trim()}');
-      httpRequest.add(utf8.encode(jsonEncode(body)));
+    return await withRetry(
+      operation: () async {
+        final client = HttpClient();
 
-      final httpResponse = await httpRequest.close();
-      final responseText = await httpResponse.transform(utf8.decoder).join();
-      final responseMap = _decodeJsonObject(responseText);
+        try {
+          final uri = _buildOpenAiResponsesUri(baseUrl);
+          final body = _buildOpenAiResponsesRequestBody(request);
+          final httpRequest = await client.postUrl(uri);
+          httpRequest.headers
+              .set(HttpHeaders.contentTypeHeader, 'application/json');
+          httpRequest.headers
+              .set(HttpHeaders.authorizationHeader, 'Bearer ${apiKey.trim()}');
+          httpRequest.add(utf8.encode(jsonEncode(body)));
 
-      if (httpResponse.statusCode >= 200 && httpResponse.statusCode < 300) {
-        final output = _extractOpenAiResponsesOutput(responseMap);
-        return QueryResponse.success(
-          output: output.isEmpty ? '[empty-output]' : output,
-          modelUsed: responseMap['model'] as String? ?? chosenModel,
-        );
-      }
+          final httpResponse = await httpRequest.close();
+          final responseText = await httpResponse.transform(utf8.decoder).join();
+          final responseMap = _decodeJsonObject(responseText);
 
-      final runtimeError = RuntimeError(
-        code: _mapOpenAiHttpCode(httpResponse.statusCode),
-        message: _extractOpenAiErrorMessage(
-          responseMap: responseMap,
-          fallbackStatusCode: httpResponse.statusCode,
-        ),
-        source: 'openai_http',
-        retriable: httpResponse.statusCode >= 500,
-      );
+          if (httpResponse.statusCode >= 200 && httpResponse.statusCode < 300) {
+            final output = _extractOpenAiResponsesOutput(responseMap);
+            return QueryResponse.success(
+              output: output.isEmpty ? '[empty-output]' : output,
+              modelUsed: responseMap['model'] as String? ?? chosenModel,
+            );
+          }
 
-      return QueryResponse.failure(
-        error: runtimeError,
-        output: _formatOpenAiErrorOutput(
-          runtimeError,
-          statusCode: httpResponse.statusCode,
-        ),
-        modelUsed: chosenModel,
-      );
-    } catch (error) {
-      final runtimeError = _mapOpenAiTransportError(
-        error,
-        source: 'openai_http',
-      );
-      return QueryResponse.failure(
-        error: runtimeError,
-        output: _formatOpenAiErrorOutput(runtimeError),
-        modelUsed: chosenModel,
-      );
-    } finally {
-      client.close(force: true);
-    }
+          final runtimeError = RuntimeError(
+            code: _mapOpenAiHttpCode(httpResponse.statusCode),
+            message: _extractOpenAiErrorMessage(
+              responseMap: responseMap,
+              fallbackStatusCode: httpResponse.statusCode,
+            ),
+            source: 'openai_http',
+            retriable: httpResponse.statusCode >= 500 || httpResponse.statusCode == 429,
+          );
+
+          return QueryResponse.failure(
+            error: runtimeError,
+            output: _formatOpenAiErrorOutput(
+              runtimeError,
+              statusCode: httpResponse.statusCode,
+            ),
+            modelUsed: chosenModel,
+          );
+        } catch (error) {
+          final runtimeError = _mapOpenAiTransportError(
+            error,
+            source: 'openai_http',
+          );
+          return QueryResponse.failure(
+            error: runtimeError,
+            output: _formatOpenAiErrorOutput(runtimeError),
+            modelUsed: chosenModel,
+          );
+        } finally {
+          client.close(force: true);
+        }
+      },
+      config: retryConfig,
+      shouldRetry: (error, statusCode) {
+        // Retry on network errors and retriable HTTP errors
+        if (error is QueryResponse) {
+          return error.error?.retriable ?? false;
+        }
+        return isRetriableError(error, statusCode: statusCode);
+      },
+    );
   }
 
   Uri _buildOpenAiResponsesUri(String? configuredBaseUrl) {
