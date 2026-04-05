@@ -2,9 +2,20 @@ import 'tool_models.dart';
 import 'tool_permissions.dart';
 import 'tool_registry.dart';
 
+/// Schedules and executes tool invocations with parallel/serial batching.
+///
+/// Groups parallel-safe tools for concurrent execution while preserving order
+/// and executing serial-only tools sequentially.
 class ToolScheduler {
   const ToolScheduler();
 
+  /// Executes a batch of tool invocations with optimal concurrency.
+  ///
+  /// Tools marked as [ToolExecutionHint.parallelSafe] are executed concurrently
+  /// in batches, while [ToolExecutionHint.serialOnly] tools run sequentially.
+  /// Permission checks are applied before execution.
+  ///
+  /// Returns results in the same order as the input invocations.
   Future<List<ToolExecutionResult>> runBatch({
     required List<ToolInvocation> invocations,
     required ToolRegistry registry,

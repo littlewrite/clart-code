@@ -3,11 +3,20 @@ import 'runtime_error.dart';
 import '../runtime/app_runtime.dart';
 import '../providers/llm_provider.dart';
 
+/// Query execution engine that coordinates LLM provider calls with security
+/// checks and telemetry.
+///
+/// Handles both synchronous and streaming query execution, applying security
+/// policies and error recovery logic.
 class QueryEngine {
   QueryEngine(this.runtime);
 
   final AppRuntime runtime;
 
+  /// Executes a query synchronously and returns the complete response.
+  ///
+  /// Applies security checks before execution and handles provider errors
+  /// with automatic retry classification.
   Future<QueryResponse> run(QueryRequest request) async {
     final userText = request.messages
         .where((m) => m.role == MessageRole.user)
@@ -51,6 +60,10 @@ class QueryEngine {
     }
   }
 
+  /// Executes a query with streaming output, yielding events as they arrive.
+  ///
+  /// Applies security checks and emits [ProviderStreamEvent]s for incremental
+  /// text deltas, completion, or errors.
   Stream<ProviderStreamEvent> runStream(QueryRequest request) async* {
     final userText = request.messages
         .where((m) => m.role == MessageRole.user)

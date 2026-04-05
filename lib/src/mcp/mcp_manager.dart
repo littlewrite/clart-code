@@ -1,0 +1,237 @@
+/// MCP 连接管理器
+/// 管理多个 MCP 服务器连接
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'mcp_client.dart';
+import 'mcp_types.dart';
+
+/// MCP 管理器
+class McpManager {
+  McpManager({required this.registryPath});
+
+  final String registryPath;
+  final _connections = <String, McpClient>{};
+  final _connectionStatus = <String, McpConnection>{};
+
+  /// 加载服务器注册表
+  Future<Map<String, McpStdioServerConfig>> loadRegistry() async {
+    final file = File(registryPath);
+    if (!await file.exists()) {
+      return {};
+    }
+
+    try {
+      final content = await file.readAsString();
+      final json = jsonDecode(content) as Map<String, Object?>;
+      final serversJson = json['servers'] as Map<String, Object?>? ?? {};
+
+      final configs = <String, McpStdioServerConfig>{};
+      for (final entry in serversJson.entries) {
+        final serverJson = entry.value as Map<String, Object?>;
+        configs[entry.key] = McpStdioServerConfig.fromJson({
+          'name': entry.key,
+          ...serverJson,
+        });
+      }
+
+      return configs;
+    } catch (e) {
+      throw Exception('Failed to load MCP registry: $e');
+    }
+  }
+
+  /// 保存服务器注册表
+  Future<void> saveRegistry(
+    Map<String, McpStdioServerConfig> configs,
+  ) async {
+    final serversJson = <String, Object?>{};
+    for (final entry in configs.entries) {
+      final config = entry.value.toJson();
+      config.remove('name'); // name 作为 key，不需要在 value 中重复
+      serversJson[entry.key] = config;
+    }
+
+    final json = {'servers': serversJson};
+    final file = File(registryPath);
+    await file.parent.create(recursive: true);
+    await file.writeAsString(
+      const JsonEncoder.withIndent('  ').convert(json),
+    );
+  }
+
+  /// 连接到指定服务器
+  Future<McpConnection> connect(McpStdioServerConfig config) async {
+    final name = config.name;
+
+    // 如果已连接，返回现有连接
+    if (_connections.containsKey(name)) {
+      return _connectionStatus[name]!;
+    }
+
+    // 更新状态为 pending
+    _connectionStatus[name] = McpConnection(
+      name: name,
+      status: McpServerStatus.pending,
+      config: config,
+    );
+
+    try {
+      final client = McpClient(config: config);
+      await client.connect();
+
+      _connections[name] = client;
+      final connection = McpConnection(
+        name: name,
+        status: McpServerStatus.connected,
+        config: config,
+        capabilities: client.capabilities,
+        serverInfo: client.serverInfo,
+      );
+      _connectionStatus[name] = connection;
+
+      return connection;
+    } catch (e) {
+      final connection = McpConnection(
+        name: name,
+        status: McpServerStatus.failed,
+        config: config,
+        error: e.toString(),
+      );
+      _connectionStatus[name] = connection;
+      return connection;
+    }
+  }
+
+  /// 连接到所有注册的服务器
+  Future<List<McpConnection>> connectAll() async {
+    final configs = await loadRegistry();
+    final connections = <McpConnection>[];
+
+    for (final config in configs.values) {
+      final connection = await connect(config);
+      connections.add(connection);
+    }
+
+    return connections;
+  }
+
+  /// 断开指定服务器
+  Future<void> disconnect(String name) async {
+    final client = _connections.remove(name);
+    await client?.disconnect();
+    _connectionStatus.remove(name);
+  }
+
+  /// 断开所有服务器
+  Future<void> disconnectAll() async {
+    for (final client in _connections.values) {
+      await client.disconnect();
+    }
+    _connections.clear();
+    _connectionStatus.clear();
+  }
+
+  /// 获取连接状态
+  McpConnection? getConnection(String name) => _connectionStatus[name];
+
+  /// 获取所有连接状态
+  List<McpConnection> getAllConnections() =>
+      _connectionStatus.values.toList();
+
+  /// 获取客户端
+  McpClient? getClient(String name) => _connections[name];
+
+  /// 列出所有工具
+  Future<List<McpTool>> listAllTools() async {
+    final allTools = <McpTool>[];
+
+    for (final entry in _connections.entries) {
+      final client = entry.value;
+      if (client.capabilities?.tools == true) {
+        try {
+          final tools = await client.listTools();
+          // 为工具名添加服务器前缀
+          final prefixedTools = tools.map((tool) {
+            return McpTool(
+              name: '${entry.key}/${tool.name}',
+              description: tool.description,
+              inputSchema: tool.inputSchema,
+            );
+          }).toList();
+          allTools.addAll(prefixedTools);
+        } catch (e) {
+          // 忽略单个服务器的错误
+        }
+      }
+    }
+
+    return allTools;
+  }
+
+  /// 列出所有资源
+  Future<List<McpResource>> listAllResources() async {
+    final allResources = <McpResource>[];
+
+    for (final entry in _connections.entries) {
+      final client = entry.value;
+      if (client.capabilities?.resources == true) {
+        try {
+          final resources = await client.listResources();
+          // 为资源 URI 添加服务器前缀
+          final prefixedResources = resources.map((resource) {
+            return McpResource(
+              uri: '${entry.key}://${resource.uri}',
+              name: resource.name,
+              description: resource.description,
+              mimeType: resource.mimeType,
+            );
+          }).toList();
+          allResources.addAll(prefixedResources);
+        } catch (e) {
+          // 忽略单个服务器的错误
+        }
+      }
+    }
+
+    return allResources;
+  }
+
+  /// 调用工具（支持 server/tool 格式）
+  Future<Map<String, Object?>> callTool({
+    required String name,
+    Map<String, Object?>? arguments,
+  }) async {
+    // 解析 server/tool 格式
+    final parts = name.split('/');
+    if (parts.length != 2) {
+      throw ArgumentError('Tool name must be in format: server/tool');
+    }
+
+    final serverName = parts[0];
+    final toolName = parts[1];
+
+    final client = _connections[serverName];
+    if (client == null) {
+      throw Exception('Server not connected: $serverName');
+    }
+
+    return await client.callTool(name: toolName, arguments: arguments);
+  }
+
+  /// 读取资源（支持 server://uri 格式）
+  Future<McpResourceContent> readResource(String uri) async {
+    // 解析 server://uri 格式
+    final uriObj = Uri.parse(uri);
+    final serverName = uriObj.scheme;
+    final resourceUri = uri.substring(serverName.length + 3); // 移除 "server://"
+
+    final client = _connections[serverName];
+    if (client == null) {
+      throw Exception('Server not connected: $serverName');
+    }
+
+    return await client.readResource(resourceUri);
+  }
+}

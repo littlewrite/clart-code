@@ -7,8 +7,13 @@ import 'runtime_error.dart';
 import 'transcript.dart';
 import '../providers/llm_provider.dart';
 
+/// Status of a turn execution.
 enum TurnExecutionStatus { success, error, interrupted }
 
+/// Result of executing a single conversation turn.
+///
+/// Contains the output text, execution status, transcript messages, and
+/// optional error information.
 class TurnExecutionResult {
   const TurnExecutionResult({
     required this.status,
@@ -60,11 +65,26 @@ class TurnExecutionResult {
   }
 }
 
+/// Executes a single conversation turn with streaming support and interruption
+/// handling.
+///
+/// Manages the lifecycle of a turn execution, including event emission,
+/// interrupt signals, and output buffering.
 class TurnExecutor {
   TurnExecutor(this.engine);
 
   final QueryEngine engine;
 
+  /// Executes a turn and returns the result.
+  ///
+  /// Parameters:
+  /// - [request]: The query request to execute
+  /// - [turn]: Turn number for event tracking
+  /// - [onEvent]: Callback for query events (turnStart, providerDelta, etc.)
+  /// - [onDelta]: Callback for incremental text deltas
+  /// - [interruptSignals]: Stream that triggers interruption when it emits
+  /// - [onInterrupt]: Callback invoked when interrupted
+  /// - [emitTurnStart]: Whether to emit turnStart event (default: true)
   Future<TurnExecutionResult> execute({
     required QueryRequest request,
     required int turn,
@@ -287,6 +307,10 @@ class TurnExecutor {
   }
 }
 
+/// Normalizes provider error output for user-friendly display.
+///
+/// Converts provider configuration errors to actionable messages and falls
+/// back to error message or generic failure text.
 String normalizeProviderErrorOutput(ProviderStreamEvent event) {
   if (event.error?.source == 'provider_config') {
     return 'Provider is not configured. Run /init or clart_code init.';

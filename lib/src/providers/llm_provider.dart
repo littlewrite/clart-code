@@ -4,8 +4,12 @@ import 'dart:io';
 import '../core/models.dart';
 import '../core/runtime_error.dart';
 
+/// Types of events emitted during streaming provider execution.
 enum ProviderStreamEventType { textDelta, done, error }
 
+/// Event emitted during streaming LLM provider execution.
+///
+/// Represents incremental text deltas, completion, or errors during streaming.
 class ProviderStreamEvent {
   const ProviderStreamEvent({
     required this.type,
@@ -57,9 +61,18 @@ class ProviderStreamEvent {
   }
 }
 
+/// Base interface for LLM providers.
+///
+/// Implementations provide both synchronous and streaming query execution.
+/// The default [stream] implementation wraps [run] for providers that don't
+/// support native streaming.
 abstract class LlmProvider {
+  /// Executes a query synchronously and returns the complete response.
   Future<QueryResponse> run(QueryRequest request);
 
+  /// Executes a query with streaming output, yielding events as they arrive.
+  ///
+  /// Default implementation wraps [run] for non-streaming providers.
   Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
     final response = await run(request);
     if (response.isOk) {

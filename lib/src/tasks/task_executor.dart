@@ -3,12 +3,17 @@ import 'package:uuid/uuid.dart';
 import 'task_models.dart';
 import 'task_store.dart';
 
+/// Manages task lifecycle and persistence.
+///
+/// Provides operations for creating, starting, completing, failing, and
+/// canceling background tasks with automatic state persistence.
 class TaskExecutor {
   TaskExecutor({TaskStore? store}) : _store = store ?? TaskStore();
 
   final TaskStore _store;
   static const _uuid = Uuid();
 
+  /// Creates a new task with pending status.
   Future<Task> createTask({
     required TaskType type,
     required String title,
@@ -26,6 +31,7 @@ class TaskExecutor {
     return task;
   }
 
+  /// Transitions a task to running status.
   Future<void> startTask(String taskId) async {
     final task = await _store.getTask(taskId);
     if (task != null) {
@@ -35,6 +41,7 @@ class TaskExecutor {
     }
   }
 
+  /// Marks a task as completed with optional output.
   Future<void> completeTask(String taskId, {String? output}) async {
     final task = await _store.getTask(taskId);
     if (task != null) {
@@ -48,6 +55,7 @@ class TaskExecutor {
     }
   }
 
+  /// Marks a task as failed with optional error message.
   Future<void> failTask(String taskId, {String? error}) async {
     final task = await _store.getTask(taskId);
     if (task != null) {
@@ -61,6 +69,9 @@ class TaskExecutor {
     }
   }
 
+  /// Cancels a pending or running task.
+  ///
+  /// Completed or failed tasks cannot be cancelled.
   Future<void> cancelTask(String taskId) async {
     final task = await _store.getTask(taskId);
     if (task != null && !task.isCompleted && !task.isFailed) {
@@ -73,6 +84,7 @@ class TaskExecutor {
     }
   }
 
+  /// Lists all tasks, optionally filtered by status.
   Future<List<Task>> listTasks({TaskStatus? filterStatus}) async {
     final tasks = await _store.loadTasks();
     if (filterStatus != null) {
