@@ -1,0 +1,542 @@
+import 'dart:async';
+
+import '../core/app_config.dart';
+import '../core/runtime_error.dart';
+import '../mcp/mcp_manager.dart';
+import '../providers/llm_provider.dart';
+import '../services/security_guard.dart';
+import '../services/telemetry.dart';
+import '../tools/tool_executor.dart';
+import '../tools/tool_models.dart';
+import '../tools/tool_permissions.dart';
+
+typedef ClartCodeCanUseTool = FutureOr<bool> Function(
+  ClartCodeToolCall toolCall,
+  ClartCodeToolContext context,
+);
+
+typedef ClartCodeSessionStartHook = FutureOr<void> Function(
+    ClartCodeSessionStartEvent event);
+
+typedef ClartCodeSessionEndHook = FutureOr<void> Function(
+    ClartCodeSessionEndEvent event);
+
+typedef ClartCodeStopHook = FutureOr<void> Function(ClartCodeStopEvent event);
+
+typedef ClartCodePreToolUseHook = FutureOr<void> Function(
+    ClartCodeToolEvent event);
+
+typedef ClartCodePostToolUseHook = FutureOr<void> Function(
+    ClartCodeToolResultEvent event);
+
+typedef ClartCodePostToolUseFailureHook = FutureOr<void> Function(
+    ClartCodeToolResultEvent event);
+
+class ClartCodeToolContext {
+  const ClartCodeToolContext({
+    required this.sessionId,
+    required this.cwd,
+    required this.provider,
+    required this.turn,
+    this.model,
+  });
+
+  final String sessionId;
+  final String cwd;
+  final ProviderKind provider;
+  final int turn;
+  final String? model;
+}
+
+class ClartCodeToolEvent {
+  const ClartCodeToolEvent({
+    required this.context,
+    required this.toolCall,
+  });
+
+  final ClartCodeToolContext context;
+  final ClartCodeToolCall toolCall;
+}
+
+class ClartCodeToolResultEvent extends ClartCodeToolEvent {
+  const ClartCodeToolResultEvent({
+    required super.context,
+    required super.toolCall,
+    required this.toolResult,
+  });
+
+  final ClartCodeToolResult toolResult;
+}
+
+class ClartCodeSessionStartEvent {
+  const ClartCodeSessionStartEvent({
+    required this.sessionId,
+    required this.cwd,
+    required this.provider,
+    required this.prompt,
+    required this.availableTools,
+    required this.toolDefinitions,
+    this.model,
+  });
+
+  final String sessionId;
+  final String cwd;
+  final ProviderKind provider;
+  final String prompt;
+  final List<String> availableTools;
+  final List<ClartCodeToolDefinition> toolDefinitions;
+  final String? model;
+}
+
+class ClartCodeSessionEndEvent {
+  const ClartCodeSessionEndEvent({
+    required this.sessionId,
+    required this.cwd,
+    required this.provider,
+    required this.prompt,
+    required this.result,
+    this.model,
+  });
+
+  final String sessionId;
+  final String cwd;
+  final ProviderKind provider;
+  final String prompt;
+  final ClartCodePromptResult result;
+  final String? model;
+}
+
+class ClartCodeStopEvent {
+  const ClartCodeStopEvent({
+    required this.sessionId,
+    required this.cwd,
+    required this.provider,
+    required this.reason,
+    this.model,
+  });
+
+  final String sessionId;
+  final String cwd;
+  final ProviderKind provider;
+  final String reason;
+  final String? model;
+}
+
+class ClartCodeAgentHooks {
+  const ClartCodeAgentHooks({
+    this.onSessionStart,
+    this.onSessionEnd,
+    this.onStop,
+    this.onPreToolUse,
+    this.onPostToolUse,
+    this.onPostToolUseFailure,
+  });
+
+  final ClartCodeSessionStartHook? onSessionStart;
+  final ClartCodeSessionEndHook? onSessionEnd;
+  final ClartCodeStopHook? onStop;
+  final ClartCodePreToolUseHook? onPreToolUse;
+  final ClartCodePostToolUseHook? onPostToolUse;
+  final ClartCodePostToolUseFailureHook? onPostToolUseFailure;
+}
+
+class ClartCodeMcpOptions {
+  const ClartCodeMcpOptions({
+    this.registryPath,
+    this.serverNames,
+    this.includeResourceTools = true,
+  });
+
+  final String? registryPath;
+  final List<String>? serverNames;
+  final bool includeResourceTools;
+}
+
+class ClartCodeAgentOptions {
+  const ClartCodeAgentOptions({
+    this.provider = ProviderKind.local,
+    this.model,
+    this.claudeApiKey,
+    this.claudeBaseUrl,
+    this.openAiApiKey,
+    this.openAiBaseUrl,
+    this.cwd,
+    this.sessionId,
+    this.resumeSessionId,
+    this.persistSession = true,
+    this.providerOverride,
+    this.toolExecutor,
+    this.allowedTools,
+    this.disallowedTools,
+    this.permissionMode,
+    this.maxTurns = 8,
+    this.permissionPolicy = const ToolPermissionPolicy(),
+    this.telemetry = const TelemetryService(),
+    this.securityGuard = const SecurityGuard(),
+    this.canUseTool,
+    this.hooks = const ClartCodeAgentHooks(),
+    this.mcp,
+    this.mcpManagerOverride,
+  });
+
+  final ProviderKind provider;
+  final String? model;
+  final String? claudeApiKey;
+  final String? claudeBaseUrl;
+  final String? openAiApiKey;
+  final String? openAiBaseUrl;
+  final String? cwd;
+  final String? sessionId;
+  final String? resumeSessionId;
+  final bool persistSession;
+  final LlmProvider? providerOverride;
+  final ToolExecutor? toolExecutor;
+  final List<String>? allowedTools;
+  final List<String>? disallowedTools;
+  final ToolPermissionMode? permissionMode;
+  final int maxTurns;
+  final ToolPermissionPolicy permissionPolicy;
+  final TelemetryService telemetry;
+  final SecurityGuard securityGuard;
+  final ClartCodeCanUseTool? canUseTool;
+  final ClartCodeAgentHooks hooks;
+  final ClartCodeMcpOptions? mcp;
+  final McpManager? mcpManagerOverride;
+
+  ClartCodeAgentOptions copyWith({
+    ProviderKind? provider,
+    String? model,
+    String? claudeApiKey,
+    String? claudeBaseUrl,
+    String? openAiApiKey,
+    String? openAiBaseUrl,
+    String? cwd,
+    String? sessionId,
+    String? resumeSessionId,
+    bool? persistSession,
+    LlmProvider? providerOverride,
+    ToolExecutor? toolExecutor,
+    List<String>? allowedTools,
+    List<String>? disallowedTools,
+    ToolPermissionMode? permissionMode,
+    int? maxTurns,
+    ToolPermissionPolicy? permissionPolicy,
+    TelemetryService? telemetry,
+    SecurityGuard? securityGuard,
+    ClartCodeCanUseTool? canUseTool,
+    ClartCodeAgentHooks? hooks,
+    ClartCodeMcpOptions? mcp,
+    McpManager? mcpManagerOverride,
+  }) {
+    return ClartCodeAgentOptions(
+      provider: provider ?? this.provider,
+      model: model ?? this.model,
+      claudeApiKey: claudeApiKey ?? this.claudeApiKey,
+      claudeBaseUrl: claudeBaseUrl ?? this.claudeBaseUrl,
+      openAiApiKey: openAiApiKey ?? this.openAiApiKey,
+      openAiBaseUrl: openAiBaseUrl ?? this.openAiBaseUrl,
+      cwd: cwd ?? this.cwd,
+      sessionId: sessionId ?? this.sessionId,
+      resumeSessionId: resumeSessionId ?? this.resumeSessionId,
+      persistSession: persistSession ?? this.persistSession,
+      providerOverride: providerOverride ?? this.providerOverride,
+      toolExecutor: toolExecutor ?? this.toolExecutor,
+      allowedTools: allowedTools ?? this.allowedTools,
+      disallowedTools: disallowedTools ?? this.disallowedTools,
+      permissionMode: permissionMode ?? this.permissionMode,
+      maxTurns: maxTurns ?? this.maxTurns,
+      permissionPolicy: permissionPolicy ?? this.permissionPolicy,
+      telemetry: telemetry ?? this.telemetry,
+      securityGuard: securityGuard ?? this.securityGuard,
+      canUseTool: canUseTool ?? this.canUseTool,
+      hooks: hooks ?? this.hooks,
+      mcp: mcp ?? this.mcp,
+      mcpManagerOverride: mcpManagerOverride ?? this.mcpManagerOverride,
+    );
+  }
+}
+
+class ClartCodeToolDefinition {
+  const ClartCodeToolDefinition({
+    required this.name,
+    required this.description,
+    required this.executionHint,
+    this.inputSchema,
+  });
+
+  final String name;
+  final String description;
+  final String executionHint;
+  final Map<String, Object?>? inputSchema;
+
+  factory ClartCodeToolDefinition.fromTool(Tool tool) {
+    return ClartCodeToolDefinition(
+      name: tool.name,
+      description: tool.description,
+      executionHint: tool.executionHint.name,
+      inputSchema: tool.inputSchema == null
+          ? null
+          : Map<String, Object?>.from(tool.inputSchema!),
+    );
+  }
+
+  Map<String, Object?> toJson() {
+    return {
+      'name': name,
+      'description': description,
+      'executionHint': executionHint,
+      'inputSchema': inputSchema,
+    };
+  }
+}
+
+class ClartCodeToolCall {
+  const ClartCodeToolCall({
+    required this.id,
+    required this.name,
+    this.input = const {},
+  });
+
+  final String id;
+  final String name;
+  final Map<String, Object?> input;
+
+  Map<String, Object?> toJson() {
+    return {
+      'id': id,
+      'name': name,
+      'input': input,
+    };
+  }
+}
+
+class ClartCodeToolResult {
+  const ClartCodeToolResult({
+    required this.callId,
+    required this.tool,
+    required this.ok,
+    required this.output,
+    this.errorCode,
+    this.errorMessage,
+  });
+
+  final String callId;
+  final String tool;
+  final bool ok;
+  final String output;
+  final String? errorCode;
+  final String? errorMessage;
+
+  Map<String, Object?> toJson() {
+    return {
+      'callId': callId,
+      'tool': tool,
+      'ok': ok,
+      'output': output,
+      'errorCode': errorCode,
+      'errorMessage': errorMessage,
+    };
+  }
+}
+
+class ClartCodeSdkMessage {
+  const ClartCodeSdkMessage({
+    required this.type,
+    required this.sessionId,
+    this.subtype,
+    this.text,
+    this.delta,
+    this.model,
+    this.turn,
+    this.turns,
+    this.isError,
+    this.error,
+    this.cwd,
+    this.tools,
+    this.toolDefinitions,
+    this.toolCall,
+    this.toolResult,
+    this.durationMs,
+  });
+
+  final String type;
+  final String sessionId;
+  final String? subtype;
+  final String? text;
+  final String? delta;
+  final String? model;
+  final int? turn;
+  final int? turns;
+  final bool? isError;
+  final RuntimeError? error;
+  final String? cwd;
+  final List<String>? tools;
+  final List<ClartCodeToolDefinition>? toolDefinitions;
+  final ClartCodeToolCall? toolCall;
+  final ClartCodeToolResult? toolResult;
+  final int? durationMs;
+
+  factory ClartCodeSdkMessage.systemInit({
+    required String sessionId,
+    required String cwd,
+    required String? model,
+    required List<String> tools,
+    required List<ClartCodeToolDefinition> toolDefinitions,
+  }) {
+    return ClartCodeSdkMessage(
+      type: 'system',
+      subtype: 'init',
+      sessionId: sessionId,
+      cwd: cwd,
+      model: model,
+      tools: List<String>.unmodifiable(tools),
+      toolDefinitions: List<ClartCodeToolDefinition>.unmodifiable(
+        toolDefinitions,
+      ),
+    );
+  }
+
+  factory ClartCodeSdkMessage.assistantDelta({
+    required String sessionId,
+    required String delta,
+    String? model,
+    int? turn,
+  }) {
+    return ClartCodeSdkMessage(
+      type: 'assistant_delta',
+      sessionId: sessionId,
+      delta: delta,
+      model: model,
+      turn: turn,
+    );
+  }
+
+  factory ClartCodeSdkMessage.assistant({
+    required String sessionId,
+    required String text,
+    String? model,
+    int? turn,
+  }) {
+    return ClartCodeSdkMessage(
+      type: 'assistant',
+      sessionId: sessionId,
+      text: text,
+      model: model,
+      turn: turn,
+    );
+  }
+
+  factory ClartCodeSdkMessage.toolCall({
+    required String sessionId,
+    required ClartCodeToolCall toolCall,
+    String? model,
+    int? turn,
+  }) {
+    return ClartCodeSdkMessage(
+      type: 'tool_call',
+      sessionId: sessionId,
+      model: model,
+      turn: turn,
+      toolCall: toolCall,
+    );
+  }
+
+  factory ClartCodeSdkMessage.toolResult({
+    required String sessionId,
+    required ClartCodeToolResult toolResult,
+    String? model,
+    int? turn,
+  }) {
+    return ClartCodeSdkMessage(
+      type: 'tool_result',
+      sessionId: sessionId,
+      model: model,
+      turn: turn,
+      toolResult: toolResult,
+    );
+  }
+
+  factory ClartCodeSdkMessage.result({
+    required String sessionId,
+    required String subtype,
+    required String text,
+    required bool isError,
+    String? model,
+    int turns = 1,
+    RuntimeError? error,
+    int? durationMs,
+  }) {
+    return ClartCodeSdkMessage(
+      type: 'result',
+      subtype: subtype,
+      sessionId: sessionId,
+      text: text,
+      model: model,
+      turns: turns,
+      isError: isError,
+      error: error,
+      durationMs: durationMs,
+    );
+  }
+
+  Map<String, Object?> toJson() {
+    return {
+      'type': type,
+      'subtype': subtype,
+      'sessionId': sessionId,
+      'text': text,
+      'delta': delta,
+      'model': model,
+      'turn': turn,
+      'turns': turns,
+      'isError': isError,
+      'error': error?.toJson(),
+      'cwd': cwd,
+      'tools': tools,
+      'toolDefinitions': toolDefinitions?.map((tool) => tool.toJson()).toList(),
+      'toolCall': toolCall?.toJson(),
+      'toolResult': toolResult?.toJson(),
+      'durationMs': durationMs,
+    };
+  }
+}
+
+class ClartCodePromptResult {
+  const ClartCodePromptResult({
+    required this.sessionId,
+    required this.text,
+    required this.turns,
+    required this.isError,
+    required this.messages,
+    this.model,
+    this.error,
+    this.durationMs,
+  });
+
+  final String sessionId;
+  final String text;
+  final int turns;
+  final bool isError;
+  final List<ClartCodeSdkMessage> messages;
+  final String? model;
+  final RuntimeError? error;
+  final int? durationMs;
+}
+
+@Deprecated('Use ClartCodeAgentOptions instead.')
+typedef ClatCodeAgentOptions = ClartCodeAgentOptions;
+
+@Deprecated('Use ClartCodeToolDefinition instead.')
+typedef ClatCodeToolDefinition = ClartCodeToolDefinition;
+
+@Deprecated('Use ClartCodeToolCall instead.')
+typedef ClatCodeToolCall = ClartCodeToolCall;
+
+@Deprecated('Use ClartCodeToolResult instead.')
+typedef ClatCodeToolResult = ClartCodeToolResult;
+
+@Deprecated('Use ClartCodeSdkMessage instead.')
+typedef ClatCodeSdkMessage = ClartCodeSdkMessage;
+
+@Deprecated('Use ClartCodePromptResult instead.')
+typedef ClatCodePromptResult = ClartCodePromptResult;

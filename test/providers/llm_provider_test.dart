@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:clart_code/src/core/models.dart';
 import 'package:clart_code/src/core/runtime_error.dart';
 import 'package:clart_code/src/providers/llm_provider.dart';
@@ -80,6 +83,52 @@ void main() {
           '[tool] tool result');
     });
 
+    test('builds native tool request and continuation payload', () {
+      final body = buildOpenAiResponsesRequestBodyForTest(
+        request: QueryRequest(
+          messages: [
+            ChatMessage(
+              role: MessageRole.tool,
+              text: jsonEncode({
+                'tool_call_id': 'call_read_1',
+                'tool': 'read',
+                'ok': true,
+                'output': 'file body',
+              }),
+            ),
+          ],
+          model: 'gpt-5.4',
+          providerStateToken: 'resp_123',
+          toolDefinitions: const [
+            QueryToolDefinition(
+              name: 'read',
+              description: 'Read a file',
+              inputSchema: {
+                'type': 'object',
+                'properties': {
+                  'path': {'type': 'string'},
+                },
+                'required': ['path'],
+              },
+            ),
+          ],
+        ),
+      );
+
+      expect(body['model'], 'gpt-5.4');
+      expect(body['previous_response_id'], 'resp_123');
+      expect(body['tools'], isA<List>());
+      final tools = body['tools'] as List;
+      expect((tools.first as Map)['type'], 'function');
+      expect((tools.first as Map)['name'], 'read');
+
+      final input = body['input'] as List;
+      expect(input, hasLength(1));
+      expect((input.first as Map)['type'], 'function_call_output');
+      expect((input.first as Map)['call_id'], 'call_read_1');
+      expect((input.first as Map)['output'], 'file body');
+    });
+
     test('extracts text from responses api output array', () {
       final text = extractOpenAiResponsesOutputForTest({
         'output': [
@@ -151,6 +200,23 @@ void main() {
       expect(events.first.model, 'gpt-5.4');
     });
 
+    test('parses responses stream completed event with native tool call', () {
+      final events = parseOpenAiResponsesStreamPayloadEventsForTest(
+        eventName: 'response.completed',
+        rawPayload:
+            '{"type":"response.completed","response":{"id":"resp_456","model":"gpt-5.4","output":[{"type":"function_call","id":"fc_1","call_id":"call_read_1","name":"read","arguments":"{\\"path\\":\\"/tmp/demo.txt\\"}"}]}}',
+      );
+
+      expect(events, hasLength(1));
+      expect(events.first.type, ProviderStreamEventType.done);
+      expect(events.first.output, '');
+      expect(events.first.providerStateToken, 'resp_456');
+      expect(events.first.toolCalls, hasLength(1));
+      expect(events.first.toolCalls.first.id, 'call_read_1');
+      expect(events.first.toolCalls.first.name, 'read');
+      expect(events.first.toolCalls.first.input, {'path': '/tmp/demo.txt'});
+    });
+
     test('parses responses refusal delta event', () {
       final events = parseOpenAiResponsesStreamPayloadEventsForTest(
         eventName: 'response.refusal.delta',
@@ -160,6 +226,227 @@ void main() {
       expect(events, hasLength(1));
       expect(events.first.type, ProviderStreamEventType.textDelta);
       expect(events.first.delta, 'cannot');
+    });
+
+    test('stream falls back to non-stream responses when SSE fails', () async {
+      HttpServer server;
+      try {
+        server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      } on SocketException {
+        return;
+      }
+      addTearDown(() async {
+        await server.close(force: true);
+      });
+
+      var requestCount = 0;
+      server.listen((request) async {
+        requestCount += 1;
+        final rawBody = await utf8.decoder.bind(request).join();
+        final body = jsonDecode(rawBody) as Map<String, Object?>;
+        final wantsStream = body['stream'] == true;
+
+        request.response.statusCode = 200;
+        if (wantsStream) {
+          request.response.headers.set(
+            HttpHeaders.contentTypeHeader,
+            'text/event-stream',
+          );
+          request.response.write('event: response.failed\n');
+          request.response.write(
+            'data: {"type":"response.failed","response":{"model":"gpt-4o-mini-stream"}}\n\n',
+          );
+          await request.response.close();
+          return;
+        }
+
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode({
+            'model': 'gpt-4o-mini-run',
+            'output': [
+              {
+                'type': 'message',
+                'content': [
+                  {
+                    'type': 'output_text',
+                    'text': 'fallback output',
+                  },
+                ],
+              },
+            ],
+          }),
+        );
+        await request.response.close();
+      });
+
+      final provider = OpenAiApiProvider(
+        apiKey: 'test-key',
+        baseUrl: 'http://${server.address.host}:${server.port}/v1',
+        model: 'gpt-4o-mini',
+      );
+
+      final events = <ProviderStreamEvent>[];
+      await for (final event in provider.stream(
+        const QueryRequest(
+          messages: [
+            ChatMessage(role: MessageRole.user, text: 'hello'),
+          ],
+        ),
+      )) {
+        events.add(event);
+      }
+
+      expect(requestCount, 2);
+      expect(events.map((event) => event.type), [
+        ProviderStreamEventType.textDelta,
+        ProviderStreamEventType.done,
+      ]);
+      expect(events.first.delta, 'fallback output');
+      expect(events.last.output, 'fallback output');
+      expect(events.last.model, 'gpt-4o-mini-run');
+    });
+  });
+
+  group('Claude Messages helpers', () {
+    test('builds native tool request body with assistant tool use and result',
+        () {
+      final body = buildClaudeRequestBodyForTest(
+        request: QueryRequest(
+          messages: [
+            const ChatMessage(role: MessageRole.system, text: 'be concise'),
+            const ChatMessage(role: MessageRole.user, text: 'read the file'),
+            ChatMessage(
+              role: MessageRole.assistant,
+              text: jsonEncode({
+                'text': 'using a tool',
+                'tool_calls': [
+                  {
+                    'id': 'toolu_1',
+                    'name': 'read',
+                    'input': {'path': '/tmp/demo.txt'},
+                  },
+                ],
+              }),
+            ),
+            ChatMessage(
+              role: MessageRole.tool,
+              text: jsonEncode({
+                'tool_call_id': 'toolu_1',
+                'tool': 'read',
+                'ok': true,
+                'output': 'demo body',
+              }),
+            ),
+          ],
+          model: 'claude-sonnet-4-6',
+          toolDefinitions: const [
+            QueryToolDefinition(
+              name: 'read',
+              description: 'Read a file',
+              inputSchema: {
+                'type': 'object',
+                'properties': {
+                  'path': {'type': 'string'},
+                },
+                'required': ['path'],
+              },
+            ),
+          ],
+        ),
+      );
+
+      expect(body['model'], 'claude-sonnet-4-6');
+      expect(body['tools'], isA<List>());
+      expect((body['tools'] as List).single, containsPair('name', 'read'));
+      expect(body['system'], 'be concise');
+
+      final messages = body['messages'] as List;
+      expect(messages, hasLength(3));
+      expect((messages[0] as Map)['role'], 'user');
+      expect((messages[1] as Map)['role'], 'assistant');
+      expect((messages[2] as Map)['role'], 'user');
+
+      final assistantContent = (messages[1] as Map)['content'] as List;
+      expect((assistantContent[0] as Map)['type'], 'text');
+      expect((assistantContent[1] as Map)['type'], 'tool_use');
+      expect((assistantContent[1] as Map)['id'], 'toolu_1');
+
+      final toolResultContent = (messages[2] as Map)['content'] as List;
+      expect((toolResultContent.single as Map)['type'], 'tool_result');
+      expect((toolResultContent.single as Map)['tool_use_id'], 'toolu_1');
+      expect((toolResultContent.single as Map)['content'], 'demo body');
+    });
+
+    test('run extracts native tool calls from Claude response', () async {
+      HttpServer server;
+      try {
+        server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      } on SocketException {
+        return;
+      }
+      addTearDown(() async {
+        await server.close(force: true);
+      });
+
+      Map<String, Object?>? capturedBody;
+      server.listen((request) async {
+        final rawBody = await utf8.decoder.bind(request).join();
+        capturedBody = Map<String, Object?>.from(
+          jsonDecode(rawBody) as Map<String, Object?>,
+        );
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode({
+            'id': 'msg_123',
+            'model': 'claude-sonnet-4-6',
+            'content': [
+              {
+                'type': 'tool_use',
+                'id': 'toolu_1',
+                'name': 'read',
+                'input': {'path': '/tmp/demo.txt'},
+              },
+            ],
+          }),
+        );
+        await request.response.close();
+      });
+
+      final provider = ClaudeApiProvider(
+        apiKey: 'test-key',
+        baseUrl: 'http://${server.address.host}:${server.port}/v1',
+        model: 'claude-sonnet-4-6',
+      );
+
+      final response = await provider.run(
+        const QueryRequest(
+          messages: [
+            ChatMessage(role: MessageRole.user, text: 'read the file'),
+          ],
+          toolDefinitions: [
+            QueryToolDefinition(
+              name: 'read',
+              description: 'Read a file',
+              inputSchema: {
+                'type': 'object',
+                'properties': {
+                  'path': {'type': 'string'},
+                },
+              },
+            ),
+          ],
+        ),
+      );
+
+      expect(response.isOk, isTrue);
+      expect(response.output, '');
+      expect(response.toolCalls, hasLength(1));
+      expect(response.toolCalls.single.id, 'toolu_1');
+      expect(response.toolCalls.single.name, 'read');
+      expect(response.toolCalls.single.input, {'path': '/tmp/demo.txt'});
+      expect(capturedBody, isNotNull);
+      expect(capturedBody!['tools'], isA<List>());
     });
   });
 

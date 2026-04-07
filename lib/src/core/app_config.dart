@@ -3,6 +3,19 @@ import 'dart:io';
 
 enum ProviderKind { local, claude, openai }
 
+ProviderKind? parseProviderKindValue(String? value) {
+  switch (value?.trim()) {
+    case 'local':
+      return ProviderKind.local;
+    case 'claude':
+      return ProviderKind.claude;
+    case 'openai':
+      return ProviderKind.openai;
+    default:
+      return null;
+  }
+}
+
 class AppConfig {
   const AppConfig({
     required this.provider,
@@ -68,7 +81,8 @@ class ConfigLoader {
     final effectiveConfigPath = _resolveConfigPath(configPath);
 
     var config = AppConfig(
-      provider: _parseProvider(env['CLART_PROVIDER']) ?? ProviderKind.local,
+      provider:
+          parseProviderKindValue(env['CLART_PROVIDER']) ?? ProviderKind.local,
       model: env['CLART_MODEL'],
       claudeApiKey: env['CLAUDE_API_KEY'],
       claudeBaseUrl: env['CLAUDE_BASE_URL'],
@@ -85,7 +99,7 @@ class ConfigLoader {
       config = fileResult.config!;
     }
 
-    final overrideProvider = _parseProvider(providerOverride);
+    final overrideProvider = parseProviderKindValue(providerOverride);
     if (providerOverride != null && overrideProvider == null) {
       return const ConfigLoadResult(
         config: null,
@@ -135,7 +149,8 @@ class ConfigLoader {
       );
     }
 
-    final parsedProvider = _parseProvider(decoded['provider'] as String?);
+    final parsedProvider =
+        parseProviderKindValue(decoded['provider'] as String?);
     if (decoded.containsKey('provider') && parsedProvider == null) {
       return const ConfigLoadResult(
         config: null,
@@ -158,19 +173,6 @@ class ConfigLoader {
         configPath: path,
       ),
     );
-  }
-
-  ProviderKind? _parseProvider(String? value) {
-    switch (value?.trim()) {
-      case 'local':
-        return ProviderKind.local;
-      case 'claude':
-        return ProviderKind.claude;
-      case 'openai':
-        return ProviderKind.openai;
-      default:
-        return null;
-    }
   }
 }
 

@@ -27,22 +27,28 @@ class ToolExecutor {
   }
 
   ToolExecutor copyWith({
+    ToolRegistry? registry,
+    ToolScheduler? scheduler,
     ToolPermissionPolicy? permissionPolicy,
   }) {
     return ToolExecutor(
-      registry: registry,
-      scheduler: scheduler,
+      registry: registry ?? this.registry,
+      scheduler: scheduler ?? this.scheduler,
       permissionPolicy: permissionPolicy ?? this.permissionPolicy,
     );
   }
 
   Future<List<ToolExecutionResult>> executeBatch(
-    List<ToolInvocation> invocations,
-  ) {
+    List<ToolInvocation> invocations, {
+    ToolPermissionResolver? permissionResolver,
+    ToolExecutionHooks hooks = const ToolExecutionHooks(),
+  }) {
     return scheduler.runBatch(
       invocations: invocations,
       registry: registry,
       permissionPolicy: permissionPolicy,
+      permissionResolver: permissionResolver,
+      hooks: hooks,
     );
   }
 }

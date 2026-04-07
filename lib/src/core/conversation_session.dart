@@ -60,6 +60,10 @@ class ConversationSession {
     _transcript.addAll(messages);
   }
 
+  void appendHistoryMessages(Iterable<ChatMessage> messages) {
+    _history.addAll(messages);
+  }
+
   void clear() {
     _history.clear();
     _transcript.clear();

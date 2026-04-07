@@ -1,8 +1,38 @@
-/// MCP 工具桥接
-/// 将 MCP 工具桥接到 Clart 的 Tool 系统
+// MCP 工具桥接
+// 将 MCP 工具桥接到 Clart 的 Tool 系统
 import '../mcp/mcp_manager.dart';
 import '../mcp/mcp_types.dart';
 import 'tool_models.dart';
+
+Future<List<Tool>> buildMcpTools({
+  required McpManager manager,
+  bool includeResourceTools = true,
+}) async {
+  final tools = <Tool>[];
+  final connections = manager.getAllConnections();
+  final hasResourceSupport = connections.any(
+    (connection) =>
+        connection.status == McpServerStatus.connected &&
+        connection.capabilities?.resources == true,
+  );
+
+  if (includeResourceTools && hasResourceSupport) {
+    tools.add(McpListResourcesTool(manager: manager));
+    tools.add(McpReadResourceTool(manager: manager));
+  }
+
+  final mcpTools = await manager.listAllTools();
+  tools.addAll(
+    mcpTools.map(
+      (mcpTool) => McpToolWrapper(
+        mcpTool: mcpTool,
+        manager: manager,
+      ),
+    ),
+  );
+
+  return List<Tool>.unmodifiable(tools);
+}
 
 /// MCP 工具包装器
 class McpToolWrapper implements Tool {
@@ -17,8 +47,10 @@ class McpToolWrapper implements Tool {
   @override
   String get name => mcpTool.name;
 
+  @override
   String get description => mcpTool.description;
 
+  @override
   Map<String, Object?>? get inputSchema => mcpTool.inputSchema;
 
   @override
@@ -92,9 +124,11 @@ class McpReadResourceTool implements Tool {
   @override
   String get name => 'mcp_read_resource';
 
+  @override
   String get description =>
       'Read content from an MCP resource. Use format: server://resource_uri';
 
+  @override
   Map<String, Object?>? get inputSchema => {
         'type': 'object',
         'properties': {
@@ -147,9 +181,11 @@ class McpListResourcesTool implements Tool {
   @override
   String get name => 'mcp_list_resources';
 
+  @override
   String get description =>
       'List all available MCP resources from connected servers';
 
+  @override
   Map<String, Object?>? get inputSchema => {
         'type': 'object',
         'properties': {},

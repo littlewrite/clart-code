@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -19,6 +20,8 @@ class ProviderStreamEvent {
     this.output,
     this.model,
     this.error,
+    this.toolCalls = const [],
+    this.providerStateToken,
   });
 
   final ProviderStreamEventType type;
@@ -26,6 +29,8 @@ class ProviderStreamEvent {
   final String? output;
   final String? model;
   final RuntimeError? error;
+  final List<QueryToolCall> toolCalls;
+  final String? providerStateToken;
 
   factory ProviderStreamEvent.textDelta({
     required String delta,
@@ -41,11 +46,15 @@ class ProviderStreamEvent {
   factory ProviderStreamEvent.done({
     required String output,
     String? model,
+    List<QueryToolCall> toolCalls = const [],
+    String? providerStateToken,
   }) {
     return ProviderStreamEvent(
       type: ProviderStreamEventType.done,
       output: output,
       model: model,
+      toolCalls: toolCalls,
+      providerStateToken: providerStateToken,
     );
   }
 
@@ -53,12 +62,16 @@ class ProviderStreamEvent {
     required RuntimeError error,
     String? output,
     String? model,
+    List<QueryToolCall> toolCalls = const [],
+    String? providerStateToken,
   }) {
     return ProviderStreamEvent(
       type: ProviderStreamEventType.error,
       error: error,
       output: output,
       model: model,
+      toolCalls: toolCalls,
+      providerStateToken: providerStateToken,
     );
   }
 }
@@ -69,6 +82,10 @@ class ProviderStreamEvent {
 /// The default [stream] implementation wraps [run] for providers that don't
 /// support native streaming.
 abstract class LlmProvider {
+  bool get supportsNativeToolCalling => false;
+
+  Future<void> cancelActiveRequest() async {}
+
   /// Executes a query synchronously and returns the complete response.
   Future<QueryResponse> run(QueryRequest request);
 
@@ -87,6 +104,8 @@ abstract class LlmProvider {
       yield ProviderStreamEvent.done(
         output: response.output,
         model: response.modelUsed,
+        toolCalls: response.toolCalls,
+        providerStateToken: response.providerStateToken,
       );
       return;
     }
@@ -101,6 +120,8 @@ abstract class LlmProvider {
           ),
       output: response.output,
       model: response.modelUsed,
+      toolCalls: response.toolCalls,
+      providerStateToken: response.providerStateToken,
     );
   }
 }
@@ -170,9 +191,22 @@ class ClaudeApiProvider extends LlmProvider {
   final String? baseUrl;
   final String? model;
   final Duration? timeout;
+  HttpClient? _activeClient;
+
+  @override
+  bool get supportsNativeToolCalling => true;
+
+  @override
+  Future<void> cancelActiveRequest() async {
+    _activeClient?.close(force: true);
+  }
 
   @override
   Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
+    if (request.toolDefinitions.isNotEmpty) {
+      yield* super.stream(request);
+      return;
+    }
     final requestedModel = _resolveClaudeModel(request);
     if (apiKey.trim().isEmpty) {
       yield ProviderStreamEvent.error(
@@ -189,21 +223,23 @@ class ClaudeApiProvider extends LlmProvider {
     }
 
     final client = HttpClient();
+    _activeClient = client;
     final outputBuffer = StringBuffer();
     var modelUsed = requestedModel;
     var emittedTerminalEvent = false;
+    final requestTimeout = timeout ?? RetryConfig.streaming.timeout;
 
     try {
       final uri = _buildClaudeUri(baseUrl);
       final body = _buildClaudeRequestBody(request)..['stream'] = true;
-      final httpRequest = await client.postUrl(uri);
+      final httpRequest = await client.postUrl(uri).timeout(requestTimeout);
       httpRequest.headers
           .set(HttpHeaders.contentTypeHeader, 'application/json');
       httpRequest.headers.set('x-api-key', apiKey);
       httpRequest.headers.set('anthropic-version', _anthropicApiVersion);
       httpRequest.add(utf8.encode(jsonEncode(body)));
 
-      final httpResponse = await httpRequest.close();
+      final httpResponse = await httpRequest.close().timeout(requestTimeout);
       if (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300) {
         final responseText = await httpResponse.transform(utf8.decoder).join();
         final responseMap = _decodeJsonObject(responseText);
@@ -264,6 +300,9 @@ class ClaudeApiProvider extends LlmProvider {
         model: modelUsed,
       );
     } finally {
+      if (identical(_activeClient, client)) {
+        _activeClient = null;
+      }
       client.close(force: true);
     }
   }
@@ -284,13 +323,13 @@ class ClaudeApiProvider extends LlmProvider {
       );
     }
 
-    final retryConfig = timeout != null
-        ? RetryConfig(timeout: timeout!)
-        : RetryConfig.standard;
+    final retryConfig =
+        timeout != null ? RetryConfig(timeout: timeout!) : RetryConfig.standard;
 
     return await withRetry(
       operation: () async {
         final client = HttpClient();
+        _activeClient = client;
         try {
           final uri = _buildClaudeUri(baseUrl);
           final body = _buildClaudeRequestBody(request);
@@ -302,14 +341,21 @@ class ClaudeApiProvider extends LlmProvider {
           httpRequest.add(utf8.encode(jsonEncode(body)));
 
           final httpResponse = await httpRequest.close();
-          final responseText = await httpResponse.transform(utf8.decoder).join();
+          final responseText =
+              await httpResponse.transform(utf8.decoder).join();
           final responseMap = _decodeJsonObject(responseText);
 
           if (httpResponse.statusCode >= 200 && httpResponse.statusCode < 300) {
             final output = _extractClaudeOutput(responseMap);
+            final toolCalls = _extractClaudeToolCalls(responseMap);
             return QueryResponse.success(
-              output: output.isEmpty ? '[empty-output]' : output,
+              output: output.isEmpty && toolCalls.isNotEmpty
+                  ? ''
+                  : output.isEmpty
+                      ? '[empty-output]'
+                      : output,
               modelUsed: responseMap['model'] as String? ?? requestedModel,
+              toolCalls: toolCalls,
             );
           }
 
@@ -320,7 +366,8 @@ class ClaudeApiProvider extends LlmProvider {
               fallbackStatusCode: httpResponse.statusCode,
             ),
             source: 'claude_http',
-            retriable: httpResponse.statusCode >= 500 || httpResponse.statusCode == 429,
+            retriable: httpResponse.statusCode >= 500 ||
+                httpResponse.statusCode == 429,
           );
           return QueryResponse.failure(
             error: runtimeError,
@@ -341,6 +388,9 @@ class ClaudeApiProvider extends LlmProvider {
             modelUsed: requestedModel,
           );
         } finally {
+          if (identical(_activeClient, client)) {
+            _activeClient = null;
+          }
           client.close(force: true);
         }
       },
@@ -391,6 +441,43 @@ class ClaudeApiProvider extends LlmProvider {
         .map((block) => block['text'] as String)
         .join('\n')
         .trim();
+  }
+
+  List<QueryToolCall> _extractClaudeToolCalls(
+      Map<String, Object?> responseMap) {
+    final content = responseMap['content'];
+    if (content is! List) {
+      return const [];
+    }
+
+    final toolCalls = <QueryToolCall>[];
+    for (final block in content.whereType<Map>()) {
+      if (block['type'] != 'tool_use') {
+        continue;
+      }
+      final id = block['id'] as String?;
+      final name = block['name'] as String?;
+      if (id == null ||
+          id.trim().isEmpty ||
+          name == null ||
+          name.trim().isEmpty) {
+        continue;
+      }
+      final input = block['input'] is Map<String, Object?>
+          ? block['input'] as Map<String, Object?>
+          : block['input'] is Map
+              ? Map<String, Object?>.from(block['input'] as Map)
+              : const <String, Object?>{};
+      toolCalls.add(
+        QueryToolCall(
+          id: id.trim(),
+          name: name.trim(),
+          input: Map<String, Object?>.unmodifiable(input),
+        ),
+      );
+    }
+
+    return List<QueryToolCall>.unmodifiable(toolCalls);
   }
 
   String _extractClaudeDeltaText(Map<String, Object?> eventPayload) {
@@ -519,6 +606,15 @@ class ClaudeApiProvider extends LlmProvider {
     Object error, {
     required String source,
   }) {
+    if (error is TimeoutException) {
+      return RuntimeError(
+        code: RuntimeErrorCode.providerFailure,
+        message:
+            'Claude API request timed out. Check endpoint latency, model responsiveness, or the configured timeout.',
+        source: source,
+        retriable: true,
+      );
+    }
     if (error is SocketException) {
       return RuntimeError(
         code: RuntimeErrorCode.providerFailure,
@@ -580,11 +676,12 @@ class ClaudeApiProvider extends LlmProvider {
       return '[ERROR] Claude authentication failed. Check your API key.';
     }
     if (error.message.contains('Network error while reaching Claude API') ||
+        error.message.contains('request timed out') ||
         error.message
             .contains('TLS handshake failed while reaching Claude API')) {
-      return '[ERROR] Could not reach Claude API. Check your network and base URL.';
+      return '[ERROR] Could not reach Claude API. Check your network, timeout, and base URL.';
     }
-    return '[ERROR] Could not reach Claude API. Check your network and base URL.';
+    return '[ERROR] Could not reach Claude API. Check your network, timeout, and base URL.';
   }
 
   RuntimeErrorCode _mapClaudeHttpCode(int statusCode) {
@@ -620,24 +717,10 @@ Map<String, Object?> _buildClaudeRequestBodyPayload({
 }) {
   final resolvedModel = request.model ?? fallbackModel ?? _defaultClaudeModel;
   final systemMessages = <String>[];
-  final messages = <Map<String, Object?>>[];
-
-  for (final message in request.messages) {
-    switch (message.role) {
-      case MessageRole.system:
-        systemMessages.add(message.text);
-        break;
-      case MessageRole.user:
-        messages.add({'role': 'user', 'content': message.text});
-        break;
-      case MessageRole.assistant:
-        messages.add({'role': 'assistant', 'content': message.text});
-        break;
-      case MessageRole.tool:
-        messages.add({'role': 'user', 'content': '[tool] ${message.text}'});
-        break;
-    }
-  }
+  final messages = _buildClaudeMessagesPayload(
+    request.messages,
+    systemMessages: systemMessages,
+  );
 
   if (messages.isEmpty) {
     messages.add({'role': 'user', 'content': ''});
@@ -649,7 +732,150 @@ Map<String, Object?> _buildClaudeRequestBodyPayload({
     'thinking': const {'type': 'disabled'},
     if (systemMessages.isNotEmpty) 'system': systemMessages.join('\n'),
     'messages': messages,
+    if (request.toolDefinitions.isNotEmpty)
+      'tools': request.toolDefinitions
+          .map(_buildClaudeToolDefinitionPayload)
+          .toList(growable: false),
   };
+}
+
+List<Map<String, Object?>> _buildClaudeMessagesPayload(
+  List<ChatMessage> history, {
+  required List<String> systemMessages,
+}) {
+  final messages = <Map<String, Object?>>[];
+  final pendingToolResults = <Map<String, Object?>>[];
+
+  void flushPendingToolResults() {
+    if (pendingToolResults.isEmpty) {
+      return;
+    }
+    messages.add({
+      'role': 'user',
+      'content': List<Map<String, Object?>>.from(pendingToolResults),
+    });
+    pendingToolResults.clear();
+  }
+
+  for (final message in history) {
+    switch (message.role) {
+      case MessageRole.system:
+        systemMessages.add(message.text);
+        break;
+      case MessageRole.user:
+        flushPendingToolResults();
+        messages.add({'role': 'user', 'content': message.text});
+        break;
+      case MessageRole.assistant:
+        flushPendingToolResults();
+        final payload = _decodeAssistantToolCallPayload(message.text);
+        if (payload == null) {
+          messages.add({'role': 'assistant', 'content': message.text});
+          break;
+        }
+
+        final content = <Map<String, Object?>>[];
+        if (payload.text != null && payload.text!.trim().isNotEmpty) {
+          content.add({
+            'type': 'text',
+            'text': payload.text!.trim(),
+          });
+        }
+        for (final toolCall in payload.toolCalls) {
+          content.add({
+            'type': 'tool_use',
+            'id': toolCall.id,
+            'name': toolCall.name,
+            'input': toolCall.input,
+          });
+        }
+        messages.add({
+          'role': 'assistant',
+          'content': content,
+        });
+        break;
+      case MessageRole.tool:
+        final toolResult = _decodeToolResultPayload(message.text);
+        if (toolResult == null) {
+          flushPendingToolResults();
+          messages.add({
+            'role': 'user',
+            'content': '[tool] ${message.text}',
+          });
+          break;
+        }
+        pendingToolResults.add({
+          'type': 'tool_result',
+          'tool_use_id': toolResult.callId,
+          'content': toolResult.output,
+          if (toolResult.isError) 'is_error': true,
+        });
+        break;
+    }
+  }
+
+  flushPendingToolResults();
+  return messages;
+}
+
+Map<String, Object?> _buildClaudeToolDefinitionPayload(
+  QueryToolDefinition tool,
+) {
+  return {
+    'name': tool.name,
+    'description': tool.description,
+    'input_schema': tool.inputSchema ??
+        const {
+          'type': 'object',
+          'properties': {},
+        },
+  };
+}
+
+_AssistantToolCallPayload? _decodeAssistantToolCallPayload(String raw) {
+  try {
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) {
+      return null;
+    }
+    final payload = Map<String, Object?>.from(decoded);
+    final toolCallsRaw = payload['tool_calls'];
+    if (toolCallsRaw is! List) {
+      return null;
+    }
+    final toolCalls = toolCallsRaw
+        .whereType<Map>()
+        .map((item) => _toolCallFromJsonMap(Map<String, Object?>.from(item)))
+        .whereType<QueryToolCall>()
+        .toList(growable: false);
+    if (toolCalls.isEmpty) {
+      return null;
+    }
+    return _AssistantToolCallPayload(
+      text: payload['text'] as String?,
+      toolCalls: toolCalls,
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+QueryToolCall? _toolCallFromJsonMap(Map<String, Object?> map) {
+  final id = map['id'] as String?;
+  final name = map['name'] as String?;
+  if (id == null || id.trim().isEmpty || name == null || name.trim().isEmpty) {
+    return null;
+  }
+  final input = map['input'] is Map<String, Object?>
+      ? map['input'] as Map<String, Object?>
+      : map['input'] is Map
+          ? Map<String, Object?>.from(map['input'] as Map)
+          : const <String, Object?>{};
+  return QueryToolCall(
+    id: id.trim(),
+    name: name.trim(),
+    input: Map<String, Object?>.unmodifiable(input),
+  );
 }
 
 class _ClaudeStreamPayloadParseResult {
@@ -664,6 +890,16 @@ class _ClaudeStreamPayloadParseResult {
   final bool terminal;
 }
 
+class _AssistantToolCallPayload {
+  const _AssistantToolCallPayload({
+    required this.toolCalls,
+    this.text,
+  });
+
+  final String? text;
+  final List<QueryToolCall> toolCalls;
+}
+
 class OpenAiApiProvider extends LlmProvider {
   OpenAiApiProvider({
     required this.apiKey,
@@ -676,6 +912,15 @@ class OpenAiApiProvider extends LlmProvider {
   final String? baseUrl;
   final String? model;
   final Duration? timeout;
+  HttpClient? _activeClient;
+
+  @override
+  bool get supportsNativeToolCalling => true;
+
+  @override
+  Future<void> cancelActiveRequest() async {
+    _activeClient?.close(force: true);
+  }
 
   @override
   Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
@@ -695,21 +940,24 @@ class OpenAiApiProvider extends LlmProvider {
     }
 
     final client = HttpClient();
+    _activeClient = client;
     final outputBuffer = StringBuffer();
     var modelUsed = chosenModel;
     var emittedTerminalEvent = false;
+    var emittedTextDelta = false;
+    final requestTimeout = timeout ?? RetryConfig.streaming.timeout;
 
     try {
       final uri = _buildOpenAiResponsesUri(baseUrl);
       final body = _buildOpenAiResponsesRequestBody(request)..['stream'] = true;
-      final httpRequest = await client.postUrl(uri);
+      final httpRequest = await client.postUrl(uri).timeout(requestTimeout);
       httpRequest.headers
           .set(HttpHeaders.contentTypeHeader, 'application/json');
       httpRequest.headers
           .set(HttpHeaders.authorizationHeader, 'Bearer ${apiKey.trim()}');
       httpRequest.add(utf8.encode(jsonEncode(body)));
 
-      final httpResponse = await httpRequest.close();
+      final httpResponse = await httpRequest.close().timeout(requestTimeout);
       if (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300) {
         final responseText = await httpResponse.transform(utf8.decoder).join();
         final responseMap = _decodeJsonObject(responseText);
@@ -743,6 +991,52 @@ class OpenAiApiProvider extends LlmProvider {
           outputBuffer: outputBuffer,
         );
         modelUsed = parsed.modelUsed;
+
+        final hasTextDelta = parsed.events.any(
+          (event) => event.type == ProviderStreamEventType.textDelta,
+        );
+        if (hasTextDelta) {
+          emittedTextDelta = true;
+        }
+
+        final hasTerminalError = parsed.events.any(
+          (event) => event.type == ProviderStreamEventType.error,
+        );
+        if (hasTerminalError && !emittedTextDelta) {
+          final fallback = await run(request);
+          final fallbackModel = fallback.modelUsed ?? modelUsed;
+          if (fallback.isOk) {
+            if (fallback.output.isNotEmpty) {
+              yield ProviderStreamEvent.textDelta(
+                delta: fallback.output,
+                model: fallbackModel,
+              );
+            }
+            yield ProviderStreamEvent.done(
+              output: fallback.output,
+              model: fallbackModel,
+              toolCalls: fallback.toolCalls,
+              providerStateToken: fallback.providerStateToken,
+            );
+          } else {
+            yield ProviderStreamEvent.error(
+              error: fallback.error ??
+                  const RuntimeError(
+                    code: RuntimeErrorCode.providerFailure,
+                    message: 'OpenAI stream fallback failed',
+                    source: 'openai_stream_fallback',
+                    retriable: true,
+                  ),
+              output: fallback.output,
+              model: fallbackModel,
+              toolCalls: fallback.toolCalls,
+              providerStateToken: fallback.providerStateToken,
+            );
+          }
+          emittedTerminalEvent = true;
+          break;
+        }
+
         for (final event in parsed.events) {
           yield event;
         }
@@ -770,6 +1064,9 @@ class OpenAiApiProvider extends LlmProvider {
         model: modelUsed,
       );
     } finally {
+      if (identical(_activeClient, client)) {
+        _activeClient = null;
+      }
       client.close(force: true);
     }
   }
@@ -790,13 +1087,13 @@ class OpenAiApiProvider extends LlmProvider {
       );
     }
 
-    final retryConfig = timeout != null
-        ? RetryConfig(timeout: timeout!)
-        : RetryConfig.standard;
+    final retryConfig =
+        timeout != null ? RetryConfig(timeout: timeout!) : RetryConfig.standard;
 
     return await withRetry(
       operation: () async {
         final client = HttpClient();
+        _activeClient = client;
 
         try {
           final uri = _buildOpenAiResponsesUri(baseUrl);
@@ -809,14 +1106,22 @@ class OpenAiApiProvider extends LlmProvider {
           httpRequest.add(utf8.encode(jsonEncode(body)));
 
           final httpResponse = await httpRequest.close();
-          final responseText = await httpResponse.transform(utf8.decoder).join();
+          final responseText =
+              await httpResponse.transform(utf8.decoder).join();
           final responseMap = _decodeJsonObject(responseText);
 
           if (httpResponse.statusCode >= 200 && httpResponse.statusCode < 300) {
             final output = _extractOpenAiResponsesOutput(responseMap);
+            final toolCalls = _extractOpenAiResponsesToolCalls(responseMap);
             return QueryResponse.success(
-              output: output.isEmpty ? '[empty-output]' : output,
+              output: output.isEmpty && toolCalls.isNotEmpty
+                  ? ''
+                  : output.isEmpty
+                      ? '[empty-output]'
+                      : output,
               modelUsed: responseMap['model'] as String? ?? chosenModel,
+              toolCalls: toolCalls,
+              providerStateToken: _extractOpenAiResponsesId(responseMap),
             );
           }
 
@@ -827,7 +1132,8 @@ class OpenAiApiProvider extends LlmProvider {
               fallbackStatusCode: httpResponse.statusCode,
             ),
             source: 'openai_http',
-            retriable: httpResponse.statusCode >= 500 || httpResponse.statusCode == 429,
+            retriable: httpResponse.statusCode >= 500 ||
+                httpResponse.statusCode == 429,
           );
 
           return QueryResponse.failure(
@@ -849,6 +1155,9 @@ class OpenAiApiProvider extends LlmProvider {
             modelUsed: chosenModel,
           );
         } finally {
+          if (identical(_activeClient, client)) {
+            _activeClient = null;
+          }
           client.close(force: true);
         }
       },
@@ -903,23 +1212,27 @@ Map<String, Object?> _buildOpenAiResponsesRequestBodyPayload({
   String? fallbackModel,
 }) {
   final resolvedModel = request.model ?? fallbackModel ?? 'gpt-4o-mini';
-  final input = <Map<String, Object?>>[];
+  final input = request.providerStateToken == null
+      ? <Map<String, Object?>>[]
+      : _buildOpenAiResponsesContinuationInput(request.messages);
 
-  for (final message in request.messages) {
-    final text = switch (message.role) {
-      MessageRole.tool => '[tool] ${message.text}',
-      _ => message.text,
-    };
+  if (request.providerStateToken == null) {
+    for (final message in request.messages) {
+      final text = switch (message.role) {
+        MessageRole.tool => '[tool] ${message.text}',
+        _ => message.text,
+      };
 
-    input.add({
-      'role': _toOpenAiResponsesRole(message.role),
-      'content': [
-        {
-          'type': _toOpenAiResponsesContentType(message.role),
-          'text': text,
-        },
-      ],
-    });
+      input.add({
+        'role': _toOpenAiResponsesRole(message.role),
+        'content': [
+          {
+            'type': _toOpenAiResponsesContentType(message.role),
+            'text': text,
+          },
+        ],
+      });
+    }
   }
 
   if (input.isEmpty) {
@@ -933,7 +1246,61 @@ Map<String, Object?> _buildOpenAiResponsesRequestBodyPayload({
 
   return {
     'model': resolvedModel,
+    if (request.providerStateToken != null)
+      'previous_response_id': request.providerStateToken,
     'input': input,
+    if (request.toolDefinitions.isNotEmpty)
+      'tools': request.toolDefinitions
+          .map(_buildOpenAiResponsesToolDefinition)
+          .toList(growable: false),
+    if (request.toolDefinitions.isNotEmpty) 'tool_choice': 'auto',
+  };
+}
+
+List<Map<String, Object?>> _buildOpenAiResponsesContinuationInput(
+  List<ChatMessage> messages,
+) {
+  final input = <Map<String, Object?>>[];
+  for (final message in messages) {
+    if (message.role == MessageRole.tool) {
+      final toolResult = _decodeToolResultPayload(message.text);
+      if (toolResult != null) {
+        input.add({
+          'type': 'function_call_output',
+          'call_id': toolResult.callId,
+          'output': toolResult.output,
+        });
+        continue;
+      }
+    }
+
+    input.add({
+      'role': _toOpenAiResponsesRole(message.role),
+      'content': [
+        {
+          'type': _toOpenAiResponsesContentType(message.role),
+          'text': message.role == MessageRole.tool
+              ? '[tool] ${message.text}'
+              : message.text,
+        },
+      ],
+    });
+  }
+  return input;
+}
+
+Map<String, Object?> _buildOpenAiResponsesToolDefinition(
+  QueryToolDefinition tool,
+) {
+  return {
+    'type': 'function',
+    'name': tool.name,
+    'description': tool.description,
+    'parameters': tool.inputSchema ??
+        const {
+          'type': 'object',
+          'properties': {},
+        },
   };
 }
 
@@ -1001,6 +1368,114 @@ String _extractOpenAiResponsesOutput(Map<String, Object?> responseMap) {
     }
   }
   return chunks.join('\n').trim();
+}
+
+String? _extractOpenAiResponsesId(Map<String, Object?> responseMap) {
+  final response = responseMap['response'];
+  if (response is Map<String, dynamic>) {
+    final id = response['id'];
+    if (id is String && id.isNotEmpty) {
+      return id;
+    }
+  }
+  final id = responseMap['id'];
+  if (id is String && id.isNotEmpty) {
+    return id;
+  }
+  return null;
+}
+
+List<QueryToolCall> _extractOpenAiResponsesToolCalls(
+  Map<String, Object?> responseMap,
+) {
+  final nestedResponse = responseMap['response'];
+  if (nestedResponse is Map<String, dynamic>) {
+    final nestedToolCalls = _extractOpenAiResponsesToolCalls(
+      Map<String, Object?>.from(nestedResponse),
+    );
+    if (nestedToolCalls.isNotEmpty) {
+      return nestedToolCalls;
+    }
+  }
+
+  final output = responseMap['output'];
+  if (output is! List) {
+    return const [];
+  }
+
+  final toolCalls = <QueryToolCall>[];
+  for (final item in output.whereType<Map>()) {
+    if (item['type'] != 'function_call') {
+      continue;
+    }
+    final name = item['name'] as String?;
+    if (name == null || name.trim().isEmpty) {
+      continue;
+    }
+    final callId = item['call_id'] as String? ??
+        item['id'] as String? ??
+        'call_${toolCalls.length + 1}';
+    final arguments = _parseOpenAiToolArguments(item['arguments']);
+    toolCalls.add(
+      QueryToolCall(
+        id: callId,
+        name: name.trim(),
+        input: arguments,
+      ),
+    );
+  }
+
+  return List<QueryToolCall>.unmodifiable(toolCalls);
+}
+
+Map<String, Object?> _parseOpenAiToolArguments(Object? rawArguments) {
+  if (rawArguments is Map<String, Object?>) {
+    return Map<String, Object?>.unmodifiable(rawArguments);
+  }
+  if (rawArguments is Map) {
+    return Map<String, Object?>.unmodifiable(
+      Map<String, Object?>.from(rawArguments),
+    );
+  }
+  if (rawArguments is String && rawArguments.trim().isNotEmpty) {
+    try {
+      final decoded = jsonDecode(rawArguments);
+      if (decoded is Map<String, Object?>) {
+        return Map<String, Object?>.unmodifiable(decoded);
+      }
+      if (decoded is Map) {
+        return Map<String, Object?>.unmodifiable(
+          Map<String, Object?>.from(decoded),
+        );
+      }
+    } catch (_) {
+      return const {};
+    }
+  }
+  return const {};
+}
+
+_ToolResultPayload? _decodeToolResultPayload(String raw) {
+  try {
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) {
+      return null;
+    }
+    final payload = Map<String, Object?>.from(decoded);
+    final callId = payload['tool_call_id'] as String?;
+    if (callId == null || callId.trim().isEmpty) {
+      return null;
+    }
+    final output = payload['output'] as String? ?? '';
+    final ok = payload['ok'] as bool? ?? true;
+    return _ToolResultPayload(
+      callId: callId.trim(),
+      output: output,
+      isError: !ok,
+    );
+  } catch (_) {
+    return null;
+  }
 }
 
 String? _extractOpenAiResponsesModel(Map<String, Object?> responseMap) {
@@ -1101,12 +1576,19 @@ _OpenAiResponsesStreamPayloadParseResult _parseOpenAiResponsesStreamPayload({
 
   if (effectiveType == 'response.completed') {
     final completedOutput = _extractOpenAiResponsesOutput(payload);
+    final toolCalls = _extractOpenAiResponsesToolCalls(payload);
     final output =
         completedOutput.isNotEmpty ? completedOutput : outputBuffer.toString();
     events.add(
       ProviderStreamEvent.done(
-        output: output.isEmpty ? '[empty-output]' : output,
+        output: output.isEmpty && toolCalls.isNotEmpty
+            ? ''
+            : output.isEmpty
+                ? '[empty-output]'
+                : output,
         model: modelUsed,
+        toolCalls: toolCalls,
+        providerStateToken: _extractOpenAiResponsesId(payload),
       ),
     );
     terminal = true;
@@ -1133,6 +1615,18 @@ String _extractOpenAiErrorMessage({
   return 'OpenAI request failed with status $fallbackStatusCode';
 }
 
+class _ToolResultPayload {
+  const _ToolResultPayload({
+    required this.callId,
+    required this.output,
+    this.isError = false,
+  });
+
+  final String callId;
+  final String output;
+  final bool isError;
+}
+
 RuntimeErrorCode _mapOpenAiHttpCode(int statusCode) {
   if (statusCode == 400) {
     return RuntimeErrorCode.invalidInput;
@@ -1147,6 +1641,15 @@ RuntimeError _mapOpenAiTransportError(
   Object error, {
   required String source,
 }) {
+  if (error is TimeoutException) {
+    return RuntimeError(
+      code: RuntimeErrorCode.providerFailure,
+      message:
+          'OpenAI-compatible request timed out. Check endpoint latency, model responsiveness, or the configured timeout.',
+      source: source,
+      retriable: true,
+    );
+  }
   if (error is SocketException) {
     return RuntimeError(
       code: RuntimeErrorCode.providerFailure,
@@ -1202,9 +1705,10 @@ String _formatOpenAiErrorOutput(
     return '[ERROR] OpenAI authentication failed. Check your API key and base URL.';
   }
   if (error.message.contains('Network error while reaching OpenAI API') ||
+      error.message.contains('request timed out') ||
       error.message
           .contains('TLS handshake failed while reaching OpenAI API')) {
-    return '[ERROR] Could not reach OpenAI API. Check your network and base URL.';
+    return '[ERROR] Could not reach OpenAI API. Check your network, timeout, and base URL.';
   }
   return '[ERROR] OpenAI request failed: ${error.message}';
 }

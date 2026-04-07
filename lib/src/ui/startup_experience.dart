@@ -8,6 +8,7 @@ import 'package:mason_logger/mason_logger.dart';
 
 import '../cli/workspace_store.dart';
 import '../core/app_config.dart';
+import '../providers/provider_strategy.dart';
 
 class TrustDecision {
   const TrustDecision({
@@ -287,18 +288,5 @@ String defaultTrustStorePath({String? cwd}) {
 }
 
 String? buildProviderHint(AppConfig config) {
-  switch (config.provider) {
-    case ProviderKind.local:
-      return 'Run /init to connect a real model provider.';
-    case ProviderKind.claude:
-      if (config.claudeApiKey?.trim().isEmpty ?? true) {
-        return 'Claude API key missing. Run /init.';
-      }
-      return null;
-    case ProviderKind.openai:
-      if (config.openAiApiKey?.trim().isEmpty ?? true) {
-        return 'OpenAI API key missing. Run /init.';
-      }
-      return null;
-  }
+  return providerStrategyFor(config.provider).buildStartupHint(config);
 }

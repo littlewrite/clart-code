@@ -1,6 +1,6 @@
-/// Server-Sent Events (SSE) parser for streaming HTTP responses.
-///
-/// Provides utilities for parsing SSE streams according to the SSE specification.
+// Server-Sent Events (SSE) parser for streaming HTTP responses.
+//
+// Provides utilities for parsing SSE streams according to the SSE specification.
 import 'dart:async';
 import 'dart:convert';
 

@@ -6,6 +6,7 @@ enum RuntimeErrorCode {
   toolNotFound,
   toolRuntimeError,
   notImplemented,
+  cancelled,
   unknown,
 }
 

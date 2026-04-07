@@ -48,6 +48,12 @@ class _RecordingTool implements Tool {
   final String name;
 
   @override
+  String get description => 'test tool $name';
+
+  @override
+  Map<String, Object?>? get inputSchema => null;
+
+  @override
   final ToolExecutionHint executionHint;
 
   final List<String> log;
@@ -206,8 +212,8 @@ void main() {
     expect(result.code, 0);
     expect(result.output,
         contains('--ui MODE            plain|rich (default rich)'));
-    expect(result.output,
-        contains('--layout MODE        scrollback|fullscreen'));
+    expect(
+        result.output, contains('--layout MODE        scrollback|fullscreen'));
   });
 
   test('auth command writes provider key and host into config file', () async {
@@ -1413,6 +1419,50 @@ void main() {
     expect(view.cursorCol, 2);
   });
 
+  test('buildRichHeaderBodyPreview uses split layout on wide terminals', () {
+    final lines = buildRichHeaderBodyPreview(
+      innerWidth: 96,
+      providerName: 'claude',
+      modelName: 'sonnet',
+      cwd: '/Users/th/Dart/clart-code',
+      providerHint: 'Provider ready. Enter to send.',
+      sessionId: 'session-123',
+      recentSessionTitle: 'recent chat',
+    );
+
+    expect(lines, isNotEmpty);
+    expect(lines.first, contains(' │ '));
+    expect(lines, anyElement(contains('session-123')));
+    expect(
+      lines.every((line) => measureTerminalDisplayWidth(line) == 96),
+      isTrue,
+    );
+  });
+
+  test(
+      'buildRichHeaderBodyPreview falls back to stacked layout on narrow terminals',
+      () {
+    final lines = buildRichHeaderBodyPreview(
+      innerWidth: 52,
+      providerName: 'claude',
+      modelName: 'sonnet',
+      cwd: '/Users/th/Dart/clart-code',
+      providerHint: 'Provider ready. Enter to send.',
+      sessionId: 'session-compact',
+      recentSessionTitle: null,
+    );
+
+    expect(lines, isNotEmpty);
+    expect(lines.first.trim(), isEmpty);
+    expect(lines.any((line) => line.contains(' │ ')), isFalse);
+    expect(lines, anyElement(contains('Tips for getting started')));
+    expect(lines, anyElement(contains('session-compact')));
+    expect(
+      lines.every((line) => measureTerminalDisplayWidth(line) == 52),
+      isTrue,
+    );
+  });
+
   test('buildRichTranscriptViewport pins to bottom by default', () {
     final view = buildRichTranscriptViewport(
       List<String>.generate(10, (index) => 'line $index'),
@@ -1478,6 +1528,32 @@ void main() {
 
     expect(pageUp.controlChar, ControlCharacter.pageUp);
     expect(pageDown.controlChar, ControlCharacter.pageDown);
+  });
+
+  test('rich input parser decodes sgr mouse wheel into line scroll', () {
+    final wheelUp = parseRichInputBytesForTest(
+      [0x1B, 0x5B, 0x3C, 0x36, 0x34, 0x3B, 0x31, 0x3B, 0x31, 0x4D],
+    );
+    final wheelDown = parseRichInputBytesForTest(
+      [0x1B, 0x5B, 0x3C, 0x36, 0x35, 0x3B, 0x31, 0x3B, 0x31, 0x4D],
+    );
+
+    expect(wheelUp.kind, RichInputTokenKind.scroll);
+    expect(wheelUp.scrollLines, -1);
+    expect(wheelDown.kind, RichInputTokenKind.scroll);
+    expect(wheelDown.scrollLines, 1);
+  });
+
+  test('rich input parser decodes x10 mouse wheel into line scroll', () {
+    final wheelUp = parseRichInputBytesForTest([0x1B, 0x5B, 0x4D, 96, 33, 33]);
+    final wheelDown = parseRichInputBytesForTest(
+      [0x1B, 0x5B, 0x4D, 97, 33, 33],
+    );
+
+    expect(wheelUp.kind, RichInputTokenKind.scroll);
+    expect(wheelUp.scrollLines, -1);
+    expect(wheelDown.kind, RichInputTokenKind.scroll);
+    expect(wheelDown.scrollLines, 1);
   });
 
   test('rich input parser decodes utf8 printable chars', () {

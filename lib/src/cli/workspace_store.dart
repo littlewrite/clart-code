@@ -295,6 +295,7 @@ class WorkspaceSessionSnapshot {
     required this.model,
     required this.history,
     required this.transcript,
+    this.tags = const [],
   });
 
   final String id;
@@ -305,6 +306,7 @@ class WorkspaceSessionSnapshot {
   final String? model;
   final List<ChatMessage> history;
   final List<TranscriptMessage> transcript;
+  final List<String> tags;
 
   Map<String, Object?> toJson() {
     return {
@@ -314,6 +316,7 @@ class WorkspaceSessionSnapshot {
       'updatedAt': updatedAt,
       'provider': provider,
       'model': model,
+      'tags': tags,
       'history': history
           .map((message) => {
                 'role': message.role.name,
@@ -337,6 +340,11 @@ class WorkspaceSessionSnapshot {
       updatedAt: json['updatedAt'] as String? ?? '',
       provider: json['provider'] as String? ?? 'local',
       model: json['model'] as String?,
+      tags: (json['tags'] as List? ?? const [])
+          .whereType<String>()
+          .map((tag) => tag.trim())
+          .where((tag) => tag.isNotEmpty)
+          .toList(),
       history: (json['history'] as List? ?? const [])
           .whereType<Map>()
           .map((item) => _chatMessageFromJson(
@@ -361,6 +369,7 @@ class WorkspaceSessionSnapshot {
     String? model,
     List<ChatMessage>? history,
     List<TranscriptMessage>? transcript,
+    List<String>? tags,
   }) {
     return WorkspaceSessionSnapshot(
       id: id ?? this.id,
@@ -371,6 +380,7 @@ class WorkspaceSessionSnapshot {
       model: model ?? this.model,
       history: history ?? this.history,
       transcript: transcript ?? this.transcript,
+      tags: tags ?? this.tags,
     );
   }
 }
@@ -392,17 +402,20 @@ WorkspaceSessionSnapshot buildWorkspaceSessionSnapshot({
   required List<TranscriptMessage> transcript,
   String? createdAt,
   String? updatedAt,
+  String? title,
+  List<String> tags = const [],
 }) {
   final now = DateTime.now().toUtc().toIso8601String();
   return WorkspaceSessionSnapshot(
     id: id,
-    title: _buildWorkspaceSessionTitle(transcript, history),
+    title: title ?? _buildWorkspaceSessionTitle(transcript, history),
     createdAt: createdAt ?? now,
     updatedAt: updatedAt ?? now,
     provider: provider,
     model: model,
     history: List<ChatMessage>.from(history),
     transcript: List<TranscriptMessage>.from(transcript),
+    tags: List<String>.unmodifiable(tags),
   );
 }
 
@@ -494,6 +507,9 @@ String renderWorkspaceSessionMarkdown(WorkspaceSessionSnapshot snapshot) {
   buffer.writeln('- id: ${snapshot.id}');
   buffer.writeln('- provider: ${snapshot.provider}');
   buffer.writeln('- model: ${snapshot.model ?? 'default'}');
+  if (snapshot.tags.isNotEmpty) {
+    buffer.writeln('- tags: ${snapshot.tags.join(', ')}');
+  }
   buffer.writeln('- createdAt: ${snapshot.createdAt}');
   buffer.writeln('- updatedAt: ${snapshot.updatedAt}');
   buffer.writeln();

@@ -7,6 +7,21 @@ class ReadTool implements Tool {
   String get name => 'read';
 
   @override
+  String get description => 'Read a UTF-8 text file from the local filesystem.';
+
+  @override
+  Map<String, Object?> get inputSchema => const {
+        'type': 'object',
+        'properties': {
+          'path': {
+            'type': 'string',
+            'description': 'Absolute or relative file path to read.',
+          },
+        },
+        'required': ['path'],
+      };
+
+  @override
   ToolExecutionHint get executionHint => ToolExecutionHint.parallelSafe;
 
   @override
@@ -45,6 +60,25 @@ class ReadTool implements Tool {
 class WriteTool implements Tool {
   @override
   String get name => 'write';
+
+  @override
+  String get description => 'Write UTF-8 text content to a local file path.';
+
+  @override
+  Map<String, Object?> get inputSchema => const {
+        'type': 'object',
+        'properties': {
+          'path': {
+            'type': 'string',
+            'description': 'Absolute or relative file path to write.',
+          },
+          'content': {
+            'type': 'string',
+            'description': 'UTF-8 text content to write to the file.',
+          },
+        },
+        'required': ['path', 'content'],
+      };
 
   @override
   ToolExecutionHint get executionHint => ToolExecutionHint.serialOnly;
@@ -86,6 +120,22 @@ class WriteTool implements Tool {
 class ShellStubTool implements Tool {
   @override
   String get name => 'shell';
+
+  @override
+  String get description =>
+      'Run a shell command. This SDK phase currently returns a stubbed result.';
+
+  @override
+  Map<String, Object?> get inputSchema => const {
+        'type': 'object',
+        'properties': {
+          'command': {
+            'type': 'string',
+            'description': 'Shell command text to execute.',
+          },
+        },
+        'required': ['command'],
+      };
 
   @override
   ToolExecutionHint get executionHint => ToolExecutionHint.serialOnly;

@@ -16,6 +16,7 @@ import '../core/query_loop.dart';
 import '../core/transcript.dart';
 import '../core/turn_executor.dart';
 import '../providers/llm_provider.dart';
+import '../providers/provider_strategy.dart';
 import '../runtime/app_runtime.dart';
 import '../services/security_guard.dart';
 import '../services/telemetry.dart';
@@ -64,6 +65,7 @@ enum _ReplUiMode { plain, rich }
 enum _RichReplLayoutMode {
   /// Normal stdout scrollback — welcome banner scrolls away as output grows.
   scrollback,
+
   /// Alternate screen + full redraw (fixed viewport, PgUp/PgDn scroll transcript).
   fullscreen,
 }
@@ -85,6 +87,7 @@ _RichReplLayoutMode? _parseRichReplLayoutMode(String raw) {
 /// Tracks the last painted prompt block height for ANSI "cursor up + clear down" redraws.
 class _RichScrollbackPromptPaint {
   int promptBlockLines = 0;
+  int promptStartRow = 0;
 }
 
 Future<int> runCli(List<String> args) async {
@@ -996,17 +999,27 @@ void _emitScrollbackRichMessages(Console console, List<_RichMessage> messages) {
   if (messages.isEmpty) {
     return;
   }
-  final inner = max(8, min(console.windowWidth, 140) - 4);
+  final inner = max(8, _richViewportWidth(console) - 4);
   for (final line in _buildRichTranscriptLines(messages, inner)) {
     stdout.writeln(line);
   }
 }
 
-void _clearScrollbackPromptBlockOnly(_RichScrollbackPromptPaint paint) {
+void _clearScrollbackPromptBlockOnly(
+  Console console,
+  _RichScrollbackPromptPaint paint, {
+  int? width,
+}) {
   if (paint.promptBlockLines > 0) {
-    stdout.write('\x1b[${paint.promptBlockLines}A\r\x1b[0J');
+    final rowWidth = width ?? _richViewportWidth(console);
+    final blank = ' ' * rowWidth;
+    for (var i = 0; i < paint.promptBlockLines; i++) {
+      _writeRow(console, paint.promptStartRow + i, blank);
+    }
+    console.cursorPosition = Coordinate(paint.promptStartRow, 0);
   }
   paint.promptBlockLines = 0;
+  paint.promptStartRow = 0;
 }
 
 void _repaintScrollbackPromptBlock({
@@ -1017,7 +1030,7 @@ void _repaintScrollbackPromptBlock({
   required String inputBuffer,
   required int inputCursor,
 }) {
-  final width = min(console.windowWidth, 140);
+  final width = _richViewportWidth(console);
   final inner = width - 2;
   final composerInnerWidth = max(8, inner - 4);
   final composerView = buildRichComposerView(
@@ -1026,36 +1039,71 @@ void _repaintScrollbackPromptBlock({
     composerInnerWidth,
     maxLines: 6,
   );
-  final lines = <String>[
-    _fitRow('status: $status', width),
-    '─' * width,
-  ];
+  final lines = <String>['─' * width];
   for (var i = 0; i < composerView.visibleLines.length; i++) {
-    final prefix = i == composerView.cursorRow ? ' > ' : '   ';
+    final prefix = i == 0 ? '❯ ' : '  ';
     lines.add(_fitRow('$prefix${composerView.visibleLines[i]}', width));
   }
+  lines.add('─' * width);
+  lines.add(
+    _buildScrollbackPromptFooterLine(
+      session,
+      status: status,
+      width: width,
+    ),
+  );
+  final promptStartRow = max(0, console.windowHeight - lines.length);
 
-  if (paint.promptBlockLines > 0) {
-    stdout.write('\x1b[${paint.promptBlockLines}A\r\x1b[0J');
-  } else {
-    stdout.writeln('');
-  }
-  for (final line in lines) {
-    stdout.writeln(line);
+  _clearScrollbackPromptBlockOnly(
+    console,
+    paint,
+    width: width,
+  );
+  for (var i = 0; i < lines.length; i++) {
+    _writeRow(console, promptStartRow + i, lines[i]);
   }
   paint.promptBlockLines = lines.length;
+  paint.promptStartRow = promptStartRow;
 
-  const composerStartLine = 2;
-  final targetLineIndex = composerStartLine + composerView.cursorRow;
-  final moveUp = lines.length - targetLineIndex;
-  if (moveUp > 0) {
-    stdout.write('\x1b[${moveUp}A');
-  }
-  final col1Based = min(
-    width,
-    max(1, 1 + 3 + composerView.cursorCol),
+  final cursorRow = promptStartRow + 1 + composerView.cursorRow;
+  final cursorCol = min(
+    width - 1,
+    max(0, 2 + composerView.cursorCol),
   );
-  stdout.write('\x1b[${col1Based}G');
+  console.cursorPosition = Coordinate(cursorRow, cursorCol);
+}
+
+String _buildScrollbackPromptFooterLine(
+  _ReplSessionState session, {
+  required String status,
+  required int width,
+}) {
+  final left = _scrollbackFooterStatusLabel(status);
+  final right = '${session.model ?? 'default'} · /model';
+  final leftWidth = _displayWidth(left);
+  final rightWidth = _displayWidth(right);
+  if (leftWidth + rightWidth + 2 <= width) {
+    return '$left${' ' * (width - leftWidth - rightWidth)}$right';
+  }
+
+  final reserved = min(rightWidth, max(0, width ~/ 3));
+  final leftRoom = max(0, width - reserved - 1);
+  final leftPart = _fitRow(left, leftRoom);
+  final rightPart = _fitRow(right, width - leftRoom);
+  return '$leftPart$rightPart';
+}
+
+String _scrollbackFooterStatusLabel(String status) {
+  final normalized = status.trim();
+  if (normalized.isEmpty ||
+      normalized == 'Ready.' ||
+      normalized == 'Ready. Type /help for commands.') {
+    return '? for shortcuts';
+  }
+  if (normalized.startsWith('Streaming response')) {
+    return 'esc to interrupt';
+  }
+  return normalized;
 }
 
 void _emitScrollbackWelcomeBanner(
@@ -1063,7 +1111,7 @@ void _emitScrollbackWelcomeBanner(
   _ReplSessionState session, {
   required bool printIntro,
 }) {
-  final width = min(console.windowWidth, 140);
+  final width = _richViewportWidth(console);
   final inner = width - 2;
   final headerBody = _buildRichHeaderBody(session, inner);
   stdout.writeln('');
@@ -1077,7 +1125,8 @@ void _emitScrollbackWelcomeBanner(
     stdout.writeln('');
     stdout.writeln(
       'Output below uses the terminal scroll buffer (like Claude Code outside '
-      'fullscreen). Use --layout fullscreen for a fixed header + viewport.',
+      'fullscreen). Use --layout fullscreen for a fixed input area + '
+      'scrollable transcript viewport.',
     );
   }
   stdout.writeln('');
@@ -1288,7 +1337,7 @@ RichTranscriptViewport buildRichTranscriptViewport(
   );
 }
 
-enum _RichTranscriptScrollAction { pageUp, pageDown }
+enum _RichTranscriptScrollAction { lineUp, lineDown, pageUp, pageDown }
 
 class _RichTranscriptScrollState {
   int? _topLine;
@@ -1318,6 +1367,27 @@ class _RichTranscriptScrollState {
     final view = viewFor(lines, viewportRows);
     final pageSize = max(1, viewportRows - 1);
     switch (action) {
+      case _RichTranscriptScrollAction.lineUp:
+        if (!view.canScrollUp && view.maxTopLine == 0) {
+          return false;
+        }
+        _topLine = max(0, view.topLine - 1);
+        return _topLine != view.topLine;
+      case _RichTranscriptScrollAction.lineDown:
+        if (!view.canScrollDown) {
+          if (isPinnedToBottom) {
+            return false;
+          }
+          _topLine = null;
+          return true;
+        }
+        final nextTopLine = min(view.maxTopLine, view.topLine + 1);
+        if (nextTopLine >= view.maxTopLine) {
+          _topLine = null;
+          return true;
+        }
+        _topLine = nextTopLine;
+        return _topLine != view.topLine;
       case _RichTranscriptScrollAction.pageUp:
         if (!view.canScrollUp && view.maxTopLine == 0) {
           return false;
@@ -1563,13 +1633,14 @@ class RichInputUtf8Decoder {
   }
 }
 
-enum RichInputTokenKind { eof, text, control, paste }
+enum RichInputTokenKind { eof, text, control, paste, scroll }
 
 class RichInputToken {
   const RichInputToken._({
     required this.kind,
     this.text,
     this.controlChar,
+    this.scrollLines,
   });
 
   const RichInputToken.text(String value)
@@ -1581,11 +1652,15 @@ class RichInputToken {
   const RichInputToken.control(ControlCharacter value)
       : this._(kind: RichInputTokenKind.control, controlChar: value);
 
+  const RichInputToken.scroll(int lines)
+      : this._(kind: RichInputTokenKind.scroll, scrollLines: lines);
+
   const RichInputToken.eof() : this._(kind: RichInputTokenKind.eof);
 
   final RichInputTokenKind kind;
   final String? text;
   final ControlCharacter? controlChar;
+  final int? scrollLines;
 }
 
 RichInputToken parseRichInputBytesForTest(List<int> bytes) {
@@ -1615,8 +1690,7 @@ Future<int> _runRichInteractiveRepl(
     );
   }
   final useFullscreen = layoutMode == _RichReplLayoutMode.fullscreen;
-  final scrollbackPaint =
-      useFullscreen ? null : _RichScrollbackPromptPaint();
+  final scrollbackPaint = useFullscreen ? null : _RichScrollbackPromptPaint();
   final transcript = <_RichMessage>[];
   final transcriptScroll = _RichTranscriptScrollState();
   final inputHistory = <String>[];
@@ -1740,7 +1814,7 @@ Future<int> _runRichInteractiveRepl(
           transcript.clear();
           transcriptScroll.pinToBottom();
           if (!useFullscreen) {
-            final w = min(console.windowWidth, 140);
+            final w = _richViewportWidth(console);
             stdout.writeln('');
             stdout.writeln('─' * w);
             stdout.writeln('(conversation view cleared)');
@@ -1925,25 +1999,11 @@ bool shouldFallbackToPlainReplOnImmediateEof({
 }
 
 String _providerApiKey(AppConfig config, ProviderKind provider) {
-  switch (provider) {
-    case ProviderKind.local:
-      return '';
-    case ProviderKind.claude:
-      return config.claudeApiKey?.trim() ?? '';
-    case ProviderKind.openai:
-      return config.openAiApiKey?.trim() ?? '';
-  }
+  return providerStrategyFor(provider).apiKey(config);
 }
 
 String? _providerBaseUrl(AppConfig config, ProviderKind provider) {
-  switch (provider) {
-    case ProviderKind.local:
-      return null;
-    case ProviderKind.claude:
-      return config.claudeBaseUrl?.trim();
-    case ProviderKind.openai:
-      return config.openAiBaseUrl?.trim();
-  }
+  return providerStrategyFor(provider).configuredBaseUrl(config);
 }
 
 _RichInputEvent _promptRichInput(
@@ -1999,7 +2059,7 @@ _RichInputEvent _promptRichInput(
     },
     onTranscriptScroll: useFs
         ? (action) {
-            final width = min(console.windowWidth, 140);
+            final width = _richViewportWidth(console);
             final inner = width - 2;
             final transcriptRows = _computeRichTranscriptRows(
               console,
@@ -2023,7 +2083,7 @@ _RichInputEvent _promptRichInput(
 
   if (!useFs && scrollbackPaint != null) {
     if (event.type == _RichInputEventType.submit) {
-      _clearScrollbackPromptBlockOnly(scrollbackPaint);
+      _clearScrollbackPromptBlockOnly(console, scrollbackPaint);
     }
   }
   return event;
@@ -2240,10 +2300,9 @@ void _renderRichRepl(
   required String inputBuffer,
   required int inputCursor,
 }) {
-  final width = min(console.windowWidth, 140);
+  final width = _richViewportWidth(console);
   final inner = width - 2;
   final height = console.windowHeight;
-  final headerBody = _buildRichHeaderBody(session, inner);
   final composerInnerWidth = max(8, inner - 4);
   final composerView = buildRichComposerView(
     inputBuffer,
@@ -2252,29 +2311,17 @@ void _renderRichRepl(
     maxLines: 6,
   );
 
-  final headerRows = headerBody.length + 3;
   final footerRows = 4 + composerView.visibleLines.length;
-  final transcriptStart = headerRows;
-  final transcriptRows = max(3, height - headerRows - footerRows);
+  final transcriptStart = 0;
+  final transcriptRows = max(3, height - footerRows);
 
-  final lines = _buildRichTranscriptLines(transcript, inner);
+  final lines = _buildFullscreenTranscriptLines(session, transcript, inner);
   final transcriptView = transcriptScroll.viewFor(lines, transcriptRows);
   final statusText = _buildRichStatusLine(status, transcriptView);
 
   console.hideCursor();
   console.clearScreen();
   console.cursorPosition = const Coordinate(0, 0);
-
-  _writeRow(
-    console,
-    0,
-    '╭${_fillTitle('─── Clart Code v0.3.0 ', inner)}╮',
-  );
-  for (var i = 0; i < headerBody.length; i++) {
-    _writeRow(console, i + 1, '│${headerBody[i]}│');
-  }
-  _writeRow(console, headerBody.length + 1, '╰${'─' * inner}╯');
-  _writeRow(console, headerBody.length + 2, '─' * width);
 
   for (var i = 0; i < transcriptRows; i++) {
     final line = i < transcriptView.visibleLines.length
@@ -2293,7 +2340,7 @@ void _renderRichRepl(
   _writeRow(
     console,
     statusRow + 2,
-    '╭${_fillTitle('── Message (Enter=send, Ctrl+J=newline, PgUp/PgDn=scroll, Up/Down=cursor/history, Ctrl+P/N=history) ', inner)}╮',
+    '╭${_fillTitle('── Message (Enter=send, Ctrl+J=newline, Wheel/PgUp/PgDn=scroll, Up/Down=cursor/history, Ctrl+P/N=history) ', inner)}╮',
   );
   for (var i = 0; i < composerView.visibleLines.length; i++) {
     final prefix = i == composerView.cursorRow ? ' > ' : '   ';
@@ -2319,9 +2366,8 @@ int _computeRichTranscriptRows(
   required String inputBuffer,
   required int inputCursor,
 }) {
-  final width = min(console.windowWidth, 140);
+  final width = _richViewportWidth(console);
   final inner = width - 2;
-  final headerBody = _buildRichHeaderBody(session, inner);
   final composerInnerWidth = max(8, inner - 4);
   final composerView = buildRichComposerView(
     inputBuffer,
@@ -2329,9 +2375,8 @@ int _computeRichTranscriptRows(
     composerInnerWidth,
     maxLines: 6,
   );
-  final headerRows = headerBody.length + 3;
   final footerRows = 4 + composerView.visibleLines.length;
-  return max(3, console.windowHeight - headerRows - footerRows);
+  return max(3, console.windowHeight - footerRows);
 }
 
 String _buildRichStatusLine(
@@ -2342,21 +2387,122 @@ String _buildRichStatusLine(
     return status;
   }
   if (view.isAtBottom) {
-    return '$status · PgUp/PgDn scroll';
+    return '$status · Wheel/PgUp/PgDn scroll';
   }
-  return '$status · above=${view.hiddenLinesAbove} below=${view.hiddenLinesBelow} · PgDn follows live';
+  return '$status · above=${view.hiddenLinesAbove} below=${view.hiddenLinesBelow} · Wheel/PgDn follows live';
 }
 
+List<String> _buildFullscreenTranscriptLines(
+  _ReplSessionState session,
+  List<_RichMessage> transcript,
+  int width,
+) {
+  final lines = <String>[
+    ..._buildRichWelcomePanelLines(session, width),
+  ];
+  if (transcript.isNotEmpty) {
+    lines.add('');
+    lines.addAll(_buildRichTranscriptLines(transcript, width));
+  }
+  return lines;
+}
+
+List<String> _buildRichWelcomePanelLines(
+  _ReplSessionState session,
+  int width,
+) {
+  final inner = max(8, width - 2);
+  final body = _buildRichHeaderBody(session, inner);
+  return [
+    '╭${_fillTitle('─── Clart Code v0.3.0 ', inner)}╮',
+    ...body.map((row) => '│${_fitRow(row, inner)}│'),
+    '╰${'─' * inner}╯',
+  ];
+}
+
+int _richViewportWidth(Console console) => max(20, console.windowWidth);
+
 List<String> _buildRichHeaderBody(_ReplSessionState session, int innerWidth) {
-  final columnGap = 3;
-  final leftWidth = max(32, min(52, (innerWidth - columnGap) ~/ 2));
-  final rightWidth = innerWidth - leftWidth - columnGap;
   final providerHint = buildProviderSetupHint(session.config);
   final savedSessions = listWorkspaceSessions();
   final recentSession = readWorkspaceSession(session.sessionId) ??
       (savedSessions.isEmpty ? null : savedSessions.first);
+  return buildRichHeaderBodyPreview(
+    innerWidth: innerWidth,
+    providerName: session.provider.name,
+    modelName: session.model ?? 'default',
+    cwd: Directory.current.path,
+    providerHint: providerHint,
+    sessionId: session.sessionId,
+    recentSessionTitle: recentSession?.title,
+  );
+}
 
+List<String> buildRichHeaderBodyPreview({
+  required int innerWidth,
+  required String providerName,
+  required String modelName,
+  required String cwd,
+  String? providerHint,
+  required String sessionId,
+  String? recentSessionTitle,
+}) {
+  final columnGap = 3;
+  final minRightWidth = 28;
+  final compactThreshold = 72;
+  final safeInnerWidth = max(24, innerWidth);
+  final providerLine = ' $providerName · $modelName';
+  final cwdLine = ' ${_truncateDisplayPath(cwd, max(12, safeInnerWidth - 2))}';
+  final infoLines = [
+    'Tips for getting started',
+    providerHint ?? 'Provider ready. Enter to send.',
+    '',
+    'Session',
+    'id=$sessionId',
+    recentSessionTitle == null
+        ? 'No saved activity yet'
+        : 'last=$recentSessionTitle',
+    '',
+    '/help for commands',
+    'Ctrl+J newline · Ctrl+C interrupt',
+  ];
   final leftColumn = [
+    '',
+    _centerHeaderLine('Welcome back!', safeInnerWidth),
+    '',
+    _centerHeaderLine('▐▛███▜▌', safeInnerWidth),
+    _centerHeaderLine('▝▜█████▛▘', safeInnerWidth),
+    _centerHeaderLine('▘▘ ▝▝', safeInnerWidth),
+    '',
+    _fitRow(providerLine, safeInnerWidth),
+    _fitRow(cwdLine, safeInnerWidth),
+  ];
+
+  if (safeInnerWidth < compactThreshold) {
+    return [
+      ...leftColumn.map((line) => _fitRow(line, safeInnerWidth)),
+      _fitRow('', safeInnerWidth),
+      ...infoLines.map((line) => _fitRow(line, safeInnerWidth)),
+    ];
+  }
+
+  final leftTargetWidth = max(
+    24,
+    min(
+      52,
+      max(
+        _displayWidth(' Welcome back!') + 4,
+        max(_displayWidth(providerLine), _displayWidth(cwdLine)) + 2,
+      ),
+    ),
+  );
+  final leftWidth = min(
+    leftTargetWidth,
+    max(24, safeInnerWidth - columnGap - minRightWidth),
+  );
+  final rightWidth = max(20, safeInnerWidth - leftWidth - columnGap);
+
+  final sizedLeftColumn = [
     '',
     _centerHeaderLine('Welcome back!', leftWidth),
     '',
@@ -2364,27 +2510,17 @@ List<String> _buildRichHeaderBody(_ReplSessionState session, int innerWidth) {
     _centerHeaderLine('▝▜█████▛▘', leftWidth),
     _centerHeaderLine('▘▘ ▝▝', leftWidth),
     '',
-    ' ${session.provider.name} · ${session.model ?? 'default'}',
-    ' ${_truncateDisplayPath(Directory.current.path, max(12, leftWidth - 2))}',
+    _fitRow(providerLine, leftWidth),
+    _fitRow(
+      ' ${_truncateDisplayPath(cwd, max(12, leftWidth - 2))}',
+      leftWidth,
+    ),
   ];
-  final rightColumn = [
-    'Tips for getting started',
-    providerHint ?? 'Provider ready. Enter to send.',
-    '',
-    'Session',
-    'id=${session.sessionId}',
-    recentSession == null
-        ? 'No saved activity yet'
-        : 'last=${recentSession.title}',
-    '',
-    '/help for commands',
-    'Ctrl+J newline · Ctrl+C interrupt',
-  ];
-  final rows = max(leftColumn.length, rightColumn.length);
+  final rows = max(sizedLeftColumn.length, infoLines.length);
   final lines = <String>[];
   for (var i = 0; i < rows; i++) {
-    final left = i < leftColumn.length ? leftColumn[i] : '';
-    final right = i < rightColumn.length ? rightColumn[i] : '';
+    final left = i < sizedLeftColumn.length ? sizedLeftColumn[i] : '';
+    final right = i < infoLines.length ? infoLines[i] : '';
     lines.add(
       '${_fitRow(left, leftWidth)} │ ${_fitRow(right, rightWidth)}',
     );
@@ -2494,6 +2630,18 @@ _RichInputEvent _readRichInput(
           }
           if (draft.insert(text)) {
             onEditChange();
+          }
+          continue;
+        case RichInputTokenKind.scroll:
+          final scrollLines = token.scrollLines ?? 0;
+          if (scrollLines < 0) {
+            for (var i = 0; i < -scrollLines; i++) {
+              onTranscriptScroll?.call(_RichTranscriptScrollAction.lineUp);
+            }
+          } else if (scrollLines > 0) {
+            for (var i = 0; i < scrollLines; i++) {
+              onTranscriptScroll?.call(_RichTranscriptScrollAction.lineDown);
+            }
           }
           continue;
         case RichInputTokenKind.control:
@@ -2703,6 +2851,16 @@ RichInputToken _readRichCsiSequence(int Function() readByte) {
       break;
     }
     bytes.add(value);
+    if (bytes.length == 1 && value == 'M'.codeUnitAt(0)) {
+      for (var i = 0; i < 3; i++) {
+        final extra = readByte();
+        if (extra == -1) {
+          break;
+        }
+        bytes.add(extra);
+      }
+      break;
+    }
     if ((value >= 0x40 && value <= 0x7E) || bytes.length >= 16) {
       break;
     }
@@ -2743,10 +2901,10 @@ RichInputToken _readRichCsiSequence(int Function() readByte) {
       if (button != null) {
         // Check if it's a wheel event (0x40 = wheel up, 0x41 = wheel down)
         if ((button & 0x43) == 0x40) {
-          return const RichInputToken.control(ControlCharacter.pageUp);
+          return const RichInputToken.scroll(-1);
         }
         if ((button & 0x43) == 0x41) {
-          return const RichInputToken.control(ControlCharacter.pageDown);
+          return const RichInputToken.scroll(1);
         }
       }
     }
@@ -2758,10 +2916,10 @@ RichInputToken _readRichCsiSequence(int Function() readByte) {
       final button = bytes[1] - 32; // X10 encoding adds 32
       // Check if it's a wheel event
       if ((button & 0x43) == 0x40) {
-        return const RichInputToken.control(ControlCharacter.pageUp);
+        return const RichInputToken.scroll(-1);
       }
       if ((button & 0x43) == 0x41) {
-        return const RichInputToken.control(ControlCharacter.pageDown);
+        return const RichInputToken.scroll(1);
       }
     }
   }
@@ -3043,6 +3201,8 @@ String _takeDisplayWidth(String value, int width) {
   }
   return output.toString();
 }
+
+int measureTerminalDisplayWidth(String value) => _displayWidth(value);
 
 int _displayWidth(String value) {
   var width = 0;
@@ -3911,22 +4071,7 @@ ToolInvocation? _buildToolInvocation(String toolName, List<String> args) {
 }
 
 LlmProvider _resolveProvider(AppConfig config) {
-  switch (config.provider) {
-    case ProviderKind.local:
-      return LocalEchoProvider();
-    case ProviderKind.claude:
-      return ClaudeApiProvider(
-        apiKey: config.claudeApiKey ?? '',
-        baseUrl: config.claudeBaseUrl,
-        model: config.model,
-      );
-    case ProviderKind.openai:
-      return OpenAiApiProvider(
-        apiKey: config.openAiApiKey ?? '',
-        baseUrl: config.openAiBaseUrl,
-        model: config.model,
-      );
-  }
+  return providerStrategyFor(config.provider).build(config);
 }
 
 ParsedCli _parseCli(List<String> args) {

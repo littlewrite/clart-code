@@ -13,6 +13,7 @@ export 'src/core/query_events.dart';
 export 'src/core/runtime_error.dart';
 export 'src/core/transcript.dart';
 export 'src/providers/llm_provider.dart';
+export 'src/providers/provider_strategy.dart';
 export 'src/runtime/app_runtime.dart';
 export 'src/core/query_loop.dart';
 export 'src/tools/tool_executor.dart';

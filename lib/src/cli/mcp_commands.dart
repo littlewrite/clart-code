@@ -1,5 +1,5 @@
-/// MCP 集成到 CLI 命令
-/// 提供 MCP 服务器管理命令
+// MCP 集成到 CLI 命令
+// 提供 MCP 服务器管理命令
 import 'dart:io';
 
 import '../mcp/mcp_manager.dart';

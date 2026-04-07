@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import '../core/app_config.dart';
+import '../providers/provider_strategy.dart';
 
 Map<String, Object?> readConfigJsonFile(String path) {
   final file = File(path);
@@ -41,32 +42,7 @@ void printProviderConfigSummary(AppConfig config) {
 }
 
 List<String> providerConfigSummaryLines(AppConfig config) {
-  switch (config.provider) {
-    case ProviderKind.local:
-      return const ['auth=not required (local provider)'];
-    case ProviderKind.claude:
-      return [
-        'claude.baseUrl=${config.claudeBaseUrl ?? 'https://api.anthropic.com'}',
-        'claude.apiKey=${maskSecret(config.claudeApiKey)}',
-      ];
-    case ProviderKind.openai:
-      return [
-        'openai.baseUrl=${config.openAiBaseUrl ?? 'https://api.openai.com/v1'}',
-        'openai.apiKey=${maskSecret(config.openAiApiKey)}',
-      ];
-  }
-}
-
-String maskSecret(String? value) {
-  final raw = value?.trim() ?? '';
-  if (raw.isEmpty) {
-    return '<missing>';
-  }
-  if (raw.length <= 6) {
-    return '*' * raw.length;
-  }
-  final visibleSuffix = raw.substring(raw.length - 4);
-  return '${'*' * (raw.length - 4)}$visibleSuffix';
+  return providerStrategyFor(config.provider).buildConfigSummaryLines(config);
 }
 
 class InlineInitCommandParseResult {
@@ -135,7 +111,8 @@ AppConfig saveProviderSetup({
   String? model,
   String? configPath,
 }) {
-  if (provider == ProviderKind.local) {
+  final strategy = providerStrategyFor(provider);
+  if (!strategy.isRemote) {
     throw ArgumentError.value(provider, 'provider', 'provider must be remote');
   }
   final trimmedKey = apiKey.trim();
@@ -152,17 +129,7 @@ AppConfig saveProviderSetup({
   if (model != null && model.trim().isNotEmpty) {
     next['model'] = model.trim();
   }
-  if (provider == ProviderKind.claude) {
-    next['claudeApiKey'] = trimmedKey;
-    if (baseUrl != null && baseUrl.trim().isNotEmpty) {
-      next['claudeBaseUrl'] = baseUrl.trim();
-    }
-  } else {
-    next['openAiApiKey'] = trimmedKey;
-    if (baseUrl != null && baseUrl.trim().isNotEmpty) {
-      next['openAiBaseUrl'] = baseUrl.trim();
-    }
-  }
+  strategy.writeSetupJson(next, apiKey: trimmedKey, baseUrl: baseUrl);
 
   final file = File(resolvedPath);
   file.parent.createSync(recursive: true);
@@ -206,31 +173,9 @@ ProviderSetupApplyResult applyProviderSetup({
 }
 
 String? buildProviderSetupHint(AppConfig config) {
-  switch (config.provider) {
-    case ProviderKind.local:
-      return 'Not configured for real LLM. Run /init or clart_code init.';
-    case ProviderKind.claude:
-      if (config.claudeApiKey?.trim().isEmpty ?? true) {
-        return 'Claude is not configured (missing API key). Run /init or clart_code init.';
-      }
-      return null;
-    case ProviderKind.openai:
-      if (config.openAiApiKey?.trim().isEmpty ?? true) {
-        return 'OpenAI is not configured (missing API key). Run /init or clart_code init.';
-      }
-      return null;
-  }
+  return providerStrategyFor(config.provider).buildSetupHint(config);
 }
 
 ProviderKind? parseProviderKind(String? value) {
-  switch (value?.trim()) {
-    case 'local':
-      return ProviderKind.local;
-    case 'claude':
-      return ProviderKind.claude;
-    case 'openai':
-      return ProviderKind.openai;
-    default:
-      return null;
-  }
+  return parseProviderKindValue(value);
 }

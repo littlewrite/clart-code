@@ -1,6 +1,6 @@
-/// HTTP retry logic with exponential backoff.
-///
-/// Provides intelligent retry mechanisms for transient HTTP failures.
+// HTTP retry logic with exponential backoff.
+//
+// Provides intelligent retry mechanisms for transient HTTP failures.
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';

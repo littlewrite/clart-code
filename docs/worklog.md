@@ -1,5 +1,28 @@
 # 迁移工作日志
 
+## 2026-04-07 / SDK Phase 1（独立 SDK 入口）
+
+- 新增独立 SDK 入口：`lib/clart_code_sdk.dart`
+- 新增 `ClartCodeAgent` 与最小 public API：
+  - `query`
+  - `prompt`
+  - `clear`
+  - `setModel`
+  - `close`
+- 新增 SDK session 封装：`ClartCodeSessionStore`
+- SDK 复用现有 workspace session 格式：`./.clart/sessions/<id>.json`
+- 新增 SDK 测试：
+  - `test/sdk/clart_code_agent_test.dart`
+- 新增 SDK 文档：
+  - `docs/clart-code-sdk-architecture.md`
+  - `docs/clart-code-sdk-feature-matrix.md`
+  - `docs/clart-code-sdk-roadmap.md`
+  - `docs/clart-code-sdk-worklog.md`
+- 策略确认：
+  - SDK 优先于 TUI
+  - 现阶段不继续投入复杂 TUI 调整
+  - 下一步进入 SDK Phase 2，重点实现 tool loop
+
 ## 2026-04-03 / Iteration 1
 
 - 建立可运行迁移骨架（help/version/chat/print）。

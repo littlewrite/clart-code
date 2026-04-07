@@ -59,6 +59,8 @@ class ToolExecutionResult {
 
 abstract class Tool {
   String get name;
+  String get description => '';
+  Map<String, Object?>? get inputSchema => null;
   ToolExecutionHint get executionHint;
 
   Future<ToolExecutionResult> run(ToolInvocation invocation);
