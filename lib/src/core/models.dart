@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'runtime_error.dart';
 
 enum MessageRole { system, user, assistant, tool }
@@ -36,6 +38,54 @@ class QueryToolCall {
   final Map<String, Object?> input;
 }
 
+class QueryCancellationSignal {
+  QueryCancellationSignal._(this._controller);
+
+  final StreamController<void> _controller;
+
+  bool _isCancelled = false;
+  String? _reason;
+
+  bool get isCancelled => _isCancelled;
+
+  String? get reason => _reason;
+
+  Stream<void> get onCancel => _controller.stream;
+}
+
+class QueryCancellationController {
+  QueryCancellationController._(this._controller)
+      : signal = QueryCancellationSignal._(_controller);
+
+  factory QueryCancellationController() {
+    return QueryCancellationController._(
+      StreamController<void>.broadcast(sync: true),
+    );
+  }
+
+  final QueryCancellationSignal signal;
+  final StreamController<void> _controller;
+
+  bool get isCancelled => signal.isCancelled;
+
+  void cancel([String reason = 'request cancelled']) {
+    if (signal._isCancelled) {
+      return;
+    }
+    signal._isCancelled = true;
+    signal._reason = reason;
+    _controller.add(null);
+    unawaited(_controller.close());
+  }
+
+  void close() {
+    if (_controller.isClosed) {
+      return;
+    }
+    unawaited(_controller.close());
+  }
+}
+
 class QueryRequest {
   const QueryRequest({
     required this.messages,
@@ -43,6 +93,7 @@ class QueryRequest {
     this.model,
     this.toolDefinitions = const [],
     this.providerStateToken,
+    this.cancellationSignal,
   });
 
   final List<ChatMessage> messages;
@@ -50,6 +101,7 @@ class QueryRequest {
   final String? model;
   final List<QueryToolDefinition> toolDefinitions;
   final String? providerStateToken;
+  final QueryCancellationSignal? cancellationSignal;
 }
 
 class QueryResponse {

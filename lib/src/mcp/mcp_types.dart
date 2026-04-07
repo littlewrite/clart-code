@@ -1,15 +1,45 @@
-/// MCP (Model Context Protocol) 类型定义
-/// 基于 JSON-RPC 2.0 协议
+// MCP (Model Context Protocol) 类型定义
+// 基于 JSON-RPC 2.0 协议
 
 enum McpTransportType { stdio, sse, http, ws }
 
 enum McpServerStatus { pending, connected, failed, needsAuth, disabled }
+
+const Set<McpTransportType> mcpRegistryTransportTypes = {
+  McpTransportType.stdio,
+  McpTransportType.sse,
+  McpTransportType.http,
+  McpTransportType.ws,
+};
+
+const Set<McpTransportType> mcpRuntimeSupportedTransportTypes = {
+  McpTransportType.stdio,
+};
+
+extension McpTransportTypeCapabilities on McpTransportType {
+  bool get isRegistryRecognized => mcpRegistryTransportTypes.contains(this);
+
+  bool get isRuntimeSupported =>
+      mcpRuntimeSupportedTransportTypes.contains(this);
+}
+
+String unsupportedMcpTransportMessage(McpTransportType transportType) {
+  final supported = mcpRuntimeSupportedTransportTypes
+      .map((transport) => transport.name)
+      .join(', ');
+  return 'unsupported MCP transport: ${transportType.name} '
+      '(current Dart runtime supports: $supported)';
+}
 
 /// MCP 服务器配置
 abstract class McpServerConfig {
   const McpServerConfig({required this.name});
 
   final String name;
+  McpTransportType get transportType;
+  bool get isRuntimeSupported => transportType.isRuntimeSupported;
+  String? get runtimeUnsupportedReason =>
+      isRuntimeSupported ? null : unsupportedMcpTransportMessage(transportType);
 
   Map<String, Object?> toJson();
 }
@@ -26,6 +56,9 @@ class McpStdioServerConfig extends McpServerConfig {
   final String command;
   final List<String> args;
   final Map<String, String>? env;
+
+  @override
+  McpTransportType get transportType => McpTransportType.stdio;
 
   @override
   Map<String, Object?> toJson() {
@@ -45,6 +78,78 @@ class McpStdioServerConfig extends McpServerConfig {
       args: (json['args'] as List?)?.cast<String>() ?? [],
       env: (json['env'] as Map?)?.cast<String, String>(),
     );
+  }
+}
+
+class McpSseServerConfig extends McpServerConfig {
+  const McpSseServerConfig({
+    required super.name,
+    required this.url,
+    this.headers,
+  });
+
+  final String url;
+  final Map<String, String>? headers;
+
+  @override
+  McpTransportType get transportType => McpTransportType.sse;
+
+  @override
+  Map<String, Object?> toJson() {
+    return {
+      'name': name,
+      'type': 'sse',
+      'url': url,
+      if (headers != null) 'headers': headers,
+    };
+  }
+}
+
+class McpHttpServerConfig extends McpServerConfig {
+  const McpHttpServerConfig({
+    required super.name,
+    required this.url,
+    this.headers,
+  });
+
+  final String url;
+  final Map<String, String>? headers;
+
+  @override
+  McpTransportType get transportType => McpTransportType.http;
+
+  @override
+  Map<String, Object?> toJson() {
+    return {
+      'name': name,
+      'type': 'http',
+      'url': url,
+      if (headers != null) 'headers': headers,
+    };
+  }
+}
+
+class McpWsServerConfig extends McpServerConfig {
+  const McpWsServerConfig({
+    required super.name,
+    required this.url,
+    this.headers,
+  });
+
+  final String url;
+  final Map<String, String>? headers;
+
+  @override
+  McpTransportType get transportType => McpTransportType.ws;
+
+  @override
+  Map<String, Object?> toJson() {
+    return {
+      'name': name,
+      'type': 'ws',
+      'url': url,
+      if (headers != null) 'headers': headers,
+    };
   }
 }
 

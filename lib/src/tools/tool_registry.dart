@@ -3,11 +3,21 @@ import 'tool_models.dart';
 class ToolRegistry {
   ToolRegistry({required List<Tool> tools}) : _byName = _buildMap(tools);
 
+  factory ToolRegistry.empty() => ToolRegistry(tools: const []);
+
   final Map<String, Tool> _byName;
 
   Tool? lookup(String name) => _byName[name];
 
   Iterable<Tool> get all => _byName.values;
+
+  ToolRegistry copy() => ToolRegistry(tools: _byName.values.toList());
+
+  ToolRegistry merged(Iterable<Tool> tools) {
+    final registry = copy();
+    registry.registerAll(tools.toList(growable: false));
+    return registry;
+  }
 
   /// 动态注册工具（用于 MCP 工具）
   void register(Tool tool) {

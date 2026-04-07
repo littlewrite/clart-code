@@ -93,7 +93,31 @@ abstract class LlmProvider {
   ///
   /// Default implementation wraps [run] for non-streaming providers.
   Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
+    if (_isRequestCancelled(request)) {
+      yield ProviderStreamEvent.error(
+        error: _buildCancelledRuntimeError(
+          request,
+          source: 'provider_stream',
+        ),
+        output: _formatCancelledOutput(request),
+      );
+      return;
+    }
+
     final response = await run(request);
+    if (_isRequestCancelled(request) && response.error == null) {
+      yield ProviderStreamEvent.error(
+        error: _buildCancelledRuntimeError(
+          request,
+          source: 'provider_stream',
+        ),
+        output: _formatCancelledOutput(request),
+        model: response.modelUsed,
+        toolCalls: response.toolCalls,
+        providerStateToken: response.providerStateToken,
+      );
+      return;
+    }
     if (response.isOk) {
       if (response.output.isNotEmpty) {
         yield ProviderStreamEvent.textDelta(
@@ -124,6 +148,12 @@ abstract class LlmProvider {
       providerStateToken: response.providerStateToken,
     );
   }
+}
+
+/// Base class for providers that return structured tool calls natively.
+abstract class NativeToolCallingLlmProvider extends LlmProvider {
+  @override
+  bool get supportsNativeToolCalling => true;
 }
 
 Map<String, Object?> buildClaudeRequestBodyForTest({
@@ -179,7 +209,7 @@ class LocalEchoProvider extends LlmProvider {
   }
 }
 
-class ClaudeApiProvider extends LlmProvider {
+class ClaudeApiProvider extends NativeToolCallingLlmProvider {
   ClaudeApiProvider({
     required this.apiKey,
     this.baseUrl,
@@ -194,19 +224,12 @@ class ClaudeApiProvider extends LlmProvider {
   HttpClient? _activeClient;
 
   @override
-  bool get supportsNativeToolCalling => true;
-
-  @override
   Future<void> cancelActiveRequest() async {
     _activeClient?.close(force: true);
   }
 
   @override
   Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
-    if (request.toolDefinitions.isNotEmpty) {
-      yield* super.stream(request);
-      return;
-    }
     final requestedModel = _resolveClaudeModel(request);
     if (apiKey.trim().isEmpty) {
       yield ProviderStreamEvent.error(
@@ -225,6 +248,7 @@ class ClaudeApiProvider extends LlmProvider {
     final client = HttpClient();
     _activeClient = client;
     final outputBuffer = StringBuffer();
+    final streamState = _ClaudeStreamingState();
     var modelUsed = requestedModel;
     var emittedTerminalEvent = false;
     final requestTimeout = timeout ?? RetryConfig.streaming.timeout;
@@ -271,6 +295,7 @@ class ClaudeApiProvider extends LlmProvider {
           eventName: sseEvent.event,
           currentModel: modelUsed,
           outputBuffer: outputBuffer,
+          streamState: streamState,
         );
         modelUsed = parsed.modelUsed;
         for (final event in parsed.events) {
@@ -285,11 +310,28 @@ class ClaudeApiProvider extends LlmProvider {
       if (!emittedTerminalEvent) {
         final output = outputBuffer.toString();
         yield ProviderStreamEvent.done(
-          output: output.isEmpty ? '[empty-output]' : output,
+          output: output.isEmpty && streamState.toolCalls.isNotEmpty
+              ? ''
+              : output.isEmpty
+                  ? '[empty-output]'
+                  : output,
           model: modelUsed,
+          toolCalls: streamState.toolCalls,
         );
       }
     } catch (error) {
+      if (_isRequestCancelled(request)) {
+        yield ProviderStreamEvent.error(
+          error: _buildCancelledRuntimeError(
+            request,
+            source: 'claude_stream',
+          ),
+          output: _formatCancelledOutput(request),
+          model: modelUsed,
+          toolCalls: streamState.toolCalls,
+        );
+        return;
+      }
       final runtimeError = _mapClaudeTransportError(
         error,
         source: 'claude_stream',
@@ -378,6 +420,16 @@ class ClaudeApiProvider extends LlmProvider {
             modelUsed: requestedModel,
           );
         } catch (error) {
+          if (_isRequestCancelled(request)) {
+            return QueryResponse.failure(
+              error: _buildCancelledRuntimeError(
+                request,
+                source: 'claude_http',
+              ),
+              output: _formatCancelledOutput(request),
+              modelUsed: requestedModel,
+            );
+          }
           final runtimeError = _mapClaudeTransportError(
             error,
             source: 'claude_http',
@@ -508,11 +560,23 @@ class ClaudeApiProvider extends LlmProvider {
     return model;
   }
 
+  String _extractClaudeContentBlockStartText(Map<String, Object?> block) {
+    if (block['type'] != 'text') {
+      return '';
+    }
+    final text = block['text'];
+    if (text is! String) {
+      return '';
+    }
+    return text;
+  }
+
   _ClaudeStreamPayloadParseResult _parseClaudeStreamPayload({
     required String rawPayload,
     required String? eventName,
     required String currentModel,
     required StringBuffer outputBuffer,
+    required _ClaudeStreamingState streamState,
   }) {
     if (rawPayload.isEmpty) {
       return _ClaudeStreamPayloadParseResult(
@@ -544,6 +608,7 @@ class ClaudeApiProvider extends LlmProvider {
           error: runtimeError,
           output: _formatClaudeErrorOutput(runtimeError),
           model: modelUsed,
+          toolCalls: streamState.toolCalls,
         ),
       );
       terminal = true;
@@ -559,23 +624,59 @@ class ClaudeApiProvider extends LlmProvider {
       modelUsed = startedModel;
     }
 
-    final deltaText = _extractClaudeDeltaText(payload);
-    if (deltaText.isNotEmpty) {
-      outputBuffer.write(deltaText);
-      events.add(
-        ProviderStreamEvent.textDelta(
-          delta: deltaText,
-          model: modelUsed,
-        ),
-      );
+    final index = payload['index'] as int?;
+
+    if (effectiveType == 'content_block_start' && index != null) {
+      final contentBlock = payload['content_block'];
+      if (contentBlock is Map) {
+        final block = Map<String, Object?>.from(contentBlock);
+        streamState.startBlock(index, block);
+        final initialText = _extractClaudeContentBlockStartText(block);
+        if (initialText.isNotEmpty) {
+          outputBuffer.write(initialText);
+          events.add(
+            ProviderStreamEvent.textDelta(
+              delta: initialText,
+              model: modelUsed,
+            ),
+          );
+        }
+      }
+    }
+
+    if (effectiveType == 'content_block_delta' && index != null) {
+      final deltaText = _extractClaudeDeltaText(payload);
+      if (deltaText.isNotEmpty) {
+        outputBuffer.write(deltaText);
+        events.add(
+          ProviderStreamEvent.textDelta(
+            delta: deltaText,
+            model: modelUsed,
+          ),
+        );
+      }
+
+      final delta = payload['delta'];
+      if (delta is Map) {
+        streamState.applyDelta(index, Map<String, Object?>.from(delta));
+      }
+    }
+
+    if (effectiveType == 'content_block_stop' && index != null) {
+      streamState.finishBlock(index);
     }
 
     if (effectiveType == 'message_stop') {
       final output = outputBuffer.toString();
       events.add(
         ProviderStreamEvent.done(
-          output: output.isEmpty ? '[empty-output]' : output,
+          output: output.isEmpty && streamState.toolCalls.isNotEmpty
+              ? ''
+              : output.isEmpty
+                  ? '[empty-output]'
+                  : output,
           model: modelUsed,
+          toolCalls: streamState.toolCalls,
         ),
       );
       terminal = true;
@@ -699,6 +800,27 @@ const String _defaultClaudeBaseUrl = 'https://api.anthropic.com';
 const String _anthropicApiVersion = '2023-06-01';
 const String _defaultClaudeModel = 'claude-sonnet-4-6';
 const int _defaultClaudeMaxTokens = 1024;
+
+bool _isRequestCancelled(QueryRequest request) {
+  return request.cancellationSignal?.isCancelled ?? false;
+}
+
+RuntimeError _buildCancelledRuntimeError(
+  QueryRequest request, {
+  required String source,
+}) {
+  final reason = request.cancellationSignal?.reason?.trim();
+  return RuntimeError(
+    code: RuntimeErrorCode.cancelled,
+    message: reason == null || reason.isEmpty ? 'request cancelled' : reason,
+    source: source,
+    retriable: false,
+  );
+}
+
+String _formatCancelledOutput(QueryRequest request) {
+  return '[STOPPED] request cancelled';
+}
 
 Map<String, Object?> _decodeJsonObject(String raw) {
   if (raw.trim().isEmpty) {
@@ -890,6 +1012,111 @@ class _ClaudeStreamPayloadParseResult {
   final bool terminal;
 }
 
+class _ClaudeStreamingState {
+  final Map<int, _ClaudeContentBlockState> _blocks = {};
+  final List<QueryToolCall> _toolCalls = [];
+
+  List<QueryToolCall> get toolCalls =>
+      List<QueryToolCall>.unmodifiable(_toolCalls);
+
+  void startBlock(int index, Map<String, Object?> block) {
+    _blocks[index] = _ClaudeContentBlockState.fromStartBlock(block);
+  }
+
+  void applyDelta(int index, Map<String, Object?> delta) {
+    _blocks[index]?.applyDelta(delta);
+  }
+
+  void finishBlock(int index) {
+    final toolCall = _blocks.remove(index)?.toToolCall();
+    if (toolCall != null) {
+      _toolCalls.add(toolCall);
+    }
+  }
+}
+
+class _ClaudeContentBlockState {
+  _ClaudeContentBlockState._({
+    required this.type,
+    this.toolId,
+    this.toolName,
+    Map<String, Object?>? toolInputSeed,
+  }) : _toolInputSeed = toolInputSeed == null
+            ? const <String, Object?>{}
+            : Map<String, Object?>.unmodifiable(toolInputSeed);
+
+  factory _ClaudeContentBlockState.fromStartBlock(Map<String, Object?> block) {
+    final type = block['type'] as String? ?? '';
+    if (type == 'tool_use') {
+      final input = block['input'];
+      return _ClaudeContentBlockState._(
+        type: type,
+        toolId: block['id'] as String?,
+        toolName: block['name'] as String?,
+        toolInputSeed: input is Map<String, Object?>
+            ? input
+            : input is Map
+                ? Map<String, Object?>.from(input)
+                : null,
+      );
+    }
+    return _ClaudeContentBlockState._(type: type);
+  }
+
+  final String type;
+  final String? toolId;
+  final String? toolName;
+  final Map<String, Object?> _toolInputSeed;
+  final StringBuffer _toolInputBuffer = StringBuffer();
+
+  void applyDelta(Map<String, Object?> delta) {
+    if (type != 'tool_use' || delta['type'] != 'input_json_delta') {
+      return;
+    }
+    final partialJson = delta['partial_json'];
+    if (partialJson is String && partialJson.isNotEmpty) {
+      _toolInputBuffer.write(partialJson);
+    }
+  }
+
+  QueryToolCall? toToolCall() {
+    if (type != 'tool_use') {
+      return null;
+    }
+    final id = toolId?.trim();
+    final name = toolName?.trim();
+    if (id == null || id.isEmpty || name == null || name.isEmpty) {
+      return null;
+    }
+    return QueryToolCall(
+      id: id,
+      name: name,
+      input: _decodeToolInput(),
+    );
+  }
+
+  Map<String, Object?> _decodeToolInput() {
+    final raw = _toolInputBuffer.toString().trim();
+    if (raw.isEmpty) {
+      return _toolInputSeed;
+    }
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, Object?>) {
+        return Map<String, Object?>.unmodifiable(decoded);
+      }
+      if (decoded is Map) {
+        return Map<String, Object?>.unmodifiable(
+          Map<String, Object?>.from(decoded),
+        );
+      }
+    } catch (_) {
+      return _toolInputSeed;
+    }
+    return _toolInputSeed;
+  }
+}
+
 class _AssistantToolCallPayload {
   const _AssistantToolCallPayload({
     required this.toolCalls,
@@ -900,7 +1127,7 @@ class _AssistantToolCallPayload {
   final List<QueryToolCall> toolCalls;
 }
 
-class OpenAiApiProvider extends LlmProvider {
+class OpenAiApiProvider extends NativeToolCallingLlmProvider {
   OpenAiApiProvider({
     required this.apiKey,
     this.baseUrl,
@@ -913,9 +1140,6 @@ class OpenAiApiProvider extends LlmProvider {
   final String? model;
   final Duration? timeout;
   HttpClient? _activeClient;
-
-  @override
-  bool get supportsNativeToolCalling => true;
 
   @override
   Future<void> cancelActiveRequest() async {
@@ -1054,6 +1278,17 @@ class OpenAiApiProvider extends LlmProvider {
         );
       }
     } catch (error) {
+      if (_isRequestCancelled(request)) {
+        yield ProviderStreamEvent.error(
+          error: _buildCancelledRuntimeError(
+            request,
+            source: 'openai_stream',
+          ),
+          output: _formatCancelledOutput(request),
+          model: modelUsed,
+        );
+        return;
+      }
       final runtimeError = _mapOpenAiTransportError(
         error,
         source: 'openai_stream',
@@ -1145,6 +1380,16 @@ class OpenAiApiProvider extends LlmProvider {
             modelUsed: chosenModel,
           );
         } catch (error) {
+          if (_isRequestCancelled(request)) {
+            return QueryResponse.failure(
+              error: _buildCancelledRuntimeError(
+                request,
+                source: 'openai_http',
+              ),
+              output: _formatCancelledOutput(request),
+              modelUsed: chosenModel,
+            );
+          }
           final runtimeError = _mapOpenAiTransportError(
             error,
             source: 'openai_http',

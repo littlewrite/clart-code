@@ -448,6 +448,140 @@ void main() {
       expect(capturedBody, isNotNull);
       expect(capturedBody!['tools'], isA<List>());
     });
+
+    test('stream parses native tool calls from Claude SSE events', () async {
+      HttpServer server;
+      try {
+        server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      } on SocketException {
+        return;
+      }
+      addTearDown(() async {
+        await server.close(force: true);
+      });
+
+      server.listen((request) async {
+        request.response.statusCode = 200;
+        request.response.headers.set(
+          HttpHeaders.contentTypeHeader,
+          'text/event-stream',
+        );
+
+        void writeEvent(String event, Map<String, Object?> data) {
+          request.response.write('event: $event\n');
+          request.response.write('data: ${jsonEncode(data)}\n\n');
+        }
+
+        writeEvent('message_start', {
+          'type': 'message_start',
+          'message': {
+            'id': 'msg_stream_1',
+            'model': 'claude-sonnet-4-6',
+          },
+        });
+        writeEvent('content_block_start', {
+          'type': 'content_block_start',
+          'index': 0,
+          'content_block': {
+            'type': 'text',
+            'text': '',
+          },
+        });
+        writeEvent('content_block_delta', {
+          'type': 'content_block_delta',
+          'index': 0,
+          'delta': {
+            'type': 'text_delta',
+            'text': 'using tool',
+          },
+        });
+        writeEvent('content_block_stop', {
+          'type': 'content_block_stop',
+          'index': 0,
+        });
+        writeEvent('content_block_start', {
+          'type': 'content_block_start',
+          'index': 1,
+          'content_block': {
+            'type': 'tool_use',
+            'id': 'toolu_stream_1',
+            'name': 'read',
+            'input': <String, Object?>{},
+          },
+        });
+        writeEvent('content_block_delta', {
+          'type': 'content_block_delta',
+          'index': 1,
+          'delta': {
+            'type': 'input_json_delta',
+            'partial_json': '{"path":"',
+          },
+        });
+        writeEvent('content_block_delta', {
+          'type': 'content_block_delta',
+          'index': 1,
+          'delta': {
+            'type': 'input_json_delta',
+            'partial_json': '/tmp/demo.txt"}',
+          },
+        });
+        writeEvent('content_block_stop', {
+          'type': 'content_block_stop',
+          'index': 1,
+        });
+        writeEvent('message_delta', {
+          'type': 'message_delta',
+          'delta': {
+            'stop_reason': 'tool_use',
+          },
+        });
+        writeEvent('message_stop', {
+          'type': 'message_stop',
+        });
+        await request.response.close();
+      });
+
+      final provider = ClaudeApiProvider(
+        apiKey: 'test-key',
+        baseUrl: 'http://${server.address.host}:${server.port}/v1',
+        model: 'claude-sonnet-4-6',
+      );
+
+      final events = <ProviderStreamEvent>[];
+      await for (final event in provider.stream(
+        const QueryRequest(
+          messages: [
+            ChatMessage(role: MessageRole.user, text: 'read the file'),
+          ],
+          toolDefinitions: [
+            QueryToolDefinition(
+              name: 'read',
+              description: 'Read a file',
+              inputSchema: {
+                'type': 'object',
+                'properties': {
+                  'path': {'type': 'string'},
+                },
+              },
+            ),
+          ],
+        ),
+      )) {
+        events.add(event);
+      }
+
+      expect(events.map((event) => event.type), [
+        ProviderStreamEventType.textDelta,
+        ProviderStreamEventType.done,
+      ]);
+      expect(events.first.delta, 'using tool');
+      expect(events.last.output, 'using tool');
+      expect(events.last.model, 'claude-sonnet-4-6');
+      expect(events.last.toolCalls, hasLength(1));
+      expect(events.last.toolCalls.single.id, 'toolu_stream_1');
+      expect(events.last.toolCalls.single.name, 'read');
+      expect(events.last.toolCalls.single.input, {'path': '/tmp/demo.txt'});
+    });
   });
 
   group('ProviderStreamEvent', () {

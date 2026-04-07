@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import '../cli/workspace_store.dart' show buildWorkspaceSessionSnapshot;
 import '../core/app_config.dart';
 import '../core/conversation_session.dart';
 import '../core/models.dart';
@@ -12,6 +11,7 @@ import '../core/query_engine.dart';
 import '../core/runtime_error.dart';
 import '../core/transcript.dart';
 import '../mcp/mcp_manager.dart';
+import '../mcp/mcp_types.dart';
 import '../providers/llm_provider.dart';
 import '../providers/provider_strategy.dart';
 import '../runtime/app_runtime.dart';
@@ -63,6 +63,7 @@ class ClartCodeAgent {
   bool _stopRequested = false;
   bool _stopNotified = false;
   String? _activeModel;
+  QueryCancellationController? _activeCancellationController;
   McpManager? _mcpManager;
   bool _runtimePrepared = false;
 
@@ -86,6 +87,8 @@ class ClartCodeAgent {
 
   List<TranscriptMessage> getTranscript() => _conversation.transcript;
 
+  ClartCodeSessionSnapshot snapshot() => _buildSessionSnapshot();
+
   List<String> get availableTools =>
       toolDefinitions.map((tool) => tool.name).toList(growable: false);
 
@@ -95,6 +98,24 @@ class ClartCodeAgent {
         .toList();
     definitions.sort((left, right) => left.name.compareTo(right.name));
     return List<ClartCodeToolDefinition>.unmodifiable(definitions);
+  }
+
+  List<McpConnection> get mcpConnections {
+    final manager = _mcpManager;
+    if (manager == null) {
+      return const [];
+    }
+    final connections = manager.getAllConnections().toList()
+      ..sort((left, right) => left.name.compareTo(right.name));
+    return List<McpConnection>.unmodifiable(connections);
+  }
+
+  List<McpConnection> get failedMcpConnections => mcpConnections
+      .where((connection) => connection.status == McpServerStatus.failed)
+      .toList(growable: false);
+
+  Future<void> prepare() async {
+    await _ensureRuntimeReady();
   }
 
   void clear() {
@@ -108,12 +129,72 @@ class ClartCodeAgent {
     _persistSession();
   }
 
+  ClartCodeSessionSnapshot renameSession(String title) {
+    final normalizedTitle = title.trim();
+    if (normalizedTitle.isEmpty) {
+      throw ArgumentError.value(
+          title, 'title', 'session title cannot be empty');
+    }
+    _sessionTitle = normalizedTitle;
+    _persistSession();
+    return _buildSessionSnapshot();
+  }
+
+  ClartCodeSessionSnapshot setSessionTags(List<String> tags) {
+    _sessionTags = _normalizeTags(tags);
+    _persistSession();
+    return _buildSessionSnapshot();
+  }
+
+  ClartCodeSessionSnapshot addSessionTag(String tag) {
+    final normalizedTag = tag.trim();
+    if (normalizedTag.isEmpty) {
+      throw ArgumentError.value(tag, 'tag', 'session tag cannot be empty');
+    }
+    return setSessionTags([..._sessionTags, normalizedTag]);
+  }
+
+  ClartCodeSessionSnapshot removeSessionTag(String tag) {
+    final normalizedTag = tag.trim();
+    if (normalizedTag.isEmpty) {
+      return _buildSessionSnapshot();
+    }
+    return setSessionTags(
+      _sessionTags.where((item) => item != normalizedTag).toList(),
+    );
+  }
+
+  ClartCodeSessionSnapshot forkSession({
+    String? title,
+    List<String>? tags,
+  }) {
+    final forked = _sessionStore.fork(
+      _sessionId,
+      title: title,
+      tags: tags,
+    );
+    if (forked == null) {
+      final current = _buildSessionSnapshot();
+      _sessionStore.save(current);
+      final recreated = _sessionStore.fork(
+        _sessionId,
+        title: title,
+        tags: tags,
+      );
+      if (recreated != null) {
+        return recreated;
+      }
+      throw StateError('failed to fork session $_sessionId');
+    }
+    return forked;
+  }
+
   Future<void> stop({String reason = 'manual_stop'}) async {
     if (!_queryInProgress || _stopRequested) {
       return;
     }
     _stopRequested = true;
-    await _runtime.provider.cancelActiveRequest();
+    _activeCancellationController?.cancel(reason);
     if (_stopNotified) {
       return;
     }
@@ -137,6 +218,7 @@ class ClartCodeAgent {
   Stream<ClartCodeSdkMessage> query(
     String prompt, {
     String? model,
+    QueryCancellationSignal? cancellationSignal,
   }) async* {
     final watch = Stopwatch()..start();
     try {
@@ -205,9 +287,19 @@ class ClartCodeAgent {
     final userPrompt = processed.submission.raw;
     final selectedModel = model ?? _config.model;
     _queryInProgress = true;
-    _stopRequested = false;
+    _stopRequested = cancellationSignal?.isCancelled ?? false;
     _stopNotified = false;
     _activeModel = selectedModel;
+    StreamSubscription<void>? externalCancellationSub;
+    if (cancellationSignal != null) {
+      externalCancellationSub = cancellationSignal.onCancel.listen((_) {
+        unawaited(
+          stop(
+            reason: cancellationSignal.reason ?? 'request cancelled',
+          ),
+        );
+      });
+    }
     final workingMessages = List<ChatMessage>.from(processed.request!.messages);
     var pendingProviderMessages = List<ChatMessage>.from(workingMessages);
     String? providerStateToken;
@@ -254,8 +346,13 @@ class ClartCodeAgent {
           toolDefinitions: definitions,
           providerToolDefinitions: providerToolDefinitions,
           providerStateToken: providerStateToken,
+          cancellationSignal: (_activeCancellationController =
+                  QueryCancellationController())
+              .signal,
         );
         final turnResult = await _runProviderTurn(request: request, turn: turn);
+        _activeCancellationController?.close();
+        _activeCancellationController = null;
         if (turnResult.providerStateToken != null &&
             turnResult.providerStateToken!.isNotEmpty) {
           providerStateToken = turnResult.providerStateToken;
@@ -366,6 +463,7 @@ class ClartCodeAgent {
         final invocationMap = Map<ToolInvocation, ClartCodeToolCall>.identity();
         final invocations = toolCalls.map((toolCall) {
           final invocation = ToolInvocation(
+            id: toolCall.id,
             name: toolCall.name,
             input: toolCall.input,
           );
@@ -383,19 +481,46 @@ class ClartCodeAgent {
           permissionResolver: !needsPermissionResolver
               ? null
               : (invocation) async {
-                  final toolCall = invocationMap[invocation]!;
+                  final toolCall = invocationMap[invocation] ??
+                      toolCalls.firstWhere(
+                        (candidate) => candidate.id == invocation.id,
+                      );
+                  final context = _toolContext(turn: turn, model: modelUsed);
+                  final permissionOutcome =
+                      await _options.resolveToolPermission?.call(
+                    toolCall,
+                    context,
+                  );
+                  if (permissionOutcome != null) {
+                    return permissionOutcome.isAllowed
+                        ? ToolPermissionResolution.allow(
+                            invocation: permissionOutcome.updatedInput == null
+                                ? invocation
+                                : invocation.copyWith(
+                                    input: permissionOutcome.updatedInput,
+                                  ),
+                            message: permissionOutcome.message,
+                          )
+                        : ToolPermissionResolution.deny(
+                            message: permissionOutcome.message,
+                          );
+                  }
+
                   final allowed = await _options.canUseTool?.call(
                         toolCall,
-                        _toolContext(turn: turn, model: modelUsed),
+                        context,
                       ) ??
                       true;
                   return allowed
-                      ? ToolPermissionDecision.allow
-                      : ToolPermissionDecision.deny;
+                      ? ToolPermissionResolution.allow(invocation: invocation)
+                      : ToolPermissionResolution.deny();
                 },
           hooks: ToolExecutionHooks(
             beforeExecute: (invocation) async {
-              final toolCall = invocationMap[invocation]!;
+              final toolCall = invocationMap[invocation] ??
+                  toolCalls.firstWhere(
+                    (candidate) => candidate.id == invocation.id,
+                  );
               await _options.hooks.onPreToolUse?.call(
                 ClartCodeToolEvent(
                   context: _toolContext(turn: turn, model: modelUsed),
@@ -464,6 +589,9 @@ class ClartCodeAgent {
       );
       yield terminal;
     } finally {
+      await externalCancellationSub?.cancel();
+      _activeCancellationController?.close();
+      _activeCancellationController = null;
       _queryInProgress = false;
       _activeModel = null;
     }
@@ -472,9 +600,14 @@ class ClartCodeAgent {
   Future<ClartCodePromptResult> prompt(
     String prompt, {
     String? model,
+    QueryCancellationSignal? cancellationSignal,
   }) async {
     final messages = <ClartCodeSdkMessage>[];
-    await for (final message in query(prompt, model: model)) {
+    await for (final message in query(
+      prompt,
+      model: model,
+      cancellationSignal: cancellationSignal,
+    )) {
       messages.add(message);
     }
 
@@ -524,8 +657,11 @@ class ClartCodeAgent {
 
   void _rebuildRuntime() {
     final baseExecutor = _options.toolExecutor ?? ToolExecutor.minimal();
-    final toolExecutor = baseExecutor.copyWith(
-      registry: ToolRegistry(tools: _filterTools(baseExecutor.registry.all)),
+    final mergedExecutor = _options.tools == null || _options.tools!.isEmpty
+        ? baseExecutor
+        : baseExecutor.withAdditionalTools(_options.tools!);
+    final toolExecutor = mergedExecutor.copyWith(
+      registry: ToolRegistry(tools: _filterTools(mergedExecutor.registry.all)),
       permissionPolicy: _buildPermissionPolicy(),
     );
     _runtime = AppRuntime(
@@ -635,6 +771,7 @@ class ClartCodeAgent {
     required List<ClartCodeToolDefinition> toolDefinitions,
     required List<QueryToolDefinition> providerToolDefinitions,
     required String? providerStateToken,
+    required QueryCancellationSignal? cancellationSignal,
   }) {
     final useNativeToolCalling = _runtime.provider.supportsNativeToolCalling;
     return QueryRequest(
@@ -651,6 +788,7 @@ class ClartCodeAgent {
       toolDefinitions:
           useNativeToolCalling ? providerToolDefinitions : const [],
       providerStateToken: useNativeToolCalling ? providerStateToken : null,
+      cancellationSignal: cancellationSignal,
     );
   }
 
@@ -888,7 +1026,14 @@ class ClartCodeAgent {
       return;
     }
 
-    final snapshot = buildWorkspaceSessionSnapshot(
+    final snapshot = _buildSessionSnapshot();
+    _sessionTitle = snapshot.title;
+    _sessionTags = List<String>.from(snapshot.tags);
+    _sessionStore.save(snapshot);
+  }
+
+  ClartCodeSessionSnapshot _buildSessionSnapshot() {
+    return ClartCodeSessionSnapshot.build(
       id: _sessionId,
       provider: _config.provider.name,
       model: _config.model,
@@ -898,9 +1043,18 @@ class ClartCodeAgent {
       title: _sessionTitle,
       tags: _sessionTags,
     );
-    _sessionTitle = snapshot.title;
-    _sessionTags = List<String>.from(snapshot.tags);
-    _sessionStore.save(ClartCodeSessionSnapshot.fromWorkspace(snapshot));
+  }
+
+  List<String> _normalizeTags(List<String> tags) {
+    final normalized = <String>{};
+    for (final tag in tags) {
+      final trimmed = tag.trim();
+      if (trimmed.isNotEmpty) {
+        normalized.add(trimmed);
+      }
+    }
+    final ordered = normalized.toList()..sort();
+    return List<String>.unmodifiable(ordered);
   }
 
   String _normalizeFailureOutput(

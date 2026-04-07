@@ -102,6 +102,56 @@ void main() {
       expect(results.first.ok, false);
       expect(results.first.errorCode, 'tool_runtime_error');
     });
+
+    test('permission resolver can override invocation input', () async {
+      final registry = ToolRegistry(
+        tools: [_EchoInputTool()],
+      );
+      final results = await scheduler.runBatch(
+        invocations: [
+          ToolInvocation(
+            id: 'call_echo_1',
+            name: 'echo_input',
+            input: {'value': 'original'},
+          ),
+        ],
+        registry: registry,
+        permissionPolicy: const ToolPermissionPolicy(
+          defaultMode: ToolPermissionMode.ask,
+        ),
+        permissionResolver: (invocation) async {
+          return ToolPermissionResolution.allow(
+            invocation: invocation.copyWith(
+              input: {'value': 'rewritten'},
+            ),
+          );
+        },
+      );
+
+      expect(results.single.ok, isTrue);
+      expect(results.single.output, 'rewritten');
+    });
+
+    test('permission resolver denial message is preserved', () async {
+      final results = await scheduler.runBatch(
+        invocations: [
+          ToolInvocation(name: 'parallel1'),
+        ],
+        registry: registry,
+        permissionPolicy: const ToolPermissionPolicy(
+          defaultMode: ToolPermissionMode.ask,
+        ),
+        permissionResolver: (invocation) async {
+          return ToolPermissionResolution.deny(
+            message: 'permission denied for test',
+          );
+        },
+      );
+
+      expect(results.single.ok, isFalse);
+      expect(results.single.errorCode, 'permission_denied');
+      expect(results.single.errorMessage, 'permission denied for test');
+    });
   });
 }
 
@@ -156,6 +206,22 @@ class _FailingTool extends Tool {
   @override
   Future<ToolExecutionResult> run(ToolInvocation invocation) async {
     throw Exception('Tool execution failed');
+  }
+}
+
+class _EchoInputTool extends Tool {
+  @override
+  String get name => 'echo_input';
+
+  @override
+  ToolExecutionHint get executionHint => ToolExecutionHint.serialOnly;
+
+  @override
+  Future<ToolExecutionResult> run(ToolInvocation invocation) async {
+    return ToolExecutionResult.success(
+      tool: name,
+      output: invocation.input['value'] as String? ?? '',
+    );
   }
 }
 

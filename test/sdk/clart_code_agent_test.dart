@@ -540,15 +540,240 @@ void main() {
         ),
       );
 
+      await agent.prepare();
       final result = await agent.prompt('use mcp tool');
 
       expect(result.isError, false);
       expect(result.text, 'mcp final: remote body');
       expect(manager.connectAllCalls, 1);
+      expect(agent.mcpConnections, hasLength(1));
+      expect(agent.failedMcpConnections, isEmpty);
       expect(agent.availableTools, contains('demo/read_remote'));
       expect(agent.availableTools, contains('mcp_list_resources'));
       expect(agent.availableTools, contains('mcp_read_resource'));
       expect(result.messages.first.tools, contains('demo/read_remote'));
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('agent registers custom tools directly from options.tools', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_custom_tools_',
+    );
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          tools: const [_CustomEchoTool()],
+          providerOverride: _ScriptedToolLoopProvider((request) {
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            if (toolPayloads.isEmpty) {
+              return QueryResponse.success(
+                output: jsonEncode({
+                  'tool_calls': [
+                    {
+                      'id': 'call_custom_1',
+                      'name': 'custom_echo',
+                      'input': {'text': 'hello tool'},
+                    },
+                  ],
+                }),
+                modelUsed: 'tool-mock',
+              );
+            }
+
+            return QueryResponse.success(
+              output: 'custom=${toolPayloads.single['output']}',
+              modelUsed: 'tool-mock',
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.prompt('use custom tool');
+
+      expect(result.isError, false);
+      expect(result.text, 'custom=HELLO TOOL');
+      expect(agent.availableTools, contains('custom_echo'));
+      final definition = agent.toolDefinitions.firstWhere(
+        (tool) => tool.name == 'custom_echo',
+      );
+      expect(definition.title, 'Custom Echo');
+      expect(definition.annotations, {'category': 'test'});
+      expect(definition.inputSchema?['type'], 'object');
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('resolveToolPermission can rewrite input before tool execution',
+      () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_permission_rewrite_',
+    );
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          allowedTools: const ['shell'],
+          permissionMode: ToolPermissionMode.ask,
+          resolveToolPermission: (toolCall, context) {
+            expect(context.turn, 1);
+            expect(toolCall.name, 'shell');
+            return ClartCodeToolPermissionOutcome.allow(
+              updatedInput: {'command': 'echo rewritten'},
+            );
+          },
+          providerOverride: _ScriptedToolLoopProvider((request) {
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            if (toolPayloads.isEmpty) {
+              return QueryResponse.success(
+                output: jsonEncode({
+                  'tool_calls': [
+                    {
+                      'id': 'call_shell_rewrite_1',
+                      'name': 'shell',
+                      'input': {'command': 'echo original'},
+                    },
+                  ],
+                }),
+                modelUsed: 'tool-mock',
+              );
+            }
+
+            final payload = toolPayloads.single;
+            return QueryResponse.success(
+              output: 'output=${payload['output']}',
+              modelUsed: 'tool-mock',
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.prompt('rewrite shell input');
+
+      expect(result.isError, false);
+      expect(result.text, contains('echo rewritten'));
+      expect(result.text, isNot(contains('echo original')));
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('resolveToolPermission denial message flows into tool result', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_permission_deny_',
+    );
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          allowedTools: const ['shell'],
+          permissionMode: ToolPermissionMode.ask,
+          resolveToolPermission: (toolCall, context) {
+            expect(context.turn, 1);
+            expect(toolCall.name, 'shell');
+            return ClartCodeToolPermissionOutcome.deny(
+              message: 'shell rejected by custom resolver',
+            );
+          },
+          providerOverride: _ScriptedToolLoopProvider((request) {
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            if (toolPayloads.isEmpty) {
+              return QueryResponse.success(
+                output: jsonEncode({
+                  'tool_calls': [
+                    {
+                      'id': 'call_shell_reject_1',
+                      'name': 'shell',
+                      'input': {'command': 'pwd'},
+                    },
+                  ],
+                }),
+                modelUsed: 'tool-mock',
+              );
+            }
+
+            final payload = toolPayloads.single;
+            return QueryResponse.success(
+              output:
+                  'handled=${payload['ok']} message=${payload['error_message']}',
+              modelUsed: 'tool-mock',
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.prompt('deny shell');
+
+      expect(result.isError, false);
+      expect(result.text, contains('handled=false'));
+      expect(result.text, contains('shell rejected by custom resolver'));
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('prepare exposes unsupported MCP transports without injecting tools',
+      () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_mcp_unsupported_',
+    );
+    final registryFile = File('${tempDir.path}/.clart/mcp_servers.json');
+    await registryFile.parent.create(recursive: true);
+    await registryFile.writeAsString(jsonEncode({
+      'mcpServers': {
+        'remote': {
+          'type': 'http',
+          'url': 'https://example.com/mcp',
+        },
+      },
+    }));
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          mcp: const ClartCodeMcpOptions(),
+        ),
+      );
+
+      await agent.prepare();
+
+      expect(agent.mcpConnections, hasLength(1));
+      expect(agent.mcpConnections.single.name, 'remote');
+      expect(agent.mcpConnections.single.status, McpServerStatus.failed);
+      expect(
+        agent.mcpConnections.single.error,
+        contains('current Dart runtime supports: stdio'),
+      );
+      expect(agent.failedMcpConnections, hasLength(1));
+      expect(agent.availableTools, isNot(contains('mcp_list_resources')));
+      expect(
+        agent.availableTools.where((tool) => tool.startsWith('remote/')),
+        isEmpty,
+      );
     } finally {
       if (tempDir.existsSync()) {
         tempDir.deleteSync(recursive: true);
@@ -599,13 +824,10 @@ class _ScriptedToolLoopProvider extends LlmProvider {
   Future<QueryResponse> run(QueryRequest request) async => _handler(request);
 }
 
-class _NativeToolLoopProvider extends LlmProvider {
+class _NativeToolLoopProvider extends NativeToolCallingLlmProvider {
   _NativeToolLoopProvider(this._handler);
 
   final QueryResponse Function(QueryRequest request) _handler;
-
-  @override
-  bool get supportsNativeToolCalling => true;
 
   @override
   Future<QueryResponse> run(QueryRequest request) async => _handler(request);
@@ -692,5 +914,44 @@ class _CancelableProvider extends LlmProvider {
   @override
   Future<QueryResponse> run(QueryRequest request) {
     throw UnimplementedError();
+  }
+}
+
+class _CustomEchoTool implements Tool {
+  const _CustomEchoTool();
+
+  @override
+  String get name => 'custom_echo';
+
+  @override
+  String? get title => 'Custom Echo';
+
+  @override
+  String get description => 'Uppercases input text for SDK tool registration.';
+
+  @override
+  Map<String, Object?>? get annotations => const {
+        'category': 'test',
+      };
+
+  @override
+  Map<String, Object?>? get inputSchema => const {
+        'type': 'object',
+        'properties': {
+          'text': {'type': 'string'},
+        },
+        'required': ['text'],
+      };
+
+  @override
+  ToolExecutionHint get executionHint => ToolExecutionHint.serialOnly;
+
+  @override
+  Future<ToolExecutionResult> run(ToolInvocation invocation) async {
+    final text = invocation.input['text'] as String? ?? '';
+    return ToolExecutionResult.success(
+      tool: name,
+      output: text.toUpperCase(),
+    );
   }
 }

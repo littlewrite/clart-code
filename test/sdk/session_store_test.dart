@@ -89,4 +89,68 @@ void main() {
       }
     }
   });
+
+  test('agent convenience API manages current session metadata', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_store_agent_meta_',
+    );
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(cwd: tempDir.path),
+      );
+      await agent.prompt('agent metadata prompt');
+
+      final initialSnapshot = agent.snapshot();
+      expect(initialSnapshot.id, agent.sessionId);
+      expect(
+        initialSnapshot.history.map((message) => message.text),
+        containsAll([
+          'agent metadata prompt',
+          'echo: agent metadata prompt',
+        ]),
+      );
+
+      final renamed = agent.renameSession('  Renamed Agent Session  ');
+      expect(renamed.title, 'Renamed Agent Session');
+      expect(agent.sessionTitle, 'Renamed Agent Session');
+
+      final retagged = agent.setSessionTags(['sdk', 'phase2', 'sdk']);
+      expect(retagged.tags, ['phase2', 'sdk']);
+      expect(agent.sessionTags, ['phase2', 'sdk']);
+
+      final added = agent.addSessionTag('alpha');
+      expect(added.tags, ['alpha', 'phase2', 'sdk']);
+      expect(agent.sessionTags, ['alpha', 'phase2', 'sdk']);
+
+      final removed = agent.removeSessionTag('phase2');
+      expect(removed.tags, ['alpha', 'sdk']);
+      expect(agent.sessionTags, ['alpha', 'sdk']);
+
+      final forked = agent.forkSession(
+        title: 'Forked Agent Session',
+        tags: ['fork', 'sdk'],
+      );
+      expect(forked.id, isNot(agent.sessionId));
+      expect(forked.title, 'Forked Agent Session');
+      expect(forked.tags, ['fork', 'sdk']);
+      expect(
+        forked.history.map((message) => message.text),
+        containsAll([
+          'agent metadata prompt',
+          'echo: agent metadata prompt',
+        ]),
+      );
+
+      final store = ClartCodeSessionStore(cwd: tempDir.path);
+      final persisted = store.load(agent.sessionId);
+      expect(persisted, isNotNull);
+      expect(persisted!.title, 'Renamed Agent Session');
+      expect(persisted.tags, ['alpha', 'sdk']);
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
 }

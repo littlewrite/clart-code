@@ -7,6 +7,8 @@ export 'src/core/models.dart'
         MessageRole,
         QueryRequest,
         QueryResponse,
+        QueryCancellationController,
+        QueryCancellationSignal,
         QueryToolCall,
         QueryToolDefinition;
 export 'src/core/runtime_error.dart';
@@ -16,6 +18,7 @@ export 'src/mcp/mcp_types.dart';
 export 'src/providers/llm_provider.dart'
     show
         LlmProvider,
+        NativeToolCallingLlmProvider,
         LocalEchoProvider,
         ClaudeApiProvider,
         OpenAiApiProvider,

@@ -1,10 +1,10 @@
-/// MCP 连接管理器
-/// 管理多个 MCP 服务器连接
+// MCP 连接管理器
+// 管理多个 MCP 服务器连接
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'mcp_client.dart';
+import 'mcp_registry.dart';
 import 'mcp_types.dart';
 
 /// MCP 管理器
@@ -15,8 +15,14 @@ class McpManager {
   final _connections = <String, McpClient>{};
   final _connectionStatus = <String, McpConnection>{};
 
+  List<McpTransportType> get recognizedTransportTypes =>
+      List<McpTransportType>.unmodifiable(mcpRegistryTransportTypes);
+
+  List<McpTransportType> get supportedTransportTypes =>
+      List<McpTransportType>.unmodifiable(mcpRuntimeSupportedTransportTypes);
+
   /// 加载服务器注册表
-  Future<Map<String, McpStdioServerConfig>> loadRegistry() async {
+  Future<Map<String, McpServerConfig>> loadRegistry() async {
     final file = File(registryPath);
     if (!await file.exists()) {
       return {};
@@ -24,19 +30,7 @@ class McpManager {
 
     try {
       final content = await file.readAsString();
-      final json = jsonDecode(content) as Map<String, Object?>;
-      final serversJson = json['servers'] as Map<String, Object?>? ?? {};
-
-      final configs = <String, McpStdioServerConfig>{};
-      for (final entry in serversJson.entries) {
-        final serverJson = entry.value as Map<String, Object?>;
-        configs[entry.key] = McpStdioServerConfig.fromJson({
-          'name': entry.key,
-          ...serverJson,
-        });
-      }
-
-      return configs;
+      return McpRegistry.fromJsonString(content).servers;
     } catch (e) {
       throw Exception('Failed to load MCP registry: $e');
     }
@@ -44,25 +38,15 @@ class McpManager {
 
   /// 保存服务器注册表
   Future<void> saveRegistry(
-    Map<String, McpStdioServerConfig> configs,
+    Map<String, McpServerConfig> configs,
   ) async {
-    final serversJson = <String, Object?>{};
-    for (final entry in configs.entries) {
-      final config = entry.value.toJson();
-      config.remove('name'); // name 作为 key，不需要在 value 中重复
-      serversJson[entry.key] = config;
-    }
-
-    final json = {'servers': serversJson};
     final file = File(registryPath);
     await file.parent.create(recursive: true);
-    await file.writeAsString(
-      const JsonEncoder.withIndent('  ').convert(json),
-    );
+    await file.writeAsString(McpRegistry(servers: configs).encodePretty());
   }
 
   /// 连接到指定服务器
-  Future<McpConnection> connect(McpStdioServerConfig config) async {
+  Future<McpConnection> connect(McpServerConfig config) async {
     final name = config.name;
 
     // 如果已连接，返回现有连接
@@ -76,6 +60,17 @@ class McpManager {
       status: McpServerStatus.pending,
       config: config,
     );
+
+    if (config is! McpStdioServerConfig) {
+      final connection = McpConnection(
+        name: name,
+        status: McpServerStatus.failed,
+        config: config,
+        error: config.runtimeUnsupportedReason,
+      );
+      _connectionStatus[name] = connection;
+      return connection;
+    }
 
     try {
       final client = McpClient(config: config);
@@ -137,8 +132,7 @@ class McpManager {
   McpConnection? getConnection(String name) => _connectionStatus[name];
 
   /// 获取所有连接状态
-  List<McpConnection> getAllConnections() =>
-      _connectionStatus.values.toList();
+  List<McpConnection> getAllConnections() => _connectionStatus.values.toList();
 
   /// 获取客户端
   McpClient? getClient(String name) => _connections[name];

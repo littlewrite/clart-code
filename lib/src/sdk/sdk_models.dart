@@ -15,6 +15,12 @@ typedef ClartCodeCanUseTool = FutureOr<bool> Function(
   ClartCodeToolContext context,
 );
 
+typedef ClartCodeResolveToolPermission
+    = FutureOr<ClartCodeToolPermissionOutcome> Function(
+  ClartCodeToolCall toolCall,
+  ClartCodeToolContext context,
+);
+
 typedef ClartCodeSessionStartHook = FutureOr<void> Function(
     ClartCodeSessionStartEvent event);
 
@@ -140,6 +146,46 @@ class ClartCodeAgentHooks {
   final ClartCodePostToolUseFailureHook? onPostToolUseFailure;
 }
 
+enum ClartCodeToolPermissionDecision { allow, deny }
+
+class ClartCodeToolPermissionOutcome {
+  const ClartCodeToolPermissionOutcome._({
+    required this.decision,
+    this.message,
+    this.updatedInput,
+  });
+
+  factory ClartCodeToolPermissionOutcome.allow({
+    String? message,
+    Map<String, Object?>? updatedInput,
+  }) {
+    return ClartCodeToolPermissionOutcome._(
+      decision: ClartCodeToolPermissionDecision.allow,
+      message: message,
+      updatedInput: updatedInput == null
+          ? null
+          : Map<String, Object?>.unmodifiable(
+              Map<String, Object?>.from(updatedInput),
+            ),
+    );
+  }
+
+  factory ClartCodeToolPermissionOutcome.deny({
+    String? message,
+  }) {
+    return ClartCodeToolPermissionOutcome._(
+      decision: ClartCodeToolPermissionDecision.deny,
+      message: message,
+    );
+  }
+
+  final ClartCodeToolPermissionDecision decision;
+  final String? message;
+  final Map<String, Object?>? updatedInput;
+
+  bool get isAllowed => decision == ClartCodeToolPermissionDecision.allow;
+}
+
 class ClartCodeMcpOptions {
   const ClartCodeMcpOptions({
     this.registryPath,
@@ -166,6 +212,7 @@ class ClartCodeAgentOptions {
     this.persistSession = true,
     this.providerOverride,
     this.toolExecutor,
+    this.tools,
     this.allowedTools,
     this.disallowedTools,
     this.permissionMode,
@@ -174,6 +221,7 @@ class ClartCodeAgentOptions {
     this.telemetry = const TelemetryService(),
     this.securityGuard = const SecurityGuard(),
     this.canUseTool,
+    this.resolveToolPermission,
     this.hooks = const ClartCodeAgentHooks(),
     this.mcp,
     this.mcpManagerOverride,
@@ -191,6 +239,7 @@ class ClartCodeAgentOptions {
   final bool persistSession;
   final LlmProvider? providerOverride;
   final ToolExecutor? toolExecutor;
+  final List<Tool>? tools;
   final List<String>? allowedTools;
   final List<String>? disallowedTools;
   final ToolPermissionMode? permissionMode;
@@ -199,6 +248,7 @@ class ClartCodeAgentOptions {
   final TelemetryService telemetry;
   final SecurityGuard securityGuard;
   final ClartCodeCanUseTool? canUseTool;
+  final ClartCodeResolveToolPermission? resolveToolPermission;
   final ClartCodeAgentHooks hooks;
   final ClartCodeMcpOptions? mcp;
   final McpManager? mcpManagerOverride;
@@ -216,6 +266,7 @@ class ClartCodeAgentOptions {
     bool? persistSession,
     LlmProvider? providerOverride,
     ToolExecutor? toolExecutor,
+    List<Tool>? tools,
     List<String>? allowedTools,
     List<String>? disallowedTools,
     ToolPermissionMode? permissionMode,
@@ -224,6 +275,7 @@ class ClartCodeAgentOptions {
     TelemetryService? telemetry,
     SecurityGuard? securityGuard,
     ClartCodeCanUseTool? canUseTool,
+    ClartCodeResolveToolPermission? resolveToolPermission,
     ClartCodeAgentHooks? hooks,
     ClartCodeMcpOptions? mcp,
     McpManager? mcpManagerOverride,
@@ -241,6 +293,7 @@ class ClartCodeAgentOptions {
       persistSession: persistSession ?? this.persistSession,
       providerOverride: providerOverride ?? this.providerOverride,
       toolExecutor: toolExecutor ?? this.toolExecutor,
+      tools: tools ?? this.tools,
       allowedTools: allowedTools ?? this.allowedTools,
       disallowedTools: disallowedTools ?? this.disallowedTools,
       permissionMode: permissionMode ?? this.permissionMode,
@@ -249,6 +302,8 @@ class ClartCodeAgentOptions {
       telemetry: telemetry ?? this.telemetry,
       securityGuard: securityGuard ?? this.securityGuard,
       canUseTool: canUseTool ?? this.canUseTool,
+      resolveToolPermission:
+          resolveToolPermission ?? this.resolveToolPermission,
       hooks: hooks ?? this.hooks,
       mcp: mcp ?? this.mcp,
       mcpManagerOverride: mcpManagerOverride ?? this.mcpManagerOverride,
@@ -261,22 +316,30 @@ class ClartCodeToolDefinition {
     required this.name,
     required this.description,
     required this.executionHint,
+    this.title,
     this.inputSchema,
+    this.annotations,
   });
 
   final String name;
   final String description;
   final String executionHint;
+  final String? title;
   final Map<String, Object?>? inputSchema;
+  final Map<String, Object?>? annotations;
 
   factory ClartCodeToolDefinition.fromTool(Tool tool) {
     return ClartCodeToolDefinition(
       name: tool.name,
       description: tool.description,
       executionHint: tool.executionHint.name,
+      title: tool.title,
       inputSchema: tool.inputSchema == null
           ? null
           : Map<String, Object?>.from(tool.inputSchema!),
+      annotations: tool.annotations == null
+          ? null
+          : Map<String, Object?>.from(tool.annotations!),
     );
   }
 
@@ -285,7 +348,9 @@ class ClartCodeToolDefinition {
       'name': name,
       'description': description,
       'executionHint': executionHint,
+      'title': title,
       'inputSchema': inputSchema,
+      'annotations': annotations,
     };
   }
 }

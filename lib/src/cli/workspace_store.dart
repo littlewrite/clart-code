@@ -3,6 +3,8 @@ import 'dart:io';
 
 import '../core/models.dart';
 import '../core/transcript.dart';
+import '../mcp/mcp_registry.dart';
+import '../mcp/mcp_types.dart';
 import '../tools/tool_permissions.dart';
 
 String workspaceDataDir({String? cwd}) =>
@@ -229,6 +231,37 @@ class WorkspaceMcpServer {
       target: json['target'] as String? ?? '',
     );
   }
+
+  factory WorkspaceMcpServer.fromConfig(McpServerConfig config) {
+    return WorkspaceMcpServer(
+      name: config.name,
+      transport: config.transportType.name,
+      target: describeWorkspaceMcpTarget(config),
+    );
+  }
+
+  McpServerConfig toConfig() {
+    switch (transport) {
+      case 'stdio':
+        final parts = splitCommandString(target);
+        if (parts.isEmpty) {
+          throw FormatException('stdio MCP target cannot be empty');
+        }
+        return McpStdioServerConfig(
+          name: name,
+          command: parts.first,
+          args: parts.skip(1).toList(growable: false),
+        );
+      case 'sse':
+        return McpSseServerConfig(name: name, url: target);
+      case 'http':
+        return McpHttpServerConfig(name: name, url: target);
+      case 'ws':
+        return McpWsServerConfig(name: name, url: target);
+      default:
+        throw FormatException('unsupported MCP transport: $transport');
+    }
+  }
 }
 
 List<WorkspaceMcpServer> readWorkspaceMcpServers({String? cwd}) {
@@ -237,15 +270,12 @@ List<WorkspaceMcpServer> readWorkspaceMcpServers({String? cwd}) {
     return const [];
   }
   try {
-    final decoded = jsonDecode(file.readAsStringSync());
-    if (decoded is List) {
-      return decoded
-          .whereType<Map>()
-          .map((item) => WorkspaceMcpServer.fromJson(
-                Map<String, Object?>.from(item.cast<String, Object?>()),
-              ))
-          .toList();
-    }
+    final registry = McpRegistry.fromJsonString(file.readAsStringSync());
+    final servers = registry.servers.values
+        .map(WorkspaceMcpServer.fromConfig)
+        .toList()
+      ..sort((a, b) => a.name.compareTo(b.name));
+    return servers;
   } catch (_) {
     // Keep MCP list resilient if the file is malformed.
   }
@@ -257,9 +287,13 @@ void writeWorkspaceMcpServers(
   String? cwd,
 }) {
   ensureWorkspaceDataDir(cwd: cwd);
+  final sortedServers = [...servers]..sort((a, b) => a.name.compareTo(b.name));
+  final configs = <String, McpServerConfig>{};
+  for (final server in sortedServers) {
+    configs[server.name] = server.toConfig();
+  }
   File(workspaceMcpServersPath(cwd: cwd)).writeAsStringSync(
-    const JsonEncoder.withIndent('  ')
-        .convert(servers.map((server) => server.toJson()).toList()),
+    McpRegistry(servers: configs).encodePretty(),
   );
 }
 

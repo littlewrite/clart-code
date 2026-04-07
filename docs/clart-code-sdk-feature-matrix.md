@@ -1,69 +1,70 @@
 # Clart Code SDK 功能矩阵
 
-> 目的：把参考实现、当前 Dart 状态、以及后续落地阶段放到同一张表里，避免范围漂移。
+> 目的：把“参考来源”“是否应该进入当前 SDK 主线”“Dart 当前状态”放到一张表里，防止把 Claude Code 的产品层能力直接搬成 SDK backlog。
 
-## 参考基线
+## 参考口径
 
-- Public API 基线：`/Users/th/Node/open-agent-sdk-typescript`
-- Claude Code 能力基线：`./claude-code`、`./claudecode`
-- 说明：`./claude-code` 与 `./claudecode` 当前内容高度接近，可视为同一功能面的两个本地镜像；功能盘点以 `claude-code/src/tools.ts`、`docs/claudecode-capability-index.md`、`docs/claudecode-feature-tracker.md` 为主。
-
-## 当前原则
-
-- SDK 优先，TUI 暂不纳入当前范围。
-- CLI 继续保留，但后续要逐步变成 SDK 的适配层。
-- 只把“稳定可复用的核心能力”推进到 SDK public API。
-- Claude Code 中偏产品化、强 feature-flag、强 UI 依赖的部分先不做。
+- SDK public API 基线：`/Users/th/Node/open-agent-sdk-typescript`
+- 产品能力来源：`./claude-code`、`./claudecode`
+- 当前约束：只推进 SDK，不启动 CLI/TUI 对接工作
 
 ## 能力域矩阵
 
-| 能力域 | 参考实现 | 当前 Dart 状态 | SDK 目标状态 | 目标阶段 |
+| 能力域 | 主要参考来源 | 是否纳入当前 SDK 主线 | Dart 当前状态 | 备注 |
 | --- | --- | --- | --- | --- |
-| SDK 入口 | `src/index.ts` | 已新增 `lib/clart_code_sdk.dart` | 稳定导出 agent/types/session/tool/mcp API | Phase 1-2 |
-| 高层 Agent API | `src/agent.ts` | 已有 `ClartCodeAgent`，支持 `query/prompt/clear/setModel/close/stop`；`stop()` 已会触发 provider 级 active request cancel | 继续补更完整 cancel 语义与 session/service 装配 | Phase 2-4 |
-| One-shot query API | `query({ prompt, options })` | 已补独立 top-level `query()` / `prompt()` helper | 保持便捷 one-shot 流式接口稳定 | Phase 2 |
-| Session 持久化 | `src/session.ts` | 已有 `.clart/sessions`、`ClartCodeSessionStore`，并补 `list/load/fork/rename/tag` | 继续补更完整 session 管理与共享能力 | Phase 2-3 |
-| Streaming event 协议 | `SDKMessage` | 已有 `assistant/tool_call/tool_result/result/system` 基础事件 | 继续对齐更完整生命周期与权限拒绝细节 | Phase 2-3 |
-| Provider 抽象 | `src/providers/*` | 已有 local/claude/openai provider | 保持 SDK 层独立组装与切换 | Phase 1 |
-| Query engine 主循环 | `src/engine.ts` | SDK agent 已优先消费 provider-native tool calls；OpenAI-compatible Responses 与 Claude Messages 路径原生，其他 provider 仍可回退 JSON plan | 继续补齐其他 provider 的 native tools 与更完整 agentic loop | Phase 2-3 |
-| Tool registry | `src/tools/index.ts` | 已有最小 `read/write/shell(stub)`，SDK 已暴露 tool definition/过滤选项 | 继续扩展注册、导出、MCP 注入 | Phase 2-4 |
-| Tool 调度 | Engine + tool helpers | 已有 `ToolScheduler`，且已接入 SDK agent 循环与结果回注 | 继续补权限 ask/hook/更多工具类型 | Phase 2-3 |
-| Tool 权限 | `permissionMode/canUseTool` | SDK 已支持 `allow/deny/ask`，并补 `canUseTool` | 继续补更细粒度交互式决策与持久化策略 | Phase 3 |
-| MCP tools/resources | `mcp/client.ts` + MCP tools | 已有 stdio MCP manager/client，且 `ClartCodeAgent` 可通过 `ClartCodeMcpOptions` 装载 MCP tools/resources | 继续沉淀为更完整 SDK service，并让 CLI 改消费 SDK service | Phase 3-4 |
-| Tasks | `task-tools.ts` | 已有本地 `TaskExecutor/TaskStore` | 先公开 SDK service，再决定是否做 task tool | Phase 4 |
-| Hooks | `src/hooks.ts` | SDK 已补 `SessionStart/SessionEnd/Stop`、`PreToolUse/PostToolUse/PostToolUseFailure` | 继续补更细粒度阻断/通知/权限更新 | Phase 3 |
-| Skills | `src/skills/*` | 未实现 | 先保留占位，不进 P0 | Phase 5 |
-| Subagents / team | `AgentTool/SendMessage/Team*` | 未实现 | 在 tool loop 稳定后再设计，不提前承诺 | Phase 5 |
-| Context injection | `utils/context.ts` | CLI 侧有 workspace/git/session 能力，SDK 未统一注入 | 做成 SDK service，再被 CLI/TUI 共用 | Phase 4-5 |
-| Auto-compact / token budget | `compact.ts/tokens.ts` | 未实现 | 先留接口，后补策略 | Phase 5 |
-| Config service | `ConfigTool` / agent options | 当前主要在 CLI config | 逐步拆成 SDK 可复用 config/context service | Phase 4 |
-| Web/UI adapter | examples/web + Claude Code TUI | 当前 rich/plain REPL 是 CLI 私有实现 | 暂不做；待 SDK 稳定后再重建 UI | Phase 6 |
+| SDK 入口 | `open-agent-sdk-typescript/src/index.ts` | 是 | 已完成 | `lib/clart_code_sdk.dart` 已独立导出 |
+| 高层 Agent API | `src/agent.ts` | 是 | 已完成 | `ClartCodeAgent` 已支持 `query/prompt/clear/setModel/stop/close` |
+| One-shot helper | `src/agent.ts` / examples | 是 | 已完成 | top-level `query()/prompt()` 已支持 external cancellation |
+| Session 持久化 | `src/session.ts` | 是 | 已完成 | 已支持 save/load/list/fork/rename/tag；本轮已从 CLI store 解耦 |
+| Streaming event 协议 | `src/types.ts` | 是 | 已完成 | 当前事件面已覆盖 init、delta、assistant、tool_call、tool_result、result |
+| Provider 抽象 | `src/providers/*` | 是 | 已完成 | local / Claude / OpenAI 已具备 |
+| Tool loop | `src/engine.ts` | 是 | 已完成 | 优先 provider-native tool calling，fallback JSON plan；SDK 已支持 direct custom tool registration |
+| Tool 权限 | `examples/10-permissions.ts` | 是 | 部分完成 | 已有 `allow/deny/ask`、`canUseTool` 与可扩展的 `resolveToolPermission` |
+| Lifecycle hooks | `src/hooks.ts` / `examples/13-hooks.ts` | 是 | 部分完成 | 已有 session/tool hooks；缺更细粒度事件 |
+| MCP tools/resources | `sdk-mcp-server.ts` / agent options | 是 | 部分完成 | registry 已统一；transport 语义已在 SDK 类型/runtime 上收紧到 `stdio`，CLI 收尾仍后置 |
+| Session interrupt / queued input | `src/agent.ts` / Claude Code query loop | 是 | 未完成 | 目前只有 request-scoped cancellation |
+| Session metadata convenience API | `src/session.ts` + Agent convenience | 是 | 已完成 | `ClartCodeAgent` 已支持 `snapshot/renameSession/setSessionTags/addSessionTag/removeSessionTag/forkSession` |
+| Context injection service | `src/utils/context.ts` | 以后再说 | 未开始 | 当前不应先做成产品化上下文系统 |
+| Task service | Claude Code tasks / open-agent tasks tools | 以后再说 | 未开始 | 仓库内有基础能力，但不应先公开成 SDK |
+| Skills | `src/skills/*` | 后续纳入 | 未实现 | 应做最小 public API，但排在 `tools/MCP` 之后 |
+| Subagents / Team | `examples/09-subagents.ts` | 后续纳入 | 未实现 | 只先做最小 subagent API，不追重型 team/coordinator 版本 |
+| Cron / Workflow / Monitor | Claude Code tools/tasks | 否 | 未实现 | 明显属于产品层能力 |
+| CLI commands | `claude-code/src/commands.ts` | 否 | 不在本轮范围 | 不进入当前 SDK 工作 |
+| TUI / Ink / rich UI | `claude-code/src/main.tsx` / UI 组件 | 否 | 不在本轮范围 | 不进入当前 SDK 工作 |
+| Bridge / IDE / plugin / OAuth / remote | Claude Code 产品层模块 | 否 | 不在本轮范围 | 只作为未来 service 来源，不是近期 SDK backlog |
 
-## 参考能力收缩结论
+## 结论
 
-### 必须纳入 SDK 主干的能力
+### 当前已经进入稳定主线的能力
 
-- `ClartCodeAgent` 高层 API
-- session 持久化与 resume
+- SDK 入口
+- Agent API
+- one-shot helper
+- session store
 - provider 抽象
 - tool loop
-- tool 权限
-- MCP 注入
-- lifecycle hooks
+- permission / hooks / MCP 的最小公开能力
+- external cancellation
 
-### 暂不纳入当前范围的能力
+### 当前应该继续补齐，但仍属于 SDK 主线的能力
 
-- rich/fullscreen TUI
-- 复杂 slash command UI
-- 大量 feature-flag 工具
-- monitor / workflow / push notification / browser automation 等偏产品能力
-- coordinator/team swarm 一类高复杂多代理模式
+- session-level interrupt / queued input 语义
+- 更细粒度 hooks / permission decision / cancelled terminal event
 
-### 关键依赖顺序
+### 当前不应该纳入的能力
 
-1. 先把 tool loop 做完整
-2. 再把 permission/hook 接上
-3. 再做 MCP/task/context service
-4. 最后再让 CLI 改用 SDK
+- CLI 命令迁移
+- TUI / rich 输入编辑 / slash command UI
+- workflow / cron / monitor / browser / notification
+- IDE / plugin / OAuth / bridge / remote sessions
+- 重型 team/coordinator/swarm 模式
 
-如果顺序反过来，CLI/TUI 会继续把底层能力绑死，SDK 只是薄壳。
+## 使用规则
+
+后续每次继续 SDK 工作时，优先先问三个问题：
+
+1. 这是 `open-agent-sdk-typescript` 意义上的 SDK public API 吗？
+2. 这项能力如果不做，是否会让 `ClartCodeAgent` 的程序化调用明显缺口？
+3. 这项能力是否其实属于 Claude Code 的产品层，而不是 SDK 主干？
+
+如果第 3 个问题答案是“是”，当前默认不做。

@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'package:test/test.dart';
 import 'package:clart_code/src/mcp/mcp_manager.dart';
@@ -26,7 +27,7 @@ void main() {
     });
 
     test('saveRegistry() and loadRegistry() persist configurations', () async {
-      final configs = {
+      final configs = <String, McpServerConfig>{
         'test-server': McpStdioServerConfig(
           name: 'test-server',
           command: 'node',
@@ -39,10 +40,90 @@ void main() {
 
       final loaded = await manager.loadRegistry();
       expect(loaded, hasLength(1));
-      expect(loaded['test-server']?.name, 'test-server');
-      expect(loaded['test-server']?.command, 'node');
-      expect(loaded['test-server']?.args, ['server.js']);
-      expect(loaded['test-server']?.env, {'KEY': 'value'});
+      final config = loaded['test-server'];
+      expect(config, isA<McpStdioServerConfig>());
+      expect(config?.name, 'test-server');
+      expect((config as McpStdioServerConfig).command, 'node');
+      expect(config.args, ['server.js']);
+      expect(config.env, {'KEY': 'value'});
+    });
+
+    test('loadRegistry() parses legacy CLI list format', () async {
+      final file = File(registryPath);
+      await file.writeAsString(jsonEncode([
+        {
+          'name': 'legacy',
+          'transport': 'stdio',
+          'target': 'node server.js',
+        },
+      ]));
+
+      final loaded = await manager.loadRegistry();
+      final config = loaded['legacy'];
+      expect(config, isA<McpStdioServerConfig>());
+      expect((config as McpStdioServerConfig).command, 'node');
+      expect(config.args, ['server.js']);
+    });
+
+    test('loadRegistry() keeps recognized but unsupported transports',
+        () async {
+      final file = File(registryPath);
+      await file.writeAsString(jsonEncode({
+        'mcpServers': {
+          'remote': {
+            'type': 'http',
+            'url': 'https://example.com/mcp',
+          },
+        },
+      }));
+
+      final loaded = await manager.loadRegistry();
+      final config = loaded['remote'];
+      expect(config, isA<McpHttpServerConfig>());
+      expect(config?.transportType, McpTransportType.http);
+      expect(config?.isRuntimeSupported, isFalse);
+      expect(
+        config?.runtimeUnsupportedReason,
+        contains('current Dart runtime supports: stdio'),
+      );
+    });
+
+    test('loadRegistry() wraps malformed registry errors', () async {
+      final file = File(registryPath);
+      await file.writeAsString('{"mcpServers": []}');
+
+      await expectLater(
+        manager.loadRegistry(),
+        throwsA(
+          isA<Exception>().having(
+            (error) => error.toString(),
+            'message',
+            contains('Failed to load MCP registry'),
+          ),
+        ),
+      );
+    });
+
+    test('connect() marks unsupported transports as failed', () async {
+      final connection = await manager.connect(
+        const McpHttpServerConfig(
+          name: 'remote',
+          url: 'https://example.com/mcp',
+        ),
+      );
+
+      expect(connection.status, McpServerStatus.failed);
+      expect(connection.error, contains('unsupported MCP transport'));
+      expect(
+          connection.error, contains('current Dart runtime supports: stdio'));
+    });
+
+    test('manager exposes recognized vs runtime supported transports', () {
+      expect(
+        manager.recognizedTransportTypes,
+        containsAll(McpTransportType.values),
+      );
+      expect(manager.supportedTransportTypes, [McpTransportType.stdio]);
     });
 
     test('getConnection() returns null for non-existent server', () {

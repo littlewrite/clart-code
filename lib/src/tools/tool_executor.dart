@@ -15,13 +15,23 @@ class ToolExecutor {
   final ToolScheduler scheduler;
   final ToolPermissionPolicy permissionPolicy;
 
-  factory ToolExecutor.minimal({
+  factory ToolExecutor.fromTools(
+    Iterable<Tool> tools, {
+    ToolScheduler scheduler = const ToolScheduler(),
     ToolPermissionPolicy permissionPolicy = const ToolPermissionPolicy(),
   }) {
     return ToolExecutor(
-      registry: ToolRegistry(
-        tools: [ReadTool(), WriteTool(), ShellStubTool()],
-      ),
+      registry: ToolRegistry(tools: tools.toList(growable: false)),
+      scheduler: scheduler,
+      permissionPolicy: permissionPolicy,
+    );
+  }
+
+  factory ToolExecutor.minimal({
+    ToolPermissionPolicy permissionPolicy = const ToolPermissionPolicy(),
+  }) {
+    return ToolExecutor.fromTools(
+      [ReadTool(), WriteTool(), ShellStubTool()],
       permissionPolicy: permissionPolicy,
     );
   }
@@ -35,6 +45,12 @@ class ToolExecutor {
       registry: registry ?? this.registry,
       scheduler: scheduler ?? this.scheduler,
       permissionPolicy: permissionPolicy ?? this.permissionPolicy,
+    );
+  }
+
+  ToolExecutor withAdditionalTools(Iterable<Tool> tools) {
+    return copyWith(
+      registry: registry.merged(tools),
     );
   }
 

@@ -4,7 +4,39 @@ import 'tool_registry.dart';
 
 enum ToolPermissionDecision { allow, deny }
 
-typedef ToolPermissionResolver = Future<ToolPermissionDecision> Function(
+class ToolPermissionResolution {
+  const ToolPermissionResolution._({
+    required this.decision,
+    this.message,
+    this.invocation,
+  });
+
+  factory ToolPermissionResolution.allow({
+    ToolInvocation? invocation,
+    String? message,
+  }) {
+    return ToolPermissionResolution._(
+      decision: ToolPermissionDecision.allow,
+      message: message,
+      invocation: invocation,
+    );
+  }
+
+  factory ToolPermissionResolution.deny({
+    String? message,
+  }) {
+    return ToolPermissionResolution._(
+      decision: ToolPermissionDecision.deny,
+      message: message,
+    );
+  }
+
+  final ToolPermissionDecision decision;
+  final String? message;
+  final ToolInvocation? invocation;
+}
+
+typedef ToolPermissionResolver = Future<ToolPermissionResolution> Function(
     ToolInvocation invocation);
 
 typedef ToolExecutionHook = Future<void> Function(ToolInvocation invocation);
@@ -71,18 +103,20 @@ class ToolScheduler {
     }
 
     for (var index = 0; index < invocations.length; index++) {
-      final invocation = invocations[index];
-      final permissionFailure = await _resolvePermissionFailure(
-        invocation: invocation,
+      final requestedInvocation = invocations[index];
+      final permissionResult = await _resolvePermission(
+        invocation: requestedInvocation,
         permissionPolicy: permissionPolicy,
         permissionResolver: permissionResolver,
       );
+      final permissionFailure = permissionResult.failure;
       if (permissionFailure != null) {
         await flushParallelSafeBatch();
         results[index] = permissionFailure;
         continue;
       }
 
+      final invocation = permissionResult.invocation;
       final tool = registry.lookup(invocation.name);
       if (tool == null) {
         await flushParallelSafeBatch();
@@ -141,54 +175,100 @@ class ToolScheduler {
     }
   }
 
-  Future<ToolExecutionResult?> _resolvePermissionFailure({
+  Future<_ResolvedToolPermission> _resolvePermission({
     required ToolInvocation invocation,
     required ToolPermissionPolicy permissionPolicy,
     required ToolPermissionResolver? permissionResolver,
   }) async {
     if (permissionPolicy.canExecute(invocation.name)) {
       if (permissionResolver == null) {
-        return null;
+        return _ResolvedToolPermission.allow(invocation);
       }
 
-      final decision = await permissionResolver(invocation);
-      if (decision == ToolPermissionDecision.allow) {
-        return null;
+      final resolution = await permissionResolver(invocation);
+      if (resolution.decision == ToolPermissionDecision.allow) {
+        return _ResolvedToolPermission.allow(
+          resolution.invocation ?? invocation,
+        );
       }
 
-      return ToolExecutionResult.failure(
-        tool: invocation.name,
-        errorCode: 'permission_denied',
-        errorMessage: 'tool execution was rejected by permission resolver',
+      return _ResolvedToolPermission.deny(
+        invocation: invocation,
+        message: resolution.message ??
+            'tool execution was rejected by permission resolver',
       );
     }
 
     if (!permissionPolicy.shouldAsk(invocation.name)) {
-      return ToolExecutionResult.failure(
-        tool: invocation.name,
-        errorCode: 'permission_denied',
-        errorMessage: 'tool execution is denied by current policy',
+      return _ResolvedToolPermission.deny(
+        invocation: invocation,
+        message: 'tool execution is denied by current policy',
       );
     }
 
     if (permissionResolver == null) {
-      return ToolExecutionResult.failure(
-        tool: invocation.name,
+      return _ResolvedToolPermission.failure(
+        invocation: invocation,
         errorCode: 'permission_prompt_unavailable',
         errorMessage:
             'tool execution requires approval but no resolver is available',
       );
     }
 
-    final decision = await permissionResolver(invocation);
-    if (decision == ToolPermissionDecision.allow) {
-      return null;
+    final resolution = await permissionResolver(invocation);
+    if (resolution.decision == ToolPermissionDecision.allow) {
+      return _ResolvedToolPermission.allow(
+        resolution.invocation ?? invocation,
+      );
     }
 
-    return ToolExecutionResult.failure(
-      tool: invocation.name,
-      errorCode: 'permission_denied',
-      errorMessage: 'tool execution was rejected by permission resolver',
+    return _ResolvedToolPermission.deny(
+      invocation: invocation,
+      message: resolution.message ??
+          'tool execution was rejected by permission resolver',
     );
   }
+}
+
+class _ResolvedToolPermission {
+  const _ResolvedToolPermission({
+    required this.invocation,
+    this.failure,
+  });
+
+  factory _ResolvedToolPermission.allow(ToolInvocation invocation) {
+    return _ResolvedToolPermission(invocation: invocation);
+  }
+
+  factory _ResolvedToolPermission.deny({
+    required ToolInvocation invocation,
+    required String message,
+  }) {
+    return _ResolvedToolPermission(
+      invocation: invocation,
+      failure: ToolExecutionResult.failure(
+        tool: invocation.name,
+        errorCode: 'permission_denied',
+        errorMessage: message,
+      ),
+    );
+  }
+
+  factory _ResolvedToolPermission.failure({
+    required ToolInvocation invocation,
+    required String errorCode,
+    required String errorMessage,
+  }) {
+    return _ResolvedToolPermission(
+      invocation: invocation,
+      failure: ToolExecutionResult.failure(
+        tool: invocation.name,
+        errorCode: errorCode,
+        errorMessage: errorMessage,
+      ),
+    );
+  }
+
+  final ToolInvocation invocation;
+  final ToolExecutionResult? failure;
 }

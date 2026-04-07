@@ -5,6 +5,7 @@
 - 保留现有 CLI。
 - 新增独立 SDK 入口，避免 TUI 继续绑定底层执行链。
 - 先把 `ClartCodeAgent` 做成稳定的高层封装，再让 CLI/TUI 逐步退化为适配层。
+- 除非用户明确提出，否则当前工作默认只推进 SDK，不启动 CLI 对接 SDK 的落地工作。
 
 ## 新入口
 
@@ -19,6 +20,8 @@
 ## 配套文档
 
 - 功能矩阵：`docs/clart-code-sdk-feature-matrix.md`
+- 能力审计：`docs/clart-code-sdk-capability-audit.md`
+- 下一阶段能力规划：`docs/clart-code-sdk-next-capabilities-plan.md`
 - 路线图：`docs/clart-code-sdk-roadmap.md`
 - 工作日志：`docs/clart-code-sdk-worklog.md`
 
@@ -54,6 +57,13 @@
 - 仓库内部已经有 tool、MCP、task 的最小实现。
 - 但当前 LLM 调用主链还没有把“模型输出 -> tool use -> tool result -> 再入模型”完整挂到 SDK agent 循环里。
 - 所以 Phase 1 先把 Agent、Session、Stream 协议立住，不伪装成已经完成工具闭环。
+
+## 本轮纠偏
+
+- SDK 的 session 持久化继续复用 `.clart/sessions/<id>.json` 与 `active_session.json` 格式。
+- 但 SDK 不再直接依赖 CLI 的 `workspace_store.dart` 实现。
+- 后续如果 CLI 与 SDK 共享存储格式，只共享格式，不共享 CLI 私有模块。
+- 参考 `./claude-code`、`./claudecode` 时，只把它们当作能力来源，不把其产品层能力直接映射成 SDK 近期 backlog。
 
 ## 后续阶段建议
 

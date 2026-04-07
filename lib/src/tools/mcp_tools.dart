@@ -48,10 +48,16 @@ class McpToolWrapper implements Tool {
   String get name => mcpTool.name;
 
   @override
+  String? get title => null;
+
+  @override
   String get description => mcpTool.description;
 
   @override
   Map<String, Object?>? get inputSchema => mcpTool.inputSchema;
+
+  @override
+  Map<String, Object?>? get annotations => null;
 
   @override
   ToolExecutionHint get executionHint => ToolExecutionHint.serialOnly;
@@ -125,6 +131,9 @@ class McpReadResourceTool implements Tool {
   String get name => 'mcp_read_resource';
 
   @override
+  String? get title => null;
+
+  @override
   String get description =>
       'Read content from an MCP resource. Use format: server://resource_uri';
 
@@ -139,6 +148,9 @@ class McpReadResourceTool implements Tool {
         },
         'required': ['uri'],
       };
+
+  @override
+  Map<String, Object?>? get annotations => null;
 
   @override
   ToolExecutionHint get executionHint => ToolExecutionHint.serialOnly;
@@ -182,6 +194,9 @@ class McpListResourcesTool implements Tool {
   String get name => 'mcp_list_resources';
 
   @override
+  String? get title => null;
+
+  @override
   String get description =>
       'List all available MCP resources from connected servers';
 
@@ -190,6 +205,9 @@ class McpListResourcesTool implements Tool {
         'type': 'object',
         'properties': {},
       };
+
+  @override
+  Map<String, Object?>? get annotations => null;
 
   @override
   ToolExecutionHint get executionHint => ToolExecutionHint.parallelSafe;

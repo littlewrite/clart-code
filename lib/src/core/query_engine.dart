@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'models.dart';
 import 'runtime_error.dart';
 import '../runtime/app_runtime.dart';
@@ -18,6 +20,14 @@ class QueryEngine {
   /// Applies security checks before execution and handles provider errors
   /// with automatic retry classification.
   Future<QueryResponse> run(QueryRequest request) async {
+    if (_isRequestCancelled(request)) {
+      runtime.telemetry.logEvent('query_cancelled');
+      return QueryResponse.failure(
+        error: _buildCancelledRuntimeError(request),
+        output: _formatCancelledOutput(request),
+      );
+    }
+
     final userText = request.messages
         .where((m) => m.role == MessageRole.user)
         .map((m) => m.text)
@@ -37,8 +47,24 @@ class QueryEngine {
     }
 
     runtime.telemetry.logEvent('query_started');
+    StreamSubscription<void>? cancelSub;
+    if (request.cancellationSignal != null) {
+      cancelSub = request.cancellationSignal!.onCancel.listen((_) {
+        unawaited(runtime.provider.cancelActiveRequest());
+      });
+    }
     try {
       final result = await runtime.provider.run(request);
+      if (_isRequestCancelled(request)) {
+        runtime.telemetry.logEvent('query_cancelled');
+        return QueryResponse.failure(
+          error: _buildCancelledRuntimeError(request),
+          output: _formatCancelledOutput(request),
+          modelUsed: result.modelUsed,
+          toolCalls: result.toolCalls,
+          providerStateToken: result.providerStateToken,
+        );
+      }
       runtime.telemetry.logEvent('query_completed');
       return result;
     } catch (error, stackTrace) {
@@ -57,6 +83,8 @@ class QueryEngine {
         ),
         output: '[ERROR] provider execution failed',
       );
+    } finally {
+      await cancelSub?.cancel();
     }
   }
 
@@ -65,6 +93,15 @@ class QueryEngine {
   /// Applies security checks and emits [ProviderStreamEvent]s for incremental
   /// text deltas, completion, or errors.
   Stream<ProviderStreamEvent> runStream(QueryRequest request) async* {
+    if (_isRequestCancelled(request)) {
+      runtime.telemetry.logEvent('query_cancelled');
+      yield ProviderStreamEvent.error(
+        error: _buildCancelledRuntimeError(request),
+        output: _formatCancelledOutput(request),
+      );
+      return;
+    }
+
     final userText = request.messages
         .where((m) => m.role == MessageRole.user)
         .map((m) => m.text)
@@ -85,9 +122,28 @@ class QueryEngine {
     }
 
     runtime.telemetry.logEvent('query_started');
+    StreamSubscription<void>? cancelSub;
+    if (request.cancellationSignal != null) {
+      cancelSub = request.cancellationSignal!.onCancel.listen((_) {
+        unawaited(runtime.provider.cancelActiveRequest());
+      });
+    }
     try {
+      var emittedTerminalEvent = false;
       await for (final event in runtime.provider.stream(request)) {
+        if (event.type == ProviderStreamEventType.done ||
+            event.type == ProviderStreamEventType.error) {
+          emittedTerminalEvent = true;
+        }
         yield event;
+      }
+      if (!emittedTerminalEvent && _isRequestCancelled(request)) {
+        runtime.telemetry.logEvent('query_cancelled');
+        yield ProviderStreamEvent.error(
+          error: _buildCancelledRuntimeError(request),
+          output: _formatCancelledOutput(request),
+        );
+        return;
       }
       runtime.telemetry.logEvent('query_completed');
     } catch (error, stackTrace) {
@@ -105,7 +161,27 @@ class QueryEngine {
         ),
         output: '[ERROR] provider execution failed',
       );
+    } finally {
+      await cancelSub?.cancel();
     }
+  }
+
+  bool _isRequestCancelled(QueryRequest request) {
+    return request.cancellationSignal?.isCancelled ?? false;
+  }
+
+  RuntimeError _buildCancelledRuntimeError(QueryRequest request) {
+    final reason = request.cancellationSignal?.reason?.trim();
+    return RuntimeError(
+      code: RuntimeErrorCode.cancelled,
+      message: reason == null || reason.isEmpty ? 'request cancelled' : reason,
+      source: 'query_engine',
+      retriable: false,
+    );
+  }
+
+  String _formatCancelledOutput(QueryRequest request) {
+    return '[STOPPED] request cancelled';
   }
 
   bool _isRetriableError(Object error) {

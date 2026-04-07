@@ -1,4 +1,6 @@
-import '../cli/workspace_store.dart';
+import 'dart:convert';
+import 'dart:io';
+
 import '../core/models.dart';
 import '../core/transcript.dart';
 
@@ -25,34 +27,89 @@ class ClartCodeSessionSnapshot {
   final List<TranscriptMessage> transcript;
   final List<String> tags;
 
-  factory ClartCodeSessionSnapshot.fromWorkspace(
-    WorkspaceSessionSnapshot snapshot,
-  ) {
+  factory ClartCodeSessionSnapshot.build({
+    required String id,
+    required String provider,
+    String? model,
+    required List<ChatMessage> history,
+    required List<TranscriptMessage> transcript,
+    String? createdAt,
+    String? updatedAt,
+    String? title,
+    List<String> tags = const [],
+  }) {
+    final now = DateTime.now().toUtc().toIso8601String();
     return ClartCodeSessionSnapshot(
-      id: snapshot.id,
-      title: snapshot.title,
-      createdAt: snapshot.createdAt,
-      updatedAt: snapshot.updatedAt,
-      provider: snapshot.provider,
-      model: snapshot.model,
-      history: List<ChatMessage>.from(snapshot.history),
-      transcript: List<TranscriptMessage>.from(snapshot.transcript),
-      tags: List<String>.from(snapshot.tags),
-    );
-  }
-
-  WorkspaceSessionSnapshot toWorkspaceSnapshot() {
-    return WorkspaceSessionSnapshot(
       id: id,
-      title: title,
-      createdAt: createdAt,
-      updatedAt: updatedAt,
+      title: title ?? _buildSessionTitle(transcript, history),
+      createdAt: createdAt ?? now,
+      updatedAt: updatedAt ?? now,
       provider: provider,
       model: model,
       history: List<ChatMessage>.from(history),
       transcript: List<TranscriptMessage>.from(transcript),
-      tags: List<String>.from(tags),
+      tags: List<String>.unmodifiable(tags),
     );
+  }
+
+  factory ClartCodeSessionSnapshot.fromJson(Map<String, Object?> json) {
+    return ClartCodeSessionSnapshot(
+      id: json['id'] as String? ?? '',
+      title: json['title'] as String? ?? '',
+      createdAt: json['createdAt'] as String? ?? '',
+      updatedAt: json['updatedAt'] as String? ?? '',
+      provider: json['provider'] as String? ?? 'local',
+      model: json['model'] as String?,
+      history: (json['history'] as List? ?? const [])
+          .whereType<Map>()
+          .map(
+            (item) => _chatMessageFromJson(
+              Map<String, Object?>.from(item.cast<String, Object?>()),
+            ),
+          )
+          .toList(growable: false),
+      transcript: (json['transcript'] as List? ?? const [])
+          .whereType<Map>()
+          .map(
+            (item) => _transcriptMessageFromJson(
+              Map<String, Object?>.from(item.cast<String, Object?>()),
+            ),
+          )
+          .toList(growable: false),
+      tags: (json['tags'] as List? ?? const [])
+          .whereType<String>()
+          .map((tag) => tag.trim())
+          .where((tag) => tag.isNotEmpty)
+          .toList(growable: false),
+    );
+  }
+
+  Map<String, Object?> toJson() {
+    return {
+      'id': id,
+      'title': title,
+      'createdAt': createdAt,
+      'updatedAt': updatedAt,
+      'provider': provider,
+      'model': model,
+      'tags': tags,
+      'history': history
+          .map(
+            (message) => {
+              'role': message.role.name,
+              'text': message.text,
+            },
+          )
+          .toList(growable: false),
+      'transcript': transcript
+          .map(
+            (message) => {
+              'kind': message.kind.name,
+              'text': message.text,
+            },
+          )
+          .toList(growable: false),
+    };
   }
 
   ClartCodeSessionSnapshot copyWith({
@@ -87,24 +144,53 @@ class ClartCodeSessionStore {
 
   final String? cwd;
 
-  String createSessionId() => createWorkspaceSessionId();
+  String createSessionId() =>
+      DateTime.now().toUtc().microsecondsSinceEpoch.toString();
 
   void save(ClartCodeSessionSnapshot snapshot) {
-    writeWorkspaceSession(snapshot.toWorkspaceSnapshot(), cwd: cwd);
+    _ensureSessionsDir();
+    File(_sessionPath(snapshot.id)).writeAsStringSync(
+      const JsonEncoder.withIndent('  ').convert(snapshot.toJson()),
+    );
+    _writeActiveSessionId(snapshot.id);
   }
 
   ClartCodeSessionSnapshot? load(String sessionId) {
-    final snapshot = readWorkspaceSession(sessionId, cwd: cwd);
-    if (snapshot == null) {
+    final file = File(_sessionPath(sessionId));
+    if (!file.existsSync()) {
       return null;
     }
-    return ClartCodeSessionSnapshot.fromWorkspace(snapshot);
+    try {
+      final decoded = jsonDecode(file.readAsStringSync());
+      if (decoded is Map<String, dynamic>) {
+        return ClartCodeSessionSnapshot.fromJson(
+          Map<String, Object?>.from(decoded),
+        );
+      }
+    } catch (_) {
+      // Keep session restore resilient if a file is malformed.
+    }
+    return null;
   }
 
   List<ClartCodeSessionSnapshot> list() {
-    return listWorkspaceSessions(cwd: cwd)
-        .map(ClartCodeSessionSnapshot.fromWorkspace)
-        .toList();
+    final dir = Directory(_sessionsDirPath);
+    if (!dir.existsSync()) {
+      return const [];
+    }
+    final snapshots = <ClartCodeSessionSnapshot>[];
+    for (final entity in dir.listSync()) {
+      if (entity is! File || !entity.path.endsWith('.json')) {
+        continue;
+      }
+      final id = entity.uri.pathSegments.last.replaceAll('.json', '');
+      final snapshot = load(id);
+      if (snapshot != null) {
+        snapshots.add(snapshot);
+      }
+    }
+    snapshots.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    return snapshots;
   }
 
   ClartCodeSessionSnapshot? fork(
@@ -186,7 +272,45 @@ class ClartCodeSessionStore {
   }
 
   String? readActiveSessionId() {
-    return readActiveWorkspaceSessionId(cwd: cwd);
+    final file = File(_activeSessionPath);
+    if (!file.existsSync()) {
+      return null;
+    }
+    try {
+      final decoded = jsonDecode(file.readAsStringSync());
+      if (decoded is Map<String, dynamic>) {
+        final id = decoded['id'] as String?;
+        if (id != null && id.trim().isNotEmpty) {
+          return id.trim();
+        }
+      }
+    } catch (_) {
+      // Fall back to null on malformed files.
+    }
+    return null;
+  }
+
+  String get _workspaceDataDir => '${cwd ?? Directory.current.path}/.clart';
+
+  String get _sessionsDirPath => '$_workspaceDataDir/sessions';
+
+  String get _activeSessionPath => '$_workspaceDataDir/active_session.json';
+
+  String _sessionPath(String id) => '$_sessionsDirPath/$id.json';
+
+  void _ensureWorkspaceDataDir() {
+    Directory(_workspaceDataDir).createSync(recursive: true);
+  }
+
+  void _ensureSessionsDir() {
+    Directory(_sessionsDirPath).createSync(recursive: true);
+  }
+
+  void _writeActiveSessionId(String id) {
+    _ensureWorkspaceDataDir();
+    File(_activeSessionPath).writeAsStringSync(
+      const JsonEncoder.withIndent('  ').convert({'id': id}),
+    );
   }
 
   List<String> _normalizeTags(List<String> tags) {
@@ -207,3 +331,72 @@ typedef ClatCodeSessionSnapshot = ClartCodeSessionSnapshot;
 
 @Deprecated('Use ClartCodeSessionStore instead.')
 typedef ClatCodeSessionStore = ClartCodeSessionStore;
+
+ChatMessage _chatMessageFromJson(Map<String, Object?> json) {
+  return ChatMessage(
+    role: _parseMessageRole(json['role'] as String?) ?? MessageRole.user,
+    text: json['text'] as String? ?? '',
+  );
+}
+
+MessageRole? _parseMessageRole(String? raw) {
+  switch (raw) {
+    case 'system':
+      return MessageRole.system;
+    case 'user':
+      return MessageRole.user;
+    case 'assistant':
+      return MessageRole.assistant;
+    case 'tool':
+      return MessageRole.tool;
+    default:
+      return null;
+  }
+}
+
+TranscriptMessage _transcriptMessageFromJson(Map<String, Object?> json) {
+  final text = json['text'] as String? ?? '';
+  switch (json['kind'] as String?) {
+    case 'userPrompt':
+      return TranscriptMessage.userPrompt(text);
+    case 'localCommand':
+      return TranscriptMessage.localCommand(text);
+    case 'localCommandStdout':
+      return TranscriptMessage.localCommandStdout(text);
+    case 'localCommandStderr':
+      return TranscriptMessage.localCommandStderr(text);
+    case 'assistant':
+      return TranscriptMessage.assistant(text);
+    case 'toolResult':
+      return TranscriptMessage.toolResult(text);
+    case 'system':
+    default:
+      return TranscriptMessage.system(text);
+  }
+}
+
+String _buildSessionTitle(
+  List<TranscriptMessage> transcript,
+  List<ChatMessage> history,
+) {
+  for (final message in transcript) {
+    if (message.kind == TranscriptMessageKind.userPrompt &&
+        message.text.trim().isNotEmpty) {
+      return _truncateSessionTitle(message.text.trim());
+    }
+  }
+  for (final message in history) {
+    if (message.role == MessageRole.user && message.text.trim().isNotEmpty) {
+      return _truncateSessionTitle(message.text.trim());
+    }
+  }
+  return 'Session ${DateTime.now().toUtc().toIso8601String()}';
+}
+
+String _truncateSessionTitle(String raw) {
+  final collapsed = raw.replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (collapsed.length <= 60) {
+    return collapsed;
+  }
+  return '${collapsed.substring(0, 57)}...';
+}

@@ -48,10 +48,16 @@ class _RecordingTool implements Tool {
   final String name;
 
   @override
+  String? get title => null;
+
+  @override
   String get description => 'test tool $name';
 
   @override
   Map<String, Object?>? get inputSchema => null;
+
+  @override
+  Map<String, Object?>? get annotations => null;
 
   @override
   final ToolExecutionHint executionHint;
@@ -721,6 +727,22 @@ void main() {
       expect(result, isNotNull);
       expect(result!.status, 'Displayed MCP servers.');
       expect(result.messages.single.text, 'local\tstdio\tnode server.js');
+
+      final registry = jsonDecode(
+        File('${tempDir.path}/.clart/mcp_servers.json').readAsStringSync(),
+      ) as Map<String, dynamic>;
+      expect(
+        registry,
+        {
+          'mcpServers': {
+            'local': {
+              'type': 'stdio',
+              'command': 'node',
+              'args': ['server.js'],
+            },
+          },
+        },
+      );
     } finally {
       Directory.current = oldCwd;
       if (tempDir.existsSync()) {
@@ -1018,6 +1040,17 @@ void main() {
       expect(decoded['memory'], 'remember this');
       expect(decoded['tasks'] as List<dynamic>, hasLength(1));
       expect(decoded['mcpServers'] as List<dynamic>, hasLength(1));
+
+      final registry = jsonDecode(
+        await File('${tempDir.path}/.clart/mcp_servers.json').readAsString(),
+      ) as Map<String, dynamic>;
+      expect(registry['mcpServers'] as Map<String, dynamic>, {
+        'local': {
+          'type': 'stdio',
+          'command': 'node',
+          'args': ['server.js'],
+        },
+      });
     } finally {
       Directory.current = oldCwd;
       if (tempDir.existsSync()) {
@@ -1333,7 +1366,7 @@ void main() {
     );
 
     final results = await scheduler.runBatch(
-      invocations: const [
+      invocations: [
         ToolInvocation(name: 'read_a'),
         ToolInvocation(name: 'read_b'),
         ToolInvocation(name: 'write_mid'),

@@ -7,6 +7,9 @@ class ReadTool implements Tool {
   String get name => 'read';
 
   @override
+  String? get title => null;
+
+  @override
   String get description => 'Read a UTF-8 text file from the local filesystem.';
 
   @override
@@ -20,6 +23,9 @@ class ReadTool implements Tool {
         },
         'required': ['path'],
       };
+
+  @override
+  Map<String, Object?>? get annotations => null;
 
   @override
   ToolExecutionHint get executionHint => ToolExecutionHint.parallelSafe;
@@ -62,6 +68,9 @@ class WriteTool implements Tool {
   String get name => 'write';
 
   @override
+  String? get title => null;
+
+  @override
   String get description => 'Write UTF-8 text content to a local file path.';
 
   @override
@@ -79,6 +88,9 @@ class WriteTool implements Tool {
         },
         'required': ['path', 'content'],
       };
+
+  @override
+  Map<String, Object?>? get annotations => null;
 
   @override
   ToolExecutionHint get executionHint => ToolExecutionHint.serialOnly;
@@ -122,6 +134,9 @@ class ShellStubTool implements Tool {
   String get name => 'shell';
 
   @override
+  String? get title => null;
+
+  @override
   String get description =>
       'Run a shell command. This SDK phase currently returns a stubbed result.';
 
@@ -136,6 +151,9 @@ class ShellStubTool implements Tool {
         },
         'required': ['command'],
       };
+
+  @override
+  Map<String, Object?>? get annotations => null;
 
   @override
   ToolExecutionHint get executionHint => ToolExecutionHint.serialOnly;

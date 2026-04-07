@@ -8,9 +8,17 @@ class MockTool implements Tool {
   @override
   final String name;
 
+  @override
+  String? get title => null;
+
+  @override
   String get description => 'Mock tool';
 
+  @override
   Map<String, Object?>? get inputSchema => null;
+
+  @override
+  Map<String, Object?>? get annotations => null;
 
   @override
   ToolExecutionHint get executionHint => ToolExecutionHint.parallelSafe;
@@ -76,7 +84,8 @@ void main() {
     });
 
     test('unregister() removes a tool', () {
-      final registry = ToolRegistry(tools: [MockTool('tool1'), MockTool('tool2')]);
+      final registry =
+          ToolRegistry(tools: [MockTool('tool1'), MockTool('tool2')]);
       registry.unregister('tool1');
 
       expect(registry.lookup('tool1'), isNull);
@@ -89,6 +98,25 @@ void main() {
       registry.unregister('non-existent');
 
       expect(registry.all, hasLength(1));
+    });
+
+    test('copy() creates an independent registry', () {
+      final registry = ToolRegistry(tools: [MockTool('tool1')]);
+      final copied = registry.copy();
+
+      copied.register(MockTool('tool2'));
+
+      expect(registry.lookup('tool2'), isNull);
+      expect(copied.lookup('tool2'), isNotNull);
+    });
+
+    test('merged() appends extra tools without mutating original registry', () {
+      final registry = ToolRegistry(tools: [MockTool('tool1')]);
+      final merged = registry.merged([MockTool('tool2')]);
+
+      expect(registry.lookup('tool2'), isNull);
+      expect(merged.lookup('tool1'), isNotNull);
+      expect(merged.lookup('tool2'), isNotNull);
     });
   });
 }
