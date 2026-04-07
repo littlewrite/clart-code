@@ -28,10 +28,18 @@ class ToolExecutor {
   }
 
   factory ToolExecutor.minimal({
+    String? cwd,
     ToolPermissionPolicy permissionPolicy = const ToolPermissionPolicy(),
   }) {
     return ToolExecutor.fromTools(
-      [ReadTool(), WriteTool(), ShellStubTool()],
+      [
+        ReadTool(cwd: cwd),
+        WriteTool(cwd: cwd),
+        EditTool(cwd: cwd),
+        GlobTool(cwd: cwd),
+        GrepTool(cwd: cwd),
+        ShellTool(cwd: cwd),
+      ],
       permissionPolicy: permissionPolicy,
     );
   }

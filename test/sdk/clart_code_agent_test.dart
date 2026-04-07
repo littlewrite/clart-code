@@ -215,9 +215,94 @@ void main() {
             .length,
         2,
       );
+      final canonicalTempDir =
+          Directory(tempDir.path).resolveSymbolicLinksSync();
       expect(result.text, contains('write=true'));
       expect(result.text, contains('shell=true'));
-      expect(result.text, contains('[NOT_IMPLEMENTED] shell tool is stubbed'));
+      expect(result.text, contains('shell_output=$canonicalTempDir'));
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('prompt executes edit glob and grep tools', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_builtin_batch_',
+    );
+    final note = File('${tempDir.path}/note.txt');
+    await note.writeAsString('alpha beta gamma');
+    await Directory('${tempDir.path}/nested').create(recursive: true);
+    await File('${tempDir.path}/nested/one.txt').writeAsString('first');
+    await File('${tempDir.path}/nested/two.md').writeAsString('second');
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          providerOverride: _ScriptedToolLoopProvider((request) {
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            if (toolPayloads.isEmpty) {
+              return QueryResponse.success(
+                output: jsonEncode({
+                  'tool_calls': [
+                    {
+                      'id': 'call_edit_1',
+                      'name': 'edit',
+                      'input': {
+                        'path': 'note.txt',
+                        'oldText': 'beta',
+                        'newText': 'BETA',
+                      },
+                    },
+                    {
+                      'id': 'call_glob_1',
+                      'name': 'glob',
+                      'input': {'pattern': '**/*.txt'},
+                    },
+                    {
+                      'id': 'call_grep_1',
+                      'name': 'grep',
+                      'input': {
+                        'pattern': 'BETA',
+                        'path': 'note.txt',
+                      },
+                    },
+                  ],
+                }),
+                modelUsed: 'tool-mock',
+              );
+            }
+
+            final editPayload = toolPayloads.firstWhere(
+              (payload) => payload['tool'] == 'edit',
+            );
+            final globPayload = toolPayloads.firstWhere(
+              (payload) => payload['tool'] == 'glob',
+            );
+            final grepPayload = toolPayloads.firstWhere(
+              (payload) => payload['tool'] == 'grep',
+            );
+            return QueryResponse.success(
+              output:
+                  'edit=${editPayload['ok']} glob=${globPayload['output']} grep=${grepPayload['output']}',
+              modelUsed: 'tool-mock',
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.prompt('update and search');
+
+      expect(result.isError, false);
+      expect(await note.readAsString(), 'alpha BETA gamma');
+      expect(result.text, contains('edit=true'));
+      expect(result.text, contains('nested/one.txt'));
+      expect(result.text, contains('note.txt:1:alpha BETA gamma'));
     } finally {
       if (tempDir.existsSync()) {
         tempDir.deleteSync(recursive: true);
@@ -428,6 +513,92 @@ void main() {
     }
   });
 
+  test('model turn hooks and permission decision hooks expose turn lifecycle',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_turn_hooks_');
+    final file = File('${tempDir.path}/turn.txt');
+    await file.writeAsString('turn body');
+
+    try {
+      final lifecycle = <String>[];
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          allowedTools: const ['read'],
+          permissionMode: ToolPermissionMode.ask,
+          canUseTool: (toolCall, context) {
+            lifecycle.add('can:${context.turn}:${toolCall.name}');
+            return true;
+          },
+          hooks: ClartCodeAgentHooks(
+            onModelTurnStart: (event) {
+              lifecycle.add(
+                'turn_start:${event.turn}:${event.availableTools.contains('read')}',
+              );
+            },
+            onModelTurnEnd: (event) {
+              lifecycle.add(
+                'turn_end:${event.turn}:${event.toolCalls.length}:${event.error == null}:${event.output}',
+              );
+            },
+            onToolPermissionDecision: (event) {
+              lifecycle.add(
+                'permission:${event.context.turn}:${event.toolCall.name}:${event.decision.name}:${event.source.name}',
+              );
+            },
+            onSessionEnd: (event) {
+              lifecycle.add('session_end:${event.result.isError}');
+            },
+          ),
+          providerOverride: _ScriptedToolLoopProvider((request) {
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            if (toolPayloads.isEmpty) {
+              return QueryResponse.success(
+                output: jsonEncode({
+                  'tool_calls': [
+                    {
+                      'id': 'call_turn_read_1',
+                      'name': 'read',
+                      'input': {'path': file.path},
+                    },
+                  ],
+                }),
+                modelUsed: 'tool-mock',
+              );
+            }
+
+            return QueryResponse.success(
+              output: 'final turn answer',
+              modelUsed: 'tool-mock',
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.prompt('exercise turn hooks');
+
+      expect(result.isError, false);
+      expect(result.text, 'final turn answer');
+      expect(lifecycle, [
+        'turn_start:1:true',
+        'turn_end:1:1:true:{"tool_calls":[{"id":"call_turn_read_1","name":"read","input":{"path":"${file.path}"}}]}',
+        'can:1:read',
+        'permission:1:read:allow:canUseTool',
+        'turn_start:2:true',
+        'turn_end:2:0:true:final turn answer',
+        'session_end:false',
+      ]);
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
   test('prompt prefers provider-native tool calls when provider supports it',
       () async {
     final tempDir =
@@ -559,6 +730,161 @@ void main() {
     }
   });
 
+  test('agent transcript preserves MCP tool isError metadata', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_mcp_tool_error_',
+    );
+
+    try {
+      final manager = _FakeMcpManager(
+        onCallTool: (name, arguments) async => {
+          'isError': true,
+          'content': [
+            {'type': 'text', 'text': 'remote denied'},
+          ],
+        },
+      );
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          mcp: const ClartCodeMcpOptions(),
+          mcpManagerOverride: manager,
+          providerOverride: _ScriptedToolLoopProvider((request) {
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            if (toolPayloads.isEmpty) {
+              return QueryResponse.success(
+                output: jsonEncode({
+                  'tool_calls': [
+                    {
+                      'id': 'call_mcp_error_1',
+                      'name': 'demo/read_remote',
+                      'input': {'path': '/remote/demo.txt'},
+                    },
+                  ],
+                }),
+                modelUsed: 'mcp-mock',
+              );
+            }
+
+            final payload = toolPayloads.single;
+            final metadata = Map<String, Object?>.from(
+              payload['metadata'] as Map,
+            );
+            final content = (metadata['content'] as List).first as Map;
+            return QueryResponse.success(
+              output:
+                  'ok=${payload['ok']} code=${payload['error_code']} server=${metadata['serverName']} tool=${metadata['toolName']} text=${content['text']}',
+              modelUsed: 'mcp-mock',
+            );
+          }),
+        ),
+      );
+
+      await agent.prepare();
+      final result = await agent.prompt('use failing mcp tool');
+
+      expect(result.isError, false);
+      expect(result.text, contains('ok=false'));
+      expect(result.text, contains('code=mcp_tool_error'));
+      expect(result.text, contains('server=demo'));
+      expect(result.text, contains('tool=read_remote'));
+      expect(result.text, contains('text=remote denied'));
+      final toolResultMessage = result.messages.firstWhere(
+        (message) => message.type == 'tool_result',
+      );
+      expect(toolResultMessage.toolResult?.ok, isFalse);
+      expect(toolResultMessage.toolResult?.errorCode, 'mcp_tool_error');
+      expect(toolResultMessage.toolResult?.metadata?['serverName'], 'demo');
+      expect(
+          toolResultMessage.toolResult?.metadata?['toolName'], 'read_remote');
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('agent transcript preserves MCP resource failure metadata', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_mcp_resource_error_',
+    );
+
+    try {
+      final manager = _FakeMcpManager(
+        onReadResource: (uri) async {
+          throw McpOperationException.resourceNotFound(
+            serverName: 'demo',
+            resourceUri: 'docs/missing.md',
+            rpcCode: -32010,
+            rpcMessage: 'Resource not found',
+          );
+        },
+      );
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          mcp: const ClartCodeMcpOptions(),
+          mcpManagerOverride: manager,
+          providerOverride: _ScriptedToolLoopProvider((request) {
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            if (toolPayloads.isEmpty) {
+              return QueryResponse.success(
+                output: jsonEncode({
+                  'tool_calls': [
+                    {
+                      'id': 'call_mcp_resource_error_1',
+                      'name': 'mcp_read_resource',
+                      'input': {'uri': 'demo://docs/missing.md'},
+                    },
+                  ],
+                }),
+                modelUsed: 'mcp-mock',
+              );
+            }
+
+            final payload = toolPayloads.single;
+            final metadata = Map<String, Object?>.from(
+              payload['metadata'] as Map,
+            );
+            return QueryResponse.success(
+              output:
+                  'ok=${payload['ok']} code=${payload['error_code']} uri=${metadata['resourceUri']} rpc=${metadata['rpcCode']}',
+              modelUsed: 'mcp-mock',
+            );
+          }),
+        ),
+      );
+
+      await agent.prepare();
+      final result = await agent.prompt('read missing mcp resource');
+
+      expect(result.isError, false);
+      expect(result.text, contains('ok=false'));
+      expect(result.text, contains('code=resource_not_found'));
+      expect(result.text, contains('uri=docs/missing.md'));
+      expect(result.text, contains('rpc=-32010'));
+      final toolResultMessage = result.messages.firstWhere(
+        (message) => message.type == 'tool_result',
+      );
+      expect(toolResultMessage.toolResult?.ok, isFalse);
+      expect(toolResultMessage.toolResult?.errorCode, 'resource_not_found');
+      expect(
+        toolResultMessage.toolResult?.metadata?['resourceUri'],
+        'docs/missing.md',
+      );
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
   test('agent registers custom tools directly from options.tools', () async {
     final tempDir = await Directory.systemTemp.createTemp(
       'clart_sdk_custom_tools_',
@@ -622,6 +948,7 @@ void main() {
     );
 
     try {
+      final decisions = <String>[];
       final agent = ClartCodeAgent(
         ClartCodeAgentOptions(
           cwd: tempDir.path,
@@ -634,6 +961,13 @@ void main() {
               updatedInput: {'command': 'echo rewritten'},
             );
           },
+          hooks: ClartCodeAgentHooks(
+            onToolPermissionDecision: (event) {
+              decisions.add(
+                'decision:${event.decision.name}:${event.source.name}:${event.updatedInput?['command']}',
+              );
+            },
+          ),
           providerOverride: _ScriptedToolLoopProvider((request) {
             final toolPayloads = request.messages
                 .where((message) => message.role == MessageRole.tool)
@@ -666,8 +1000,12 @@ void main() {
       final result = await agent.prompt('rewrite shell input');
 
       expect(result.isError, false);
-      expect(result.text, contains('echo rewritten'));
+      expect(result.text, contains('rewritten'));
       expect(result.text, isNot(contains('echo original')));
+      expect(
+        decisions,
+        ['decision:allow:resolveToolPermission:echo rewritten'],
+      );
     } finally {
       if (tempDir.existsSync()) {
         tempDir.deleteSync(recursive: true);
@@ -728,6 +1066,98 @@ void main() {
       expect(result.isError, false);
       expect(result.text, contains('handled=false'));
       expect(result.text, contains('shell rejected by custom resolver'));
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('concurrent prompt calls are serialized through session queue',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_queue_serial_');
+
+    try {
+      final provider = _QueuedPromptProvider();
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          providerOverride: provider,
+          persistSession: false,
+        ),
+      );
+
+      final firstPending = agent.prompt('first queued prompt');
+      await provider.firstStarted.future;
+      final secondPending = agent.prompt('second queued prompt');
+      await Future<void>.delayed(Duration.zero);
+
+      expect(agent.isRunning, isTrue);
+      expect(agent.queuedInputCount, 1);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(provider.seenPrompts, ['first queued prompt']);
+
+      provider.releaseFirst.complete();
+      final firstResult = await firstPending;
+      await provider.secondStarted.future;
+      final secondResult = await secondPending;
+
+      expect(firstResult.isError, isFalse);
+      expect(firstResult.text, 'reply:first queued prompt');
+      expect(secondResult.isError, isFalse);
+      expect(secondResult.text, 'reply:second queued prompt');
+      expect(provider.seenPrompts, [
+        'first queued prompt',
+        'second queued prompt',
+      ]);
+      expect(agent.queuedInputCount, 0);
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('clearQueuedInputs cancels pending prompts without touching active run',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_queue_clear_');
+
+    try {
+      final provider = _QueuedPromptProvider();
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          providerOverride: provider,
+          persistSession: false,
+        ),
+      );
+
+      final firstPending = agent.prompt('active prompt');
+      await provider.firstStarted.future;
+      final secondPending = agent.prompt('queued prompt 1');
+      final thirdPending = agent.prompt('queued prompt 2');
+      await Future<void>.delayed(Duration.zero);
+
+      expect(agent.queuedInputCount, 2);
+      final cleared = await agent.clearQueuedInputs(reason: 'clear_queue');
+      final secondResult = await secondPending;
+      final thirdResult = await thirdPending;
+
+      expect(cleared, 2);
+      expect(secondResult.isError, isTrue);
+      expect(secondResult.error?.code, RuntimeErrorCode.cancelled);
+      expect(secondResult.turns, 0);
+      expect(thirdResult.isError, isTrue);
+      expect(thirdResult.error?.code, RuntimeErrorCode.cancelled);
+      expect(provider.seenPrompts, ['active prompt']);
+      expect(agent.queuedInputCount, 0);
+
+      provider.releaseFirst.complete();
+      final firstResult = await firstPending;
+      expect(firstResult.isError, isFalse);
+      expect(firstResult.text, 'reply:active prompt');
     } finally {
       if (tempDir.existsSync()) {
         tempDir.deleteSync(recursive: true);
@@ -809,6 +1239,96 @@ void main() {
       }
     }
   });
+
+  test('interrupt cancels active prompt and automatically runs queued prompt',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_interrupt_queue_');
+
+    try {
+      final provider = _QueuedPromptProvider();
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          providerOverride: provider,
+          persistSession: false,
+        ),
+      );
+
+      final firstPending = agent.prompt('interrupt me');
+      await provider.firstStarted.future;
+      final secondPending = agent.prompt('run after interrupt');
+      await Future<void>.delayed(Duration.zero);
+
+      expect(agent.queuedInputCount, 1);
+      await agent.interrupt(reason: 'switch_to_next');
+
+      final firstResult = await firstPending;
+      await provider.secondStarted.future;
+      final secondResult = await secondPending;
+
+      expect(provider.cancelCalled, isTrue);
+      expect(firstResult.isError, isTrue);
+      expect(firstResult.error?.code, RuntimeErrorCode.cancelled);
+      expect(secondResult.isError, isFalse);
+      expect(secondResult.text, 'reply:run after interrupt');
+      expect(provider.seenPrompts, [
+        'interrupt me',
+        'run after interrupt',
+      ]);
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('cancelled terminal hook receives stop reason', () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_stop_hooks_');
+
+    try {
+      final lifecycle = <String>[];
+      final provider = _CancelableProvider();
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          providerOverride: provider,
+          persistSession: false,
+          hooks: ClartCodeAgentHooks(
+            onStop: (event) {
+              lifecycle.add('stop:${event.reason}');
+            },
+            onCancelledTerminal: (event) {
+              lifecycle.add(
+                'cancelled:${event.reason}:${event.result.error?.code.name}:${event.result.text.contains('[STOPPED]')}',
+              );
+            },
+            onSessionEnd: (event) {
+              lifecycle.add('session_end:${event.result.error?.code.name}');
+            },
+          ),
+        ),
+      );
+
+      final pending = agent.prompt('wait for cancel hook');
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      await agent.stop(reason: 'hook_stop');
+      final result = await pending;
+
+      expect(result.isError, isTrue);
+      expect(result.error?.code, RuntimeErrorCode.cancelled);
+      expect(lifecycle, [
+        'stop:hook_stop',
+        'cancelled:hook_stop:cancelled:true',
+        'session_end:cancelled',
+      ]);
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
 }
 
 Map<String, Object?> _decodeToolPayload(String raw) {
@@ -834,10 +1354,18 @@ class _NativeToolLoopProvider extends NativeToolCallingLlmProvider {
 }
 
 class _FakeMcpManager extends McpManager {
-  _FakeMcpManager() : super(registryPath: '/tmp/fake_mcp_registry.json');
+  _FakeMcpManager({
+    this.onCallTool,
+    this.onReadResource,
+  }) : super(registryPath: '/tmp/fake_mcp_registry.json');
 
   int connectAllCalls = 0;
   List<McpConnection> _connections = const [];
+  final FutureOr<Map<String, Object?>> Function(
+    String name,
+    Map<String, Object?>? arguments,
+  )? onCallTool;
+  final FutureOr<McpResourceContent> Function(String uri)? onReadResource;
 
   @override
   Future<List<McpConnection>> connectAll() async {
@@ -885,11 +1413,26 @@ class _FakeMcpManager extends McpManager {
     required String name,
     Map<String, Object?>? arguments,
   }) async {
+    if (onCallTool != null) {
+      return await onCallTool!(name, arguments);
+    }
     return {
       'content': [
         {'type': 'text', 'text': 'remote body'},
       ],
     };
+  }
+
+  @override
+  Future<McpResourceContent> readResource(String uri) async {
+    if (onReadResource != null) {
+      return await onReadResource!(uri);
+    }
+    return const McpResourceContent(
+      uri: 'docs://guide.md',
+      mimeType: 'text/plain',
+      text: 'resource body',
+    );
   }
 }
 
@@ -914,6 +1457,52 @@ class _CancelableProvider extends LlmProvider {
   @override
   Future<QueryResponse> run(QueryRequest request) {
     throw UnimplementedError();
+  }
+}
+
+class _QueuedPromptProvider extends LlmProvider {
+  final Completer<void> firstStarted = Completer<void>();
+  final Completer<void> secondStarted = Completer<void>();
+  final Completer<void> releaseFirst = Completer<void>();
+  final List<String> seenPrompts = <String>[];
+  Completer<void>? _activeCancellation;
+  bool cancelCalled = false;
+
+  @override
+  Future<void> cancelActiveRequest() async {
+    cancelCalled = true;
+    if (_activeCancellation != null && !_activeCancellation!.isCompleted) {
+      _activeCancellation!.complete();
+    }
+  }
+
+  @override
+  Future<QueryResponse> run(QueryRequest request) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
+    final prompt = request.messages.last.text;
+    seenPrompts.add(prompt);
+
+    if (seenPrompts.length == 1) {
+      if (!firstStarted.isCompleted) {
+        firstStarted.complete();
+      }
+      _activeCancellation = Completer<void>();
+      await Future.any([
+        releaseFirst.future,
+        _activeCancellation!.future,
+      ]);
+      if (_activeCancellation!.isCompleted && !releaseFirst.isCompleted) {
+        return;
+      }
+    } else if (seenPrompts.length == 2 && !secondStarted.isCompleted) {
+      secondStarted.complete();
+    }
+
+    yield ProviderStreamEvent.done(output: 'reply:$prompt');
   }
 }
 

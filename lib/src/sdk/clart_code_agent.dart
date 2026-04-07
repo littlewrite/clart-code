@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 
@@ -62,10 +63,13 @@ class ClartCodeAgent {
   bool _queryInProgress = false;
   bool _stopRequested = false;
   bool _stopNotified = false;
+  String? _stopReason;
   String? _activeModel;
   QueryCancellationController? _activeCancellationController;
   McpManager? _mcpManager;
   bool _runtimePrepared = false;
+  final Queue<_QueuedAgentRun> _pendingRuns = Queue<_QueuedAgentRun>();
+  bool _drainingRuns = false;
 
   int _toolCallCounter = 0;
 
@@ -82,6 +86,8 @@ class ClartCodeAgent {
   List<String> get sessionTags => List<String>.unmodifiable(_sessionTags);
 
   bool get isRunning => _queryInProgress;
+
+  int get queuedInputCount => _pendingRuns.length;
 
   List<ChatMessage> getMessages() => _conversation.history;
 
@@ -194,6 +200,7 @@ class ClartCodeAgent {
       return;
     }
     _stopRequested = true;
+    _stopReason = reason;
     _activeCancellationController?.cancel(reason);
     if (_stopNotified) {
       return;
@@ -210,12 +217,56 @@ class ClartCodeAgent {
     );
   }
 
+  Future<void> interrupt({String reason = 'manual_interrupt'}) async {
+    await stop(reason: reason);
+  }
+
+  Future<int> clearQueuedInputs({
+    String reason = 'queued inputs cleared',
+  }) async {
+    if (_pendingRuns.isEmpty) {
+      return 0;
+    }
+
+    final cancelledRuns = _pendingRuns.toList(growable: false);
+    _pendingRuns.clear();
+    for (final run in cancelledRuns) {
+      await _emitQueuedCancellation(
+        run,
+        reason: reason,
+      );
+    }
+    return cancelledRuns.length;
+  }
+
   Future<void> close() async {
+    await clearQueuedInputs(reason: 'agent closed');
     _persistSession();
     await _mcpManager?.disconnectAll();
   }
 
   Stream<ClartCodeSdkMessage> query(
+    String prompt, {
+    String? model,
+    QueryCancellationSignal? cancellationSignal,
+  }) async* {
+    final run = _QueuedAgentRun(
+      prompt: prompt,
+      model: model,
+      cancellationSignal: cancellationSignal,
+    );
+    if (cancellationSignal?.isCancelled ?? false) {
+      await _emitQueuedCancellation(
+        run,
+        reason: cancellationSignal?.reason ?? 'request cancelled',
+      );
+    } else {
+      _enqueueRun(run);
+    }
+    yield* run.controller.stream;
+  }
+
+  Stream<ClartCodeSdkMessage> _executeQuery(
     String prompt, {
     String? model,
     QueryCancellationSignal? cancellationSignal,
@@ -289,6 +340,9 @@ class ClartCodeAgent {
     _queryInProgress = true;
     _stopRequested = cancellationSignal?.isCancelled ?? false;
     _stopNotified = false;
+    _stopReason = _stopRequested
+        ? cancellationSignal?.reason ?? 'request cancelled'
+        : null;
     _activeModel = selectedModel;
     StreamSubscription<void>? externalCancellationSub;
     if (cancellationSignal != null) {
@@ -338,6 +392,17 @@ class ClartCodeAgent {
         }
 
         completedTurns = turn;
+        await _options.hooks.onModelTurnStart?.call(
+          ClartCodeModelTurnStartEvent(
+            sessionId: _sessionId,
+            cwd: _cwd,
+            provider: _config.provider,
+            prompt: userPrompt,
+            turn: turn,
+            model: modelUsed,
+            availableTools: availableTools,
+          ),
+        );
         final request = _buildToolLoopRequest(
           messages: providerStateToken == null
               ? workingMessages
@@ -350,7 +415,9 @@ class ClartCodeAgent {
                   QueryCancellationController())
               .signal,
         );
+        final turnWatch = Stopwatch()..start();
         final turnResult = await _runProviderTurn(request: request, turn: turn);
+        turnWatch.stop();
         _activeCancellationController?.close();
         _activeCancellationController = null;
         if (turnResult.providerStateToken != null &&
@@ -362,6 +429,25 @@ class ClartCodeAgent {
           modelUsed = turnResult.modelUsed;
           _activeModel = modelUsed;
         }
+        final toolCalls = turnResult.toolCalls.isNotEmpty
+            ? _sdkToolCallsFromProviderToolCalls(turnResult.toolCalls)
+            : _parseToolCalls(turnResult.rawOutput);
+
+        await _options.hooks.onModelTurnEnd?.call(
+          ClartCodeModelTurnEndEvent(
+            sessionId: _sessionId,
+            cwd: _cwd,
+            provider: _config.provider,
+            prompt: userPrompt,
+            turn: turn,
+            model: modelUsed,
+            rawOutput: turnResult.rawOutput,
+            output: turnResult.output,
+            toolCalls: toolCalls,
+            durationMs: turnWatch.elapsedMilliseconds,
+            error: turnResult.error,
+          ),
+        );
 
         for (final delta in turnResult.deltas) {
           yield ClartCodeSdkMessage.assistantDelta(
@@ -389,9 +475,6 @@ class ClartCodeAgent {
         }
 
         final output = turnResult.output;
-        final toolCalls = turnResult.toolCalls.isNotEmpty
-            ? _sdkToolCallsFromProviderToolCalls(turnResult.toolCalls)
-            : _parseToolCalls(turnResult.rawOutput);
         if (toolCalls.isEmpty) {
           _conversation.appendHistoryMessages([
             ChatMessage(role: MessageRole.assistant, text: output),
@@ -492,6 +575,17 @@ class ClartCodeAgent {
                     context,
                   );
                   if (permissionOutcome != null) {
+                    await _options.hooks.onToolPermissionDecision?.call(
+                      ClartCodeToolPermissionEvent(
+                        context: context,
+                        toolCall: toolCall,
+                        decision: permissionOutcome.decision,
+                        source:
+                            ClartCodeToolPermissionSource.resolveToolPermission,
+                        message: permissionOutcome.message,
+                        updatedInput: permissionOutcome.updatedInput,
+                      ),
+                    );
                     return permissionOutcome.isAllowed
                         ? ToolPermissionResolution.allow(
                             invocation: permissionOutcome.updatedInput == null
@@ -511,6 +605,18 @@ class ClartCodeAgent {
                         context,
                       ) ??
                       true;
+                  if (_options.canUseTool != null) {
+                    await _options.hooks.onToolPermissionDecision?.call(
+                      ClartCodeToolPermissionEvent(
+                        context: context,
+                        toolCall: toolCall,
+                        decision: allowed
+                            ? ClartCodeToolPermissionDecision.allow
+                            : ClartCodeToolPermissionDecision.deny,
+                        source: ClartCodeToolPermissionSource.canUseTool,
+                      ),
+                    );
+                  }
                   return allowed
                       ? ToolPermissionResolution.allow(invocation: invocation)
                       : ToolPermissionResolution.deny();
@@ -541,6 +647,7 @@ class ClartCodeAgent {
             output: result.output,
             errorCode: result.errorCode,
             errorMessage: result.errorMessage,
+            metadata: result.metadata,
           );
           final toolEvent = ClartCodeToolResultEvent(
             context: _toolContext(turn: turn, model: modelUsed),
@@ -594,6 +701,7 @@ class ClartCodeAgent {
       _activeCancellationController = null;
       _queryInProgress = false;
       _activeModel = null;
+      _stopReason = null;
     }
   }
 
@@ -633,6 +741,95 @@ class ClartCodeAgent {
     );
   }
 
+  void _enqueueRun(_QueuedAgentRun run) {
+    _pendingRuns.addLast(run);
+    run.attachQueueCancellation(() async {
+      await _cancelQueuedRun(
+        run,
+        reason: run.cancellationSignal?.reason ?? 'request cancelled',
+      );
+    });
+    unawaited(_drainQueuedRuns());
+  }
+
+  Future<void> _drainQueuedRuns() async {
+    if (_drainingRuns) {
+      return;
+    }
+    _drainingRuns = true;
+    try {
+      while (_pendingRuns.isNotEmpty) {
+        final run = _pendingRuns.removeFirst();
+        run.markStarted();
+        try {
+          await run.controller.addStream(
+            _executeQuery(
+              run.prompt,
+              model: run.model,
+              cancellationSignal: run.cancellationSignal,
+            ),
+          );
+        } finally {
+          await run.close();
+        }
+      }
+    } finally {
+      _drainingRuns = false;
+    }
+  }
+
+  Future<void> _cancelQueuedRun(
+    _QueuedAgentRun run, {
+    required String reason,
+  }) async {
+    if (!_pendingRuns.remove(run)) {
+      return;
+    }
+    await _emitQueuedCancellation(run, reason: reason);
+  }
+
+  Future<void> _emitQueuedCancellation(
+    _QueuedAgentRun run, {
+    required String reason,
+  }) async {
+    final error = _buildCancelledRuntimeError(reason);
+    final output = '[STOPPED] request cancelled before execution';
+    final result = ClartCodePromptResult(
+      sessionId: _sessionId,
+      text: output,
+      turns: 0,
+      isError: true,
+      messages: const [],
+      model: run.model ?? _config.model,
+      error: error,
+      durationMs: 0,
+    );
+    await _options.hooks.onCancelledTerminal?.call(
+      ClartCodeCancelledTerminalEvent(
+        sessionId: _sessionId,
+        cwd: _cwd,
+        provider: _config.provider,
+        prompt: run.prompt,
+        model: run.model ?? _config.model,
+        result: result,
+        reason: reason,
+      ),
+    );
+    run.controller.add(
+      ClartCodeSdkMessage.result(
+        sessionId: _sessionId,
+        subtype: 'error_stopped',
+        text: output,
+        isError: true,
+        model: run.model ?? _config.model,
+        turns: 0,
+        error: error,
+        durationMs: 0,
+      ),
+    );
+    await run.close();
+  }
+
   void _restoreConversation() {
     final existing = _options.resumeSessionId == null
         ? null
@@ -656,7 +853,8 @@ class ClartCodeAgent {
   }
 
   void _rebuildRuntime() {
-    final baseExecutor = _options.toolExecutor ?? ToolExecutor.minimal();
+    final baseExecutor =
+        _options.toolExecutor ?? ToolExecutor.minimal(cwd: _cwd);
     final mergedExecutor = _options.tools == null || _options.tools!.isEmpty
         ? baseExecutor
         : baseExecutor.withAdditionalTools(_options.tools!);
@@ -1008,6 +1206,7 @@ class ClartCodeAgent {
       'output': result.output,
       'error_code': result.errorCode,
       'error_message': result.errorMessage,
+      if (result.metadata != null) 'metadata': result.metadata,
     });
   }
 
@@ -1087,9 +1286,21 @@ class ClartCodeAgent {
   }
 
   RuntimeError _stoppedError() {
-    return const RuntimeError(
+    return _buildCancelledRuntimeError(_stopReason);
+  }
+
+  RuntimeError _buildCancelledRuntimeError(String? reason) {
+    final normalizedReason = reason?.trim();
+    final message = normalizedReason == null ||
+            normalizedReason.isEmpty ||
+            normalizedReason == 'manual_stop' ||
+            normalizedReason == 'manual_interrupt' ||
+            normalizedReason == 'request cancelled'
+        ? 'request cancelled by user'
+        : 'request cancelled: $normalizedReason';
+    return RuntimeError(
       code: RuntimeErrorCode.cancelled,
-      message: 'request cancelled by user',
+      message: message,
       source: 'sdk_agent',
       retriable: false,
     );
@@ -1120,6 +1331,19 @@ class ClartCodeAgent {
       error: error,
       durationMs: watch.elapsedMilliseconds,
     );
+    if (error.code == RuntimeErrorCode.cancelled) {
+      await _options.hooks.onCancelledTerminal?.call(
+        ClartCodeCancelledTerminalEvent(
+          sessionId: _sessionId,
+          cwd: _cwd,
+          provider: _config.provider,
+          prompt: prompt,
+          model: modelUsed,
+          result: result,
+          reason: _stopReason ?? 'request cancelled',
+        ),
+      );
+    }
     await _options.hooks.onSessionEnd?.call(
       ClartCodeSessionEndEvent(
         sessionId: _sessionId,
@@ -1166,4 +1390,48 @@ class _ProviderTurnResult {
   final String? modelUsed;
   final RuntimeError? error;
   final String? providerStateToken;
+}
+
+class _QueuedAgentRun {
+  _QueuedAgentRun({
+    required this.prompt,
+    required this.model,
+    required this.cancellationSignal,
+  });
+
+  final String prompt;
+  final String? model;
+  final QueryCancellationSignal? cancellationSignal;
+  final StreamController<ClartCodeSdkMessage> controller =
+      StreamController<ClartCodeSdkMessage>();
+
+  StreamSubscription<void>? _queueCancellationSub;
+  bool _started = false;
+
+  void attachQueueCancellation(Future<void> Function() onCancel) {
+    final signal = cancellationSignal;
+    if (signal == null) {
+      return;
+    }
+    _queueCancellationSub = signal.onCancel.listen((_) {
+      if (_started) {
+        return;
+      }
+      unawaited(onCancel());
+    });
+  }
+
+  void markStarted() {
+    _started = true;
+    unawaited(_queueCancellationSub?.cancel());
+    _queueCancellationSub = null;
+  }
+
+  Future<void> close() async {
+    await _queueCancellationSub?.cancel();
+    _queueCancellationSub = null;
+    if (!controller.isClosed) {
+      await controller.close();
+    }
+  }
 }

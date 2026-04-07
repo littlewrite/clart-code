@@ -29,6 +29,14 @@ typedef ClartCodeSessionEndHook = FutureOr<void> Function(
 
 typedef ClartCodeStopHook = FutureOr<void> Function(ClartCodeStopEvent event);
 
+typedef ClartCodeModelTurnStartHook = FutureOr<void> Function(
+  ClartCodeModelTurnStartEvent event,
+);
+
+typedef ClartCodeModelTurnEndHook = FutureOr<void> Function(
+  ClartCodeModelTurnEndEvent event,
+);
+
 typedef ClartCodePreToolUseHook = FutureOr<void> Function(
     ClartCodeToolEvent event);
 
@@ -37,6 +45,14 @@ typedef ClartCodePostToolUseHook = FutureOr<void> Function(
 
 typedef ClartCodePostToolUseFailureHook = FutureOr<void> Function(
     ClartCodeToolResultEvent event);
+
+typedef ClartCodeToolPermissionDecisionHook = FutureOr<void> Function(
+  ClartCodeToolPermissionEvent event,
+);
+
+typedef ClartCodeCancelledTerminalHook = FutureOr<void> Function(
+  ClartCodeCancelledTerminalEvent event,
+);
 
 class ClartCodeToolContext {
   const ClartCodeToolContext({
@@ -128,22 +144,116 @@ class ClartCodeStopEvent {
   final String? model;
 }
 
+class ClartCodeModelTurnStartEvent {
+  const ClartCodeModelTurnStartEvent({
+    required this.sessionId,
+    required this.cwd,
+    required this.provider,
+    required this.prompt,
+    required this.turn,
+    required this.availableTools,
+    this.model,
+  });
+
+  final String sessionId;
+  final String cwd;
+  final ProviderKind provider;
+  final String prompt;
+  final int turn;
+  final List<String> availableTools;
+  final String? model;
+}
+
+class ClartCodeModelTurnEndEvent {
+  const ClartCodeModelTurnEndEvent({
+    required this.sessionId,
+    required this.cwd,
+    required this.provider,
+    required this.prompt,
+    required this.turn,
+    required this.rawOutput,
+    required this.output,
+    required this.toolCalls,
+    required this.durationMs,
+    this.model,
+    this.error,
+  });
+
+  final String sessionId;
+  final String cwd;
+  final ProviderKind provider;
+  final String prompt;
+  final int turn;
+  final String rawOutput;
+  final String output;
+  final List<ClartCodeToolCall> toolCalls;
+  final int durationMs;
+  final String? model;
+  final RuntimeError? error;
+}
+
+enum ClartCodeToolPermissionSource { resolveToolPermission, canUseTool }
+
+class ClartCodeToolPermissionEvent extends ClartCodeToolEvent {
+  const ClartCodeToolPermissionEvent({
+    required super.context,
+    required super.toolCall,
+    required this.decision,
+    required this.source,
+    this.message,
+    this.updatedInput,
+  });
+
+  final ClartCodeToolPermissionDecision decision;
+  final ClartCodeToolPermissionSource source;
+  final String? message;
+  final Map<String, Object?>? updatedInput;
+}
+
+class ClartCodeCancelledTerminalEvent {
+  const ClartCodeCancelledTerminalEvent({
+    required this.sessionId,
+    required this.cwd,
+    required this.provider,
+    required this.prompt,
+    required this.result,
+    required this.reason,
+    this.model,
+  });
+
+  final String sessionId;
+  final String cwd;
+  final ProviderKind provider;
+  final String prompt;
+  final ClartCodePromptResult result;
+  final String reason;
+  final String? model;
+}
+
 class ClartCodeAgentHooks {
   const ClartCodeAgentHooks({
     this.onSessionStart,
     this.onSessionEnd,
     this.onStop,
+    this.onModelTurnStart,
+    this.onModelTurnEnd,
     this.onPreToolUse,
     this.onPostToolUse,
     this.onPostToolUseFailure,
+    this.onToolPermissionDecision,
+    this.onCancelledTerminal,
   });
 
   final ClartCodeSessionStartHook? onSessionStart;
   final ClartCodeSessionEndHook? onSessionEnd;
   final ClartCodeStopHook? onStop;
+  final ClartCodeModelTurnStartHook? onModelTurnStart;
+  final ClartCodeModelTurnEndHook? onModelTurnEnd;
   final ClartCodePreToolUseHook? onPreToolUse;
   final ClartCodePostToolUseHook? onPostToolUse;
   final ClartCodePostToolUseFailureHook? onPostToolUseFailure;
+  final ClartCodeToolPermissionDecisionHook? onToolPermissionDecision;
+  final ClartCodeCancelledTerminalHook? onCancelledTerminal;
 }
 
 enum ClartCodeToolPermissionDecision { allow, deny }
@@ -383,6 +493,7 @@ class ClartCodeToolResult {
     required this.output,
     this.errorCode,
     this.errorMessage,
+    this.metadata,
   });
 
   final String callId;
@@ -391,6 +502,7 @@ class ClartCodeToolResult {
   final String output;
   final String? errorCode;
   final String? errorMessage;
+  final Map<String, Object?>? metadata;
 
   Map<String, Object?> toJson() {
     return {
@@ -400,6 +512,7 @@ class ClartCodeToolResult {
       'output': output,
       'errorCode': errorCode,
       'errorMessage': errorMessage,
+      if (metadata != null) 'metadata': metadata,
     };
   }
 }

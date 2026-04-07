@@ -197,35 +197,72 @@ class McpManager {
     required String name,
     Map<String, Object?>? arguments,
   }) async {
-    // 解析 server/tool 格式
-    final parts = name.split('/');
-    if (parts.length != 2) {
-      throw ArgumentError('Tool name must be in format: server/tool');
+    final separatorIndex = name.indexOf('/');
+    if (separatorIndex <= 0 || separatorIndex == name.length - 1) {
+      throw McpOperationException.invalidToolName(name);
     }
 
-    final serverName = parts[0];
-    final toolName = parts[1];
+    final serverName = name.substring(0, separatorIndex);
+    final toolName = name.substring(separatorIndex + 1);
 
     final client = _connections[serverName];
     if (client == null) {
-      throw Exception('Server not connected: $serverName');
+      throw _buildUnavailableServerError(serverName);
     }
 
-    return await client.callTool(name: toolName, arguments: arguments);
+    try {
+      return await client.callTool(name: toolName, arguments: arguments);
+    } on McpOperationException {
+      rethrow;
+    } catch (error) {
+      throw McpOperationException.toolCallFailed(
+        serverName: serverName,
+        toolName: toolName,
+        message: error.toString(),
+      );
+    }
   }
 
   /// 读取资源（支持 server://uri 格式）
   Future<McpResourceContent> readResource(String uri) async {
-    // 解析 server://uri 格式
-    final uriObj = Uri.parse(uri);
-    final serverName = uriObj.scheme;
-    final resourceUri = uri.substring(serverName.length + 3); // 移除 "server://"
+    final separatorIndex = uri.indexOf('://');
+    if (separatorIndex <= 0 || separatorIndex == uri.length - 3) {
+      throw McpOperationException.invalidResourceUri(uri);
+    }
+
+    final serverName = uri.substring(0, separatorIndex);
+    final resourceUri = uri.substring(separatorIndex + 3);
 
     final client = _connections[serverName];
     if (client == null) {
-      throw Exception('Server not connected: $serverName');
+      throw _buildUnavailableServerError(serverName);
     }
 
-    return await client.readResource(resourceUri);
+    try {
+      return await client.readResource(resourceUri);
+    } on McpOperationException {
+      rethrow;
+    } catch (error) {
+      throw McpOperationException.readFailed(
+        serverName: serverName,
+        resourceUri: resourceUri,
+        message: error.toString(),
+      );
+    }
+  }
+
+  McpOperationException _buildUnavailableServerError(String serverName) {
+    final connection = _connectionStatus[serverName];
+    if (connection != null && !connection.config.isRuntimeSupported) {
+      return McpOperationException.unsupportedTransport(
+        serverName: serverName,
+        transportType: connection.config.transportType,
+        message: connection.error ?? connection.config.runtimeUnsupportedReason,
+      );
+    }
+    return McpOperationException.serverNotConnected(
+      serverName: serverName,
+      connection: connection,
+    );
   }
 }

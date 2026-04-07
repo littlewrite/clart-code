@@ -141,24 +141,84 @@ void main() {
       expect(client, isNull);
     });
 
-    test('callTool() throws for invalid tool name format', () async {
+    test('callTool() returns stable error for invalid tool name format',
+        () async {
       expect(
         () => manager.callTool(name: 'invalid-format'),
-        throwsA(isA<ArgumentError>()),
+        throwsA(
+          isA<McpOperationException>().having(
+            (error) => error.code,
+            'code',
+            'invalid_tool_name',
+          ),
+        ),
       );
     });
 
-    test('callTool() throws for non-connected server', () async {
+    test('callTool() returns stable error for non-connected server', () async {
       expect(
         () => manager.callTool(name: 'server/tool'),
-        throwsA(isA<Exception>()),
+        throwsA(
+          isA<McpOperationException>()
+              .having((error) => error.code, 'code', 'server_not_connected')
+              .having(
+                (error) => error.metadata['serverName'],
+                'serverName',
+                'server',
+              ),
+        ),
       );
     });
 
-    test('readResource() throws for non-connected server', () async {
+    test('readResource() returns stable error for non-connected server',
+        () async {
       expect(
         () => manager.readResource('server://resource'),
-        throwsA(isA<Exception>()),
+        throwsA(
+          isA<McpOperationException>()
+              .having((error) => error.code, 'code', 'server_not_connected')
+              .having(
+                (error) => error.metadata['serverName'],
+                'serverName',
+                'server',
+              ),
+        ),
+      );
+    });
+
+    test('callTool() distinguishes unsupported transport from not connected',
+        () async {
+      await manager.connect(
+        const McpHttpServerConfig(
+          name: 'remote',
+          url: 'https://example.com/mcp',
+        ),
+      );
+
+      expect(
+        () => manager.callTool(name: 'remote/tool'),
+        throwsA(
+          isA<McpOperationException>()
+              .having((error) => error.code, 'code', 'unsupported_transport')
+              .having(
+                (error) => error.metadata['transportType'],
+                'transportType',
+                'http',
+              ),
+        ),
+      );
+    });
+
+    test('readResource() validates uri format', () async {
+      expect(
+        () => manager.readResource('invalid-resource'),
+        throwsA(
+          isA<McpOperationException>().having(
+            (error) => error.code,
+            'code',
+            'invalid_resource_uri',
+          ),
+        ),
       );
     });
   });

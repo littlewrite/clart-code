@@ -59,6 +59,14 @@
 当前已完成：
 
 - `ClartCodeAgent` 已补 `snapshot()/renameSession()/setSessionTags()/addSessionTag()/removeSessionTag()/forkSession()`
+- 更细粒度 hooks 已补：
+  - model turn start/end
+  - permission decision
+  - cancelled terminal event
+- 最小 session interrupt / queued input 语义已补：
+  - 并发 prompt/query 串行排队
+  - `interrupt()` 打断 active run
+  - `clearQueuedInputs()` 清理 pending queue
 
 收尾标准：
 
@@ -124,16 +132,17 @@
 
 如果下一轮继续只做 SDK，优先顺序是：
 
-1. `MCP transport` 剩余收尾
-2. 第一批 builtin tools（尤其是真实 `shell`）
-3. MCP tool/resource error 语义与测试
-4. 再回到更细粒度 hooks / permission decision / interrupt
+1. `MCP transport` 的 CLI 收尾
+2. 再评估更细 builtin input/error 约束
+3. 再评估是否需要更细的 queued-input / interrupt 事件面
 
 补记：
 
 - `MCP registry` 对齐已完成
 - `MCP transport` 的 SDK 类型/runtime 收口已开始，CLI 收口仍后置
+- `MCP tool/resource` error 语义与测试已在 SDK 范围内完成
 - `tool public API` 已补 direct tool registration 与可扩 permission outcome
+- 第一批 builtin tools 已补齐，`shell` 不再是 stub
 
 不要先做：
 

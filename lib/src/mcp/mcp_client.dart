@@ -1,5 +1,5 @@
-/// MCP 客户端实现
-/// 实现 Model Context Protocol 的核心方法
+// MCP 客户端实现
+// 实现 Model Context Protocol 的核心方法
 import 'dart:async';
 
 import 'json_rpc.dart';
@@ -75,7 +75,13 @@ class McpClient {
     final response = await _transport!.sendRequest(request);
 
     if (response.isError) {
-      throw Exception('List tools failed: ${response.error}');
+      final error = response.error!;
+      throw McpOperationException.listToolsFailed(
+        serverName: config.name,
+        rpcCode: error.code,
+        rpcMessage: error.message,
+        rpcData: error.data,
+      );
     }
 
     final result = response.result as Map<String, Object?>;
@@ -105,7 +111,23 @@ class McpClient {
     final response = await _transport!.sendRequest(request);
 
     if (response.isError) {
-      throw Exception('Tool call failed: ${response.error}');
+      final error = response.error!;
+      if (_looksLikeNotFound(error.message, kind: 'tool')) {
+        throw McpOperationException.toolNotFound(
+          serverName: config.name,
+          toolName: name,
+          rpcCode: error.code,
+          rpcMessage: error.message,
+          rpcData: error.data,
+        );
+      }
+      throw McpOperationException.toolCallFailed(
+        serverName: config.name,
+        toolName: name,
+        rpcCode: error.code,
+        rpcMessage: error.message,
+        rpcData: error.data,
+      );
     }
 
     return response.result as Map<String, Object?>;
@@ -119,7 +141,13 @@ class McpClient {
     final response = await _transport!.sendRequest(request);
 
     if (response.isError) {
-      throw Exception('List resources failed: ${response.error}');
+      final error = response.error!;
+      throw McpOperationException.listResourcesFailed(
+        serverName: config.name,
+        rpcCode: error.code,
+        rpcMessage: error.message,
+        rpcData: error.data,
+      );
     }
 
     final result = response.result as Map<String, Object?>;
@@ -143,14 +171,34 @@ class McpClient {
     final response = await _transport!.sendRequest(request);
 
     if (response.isError) {
-      throw Exception('Read resource failed: ${response.error}');
+      final error = response.error!;
+      if (_looksLikeNotFound(error.message, kind: 'resource')) {
+        throw McpOperationException.resourceNotFound(
+          serverName: config.name,
+          resourceUri: uri,
+          rpcCode: error.code,
+          rpcMessage: error.message,
+          rpcData: error.data,
+        );
+      }
+      throw McpOperationException.readFailed(
+        serverName: config.name,
+        resourceUri: uri,
+        rpcCode: error.code,
+        rpcMessage: error.message,
+        rpcData: error.data,
+      );
     }
 
     final result = response.result as Map<String, Object?>;
     final contentsJson = result['contents'] as List? ?? [];
 
     if (contentsJson.isEmpty) {
-      throw Exception('No content returned for resource: $uri');
+      throw McpOperationException.resourceNotFound(
+        serverName: config.name,
+        resourceUri: uri,
+        reason: 'empty_content',
+      );
     }
 
     return McpResourceContent.fromJson(
@@ -170,5 +218,21 @@ class McpClient {
     if (_transport == null) {
       throw StateError('Not connected');
     }
+  }
+
+  bool _looksLikeNotFound(String message, {required String kind}) {
+    final normalized = message.toLowerCase();
+    if (normalized.contains('not found')) {
+      return kind == 'tool'
+          ? normalized.contains('tool') || normalized.contains('name')
+          : normalized.contains('resource') ||
+              normalized.contains('uri') ||
+              normalized.contains('file');
+    }
+    if (kind == 'tool') {
+      return normalized.contains('unknown tool');
+    }
+    return normalized.contains('unknown resource') ||
+        normalized.contains('no resource');
   }
 }

@@ -31,6 +31,228 @@ String unsupportedMcpTransportMessage(McpTransportType transportType) {
       '(current Dart runtime supports: $supported)';
 }
 
+class McpOperationException implements Exception {
+  McpOperationException({
+    required this.code,
+    required this.message,
+    Map<String, Object?> metadata = const {},
+  }) : metadata = Map<String, Object?>.unmodifiable(
+          Map<String, Object?>.from(metadata),
+        );
+
+  factory McpOperationException.invalidToolName(String name) {
+    return McpOperationException(
+      code: 'invalid_tool_name',
+      message: 'MCP tool name must be in format: server/tool',
+      metadata: {
+        'source': 'mcp',
+        'tool': name,
+      },
+    );
+  }
+
+  factory McpOperationException.invalidResourceUri(String uri) {
+    return McpOperationException(
+      code: 'invalid_resource_uri',
+      message: 'MCP resource uri must be in format: server://resource_uri',
+      metadata: {
+        'source': 'mcp',
+        'resourceUri': uri,
+      },
+    );
+  }
+
+  factory McpOperationException.serverNotConnected({
+    required String serverName,
+    McpConnection? connection,
+  }) {
+    final metadata = <String, Object?>{
+      'source': 'mcp',
+      'serverName': serverName,
+    };
+    if (connection != null) {
+      metadata['status'] = connection.status.name;
+      metadata['transportType'] = connection.config.transportType.name;
+      if (connection.error != null) {
+        metadata['connectionError'] = connection.error;
+      }
+    }
+    return McpOperationException(
+      code: 'server_not_connected',
+      message: connection?.error ?? 'MCP server not connected: $serverName',
+      metadata: metadata,
+    );
+  }
+
+  factory McpOperationException.unsupportedTransport({
+    required String serverName,
+    required McpTransportType transportType,
+    String? message,
+  }) {
+    return McpOperationException(
+      code: 'unsupported_transport',
+      message: message ?? unsupportedMcpTransportMessage(transportType),
+      metadata: {
+        'source': 'mcp',
+        'serverName': serverName,
+        'transportType': transportType.name,
+      },
+    );
+  }
+
+  factory McpOperationException.toolNotFound({
+    required String serverName,
+    required String toolName,
+    int? rpcCode,
+    String? rpcMessage,
+    Object? rpcData,
+  }) {
+    return McpOperationException(
+      code: 'tool_not_found',
+      message: 'MCP tool not found: $serverName/$toolName',
+      metadata: _buildRpcMetadata(
+        serverName: serverName,
+        toolName: toolName,
+        rpcCode: rpcCode,
+        rpcMessage: rpcMessage,
+        rpcData: rpcData,
+      ),
+    );
+  }
+
+  factory McpOperationException.resourceNotFound({
+    required String serverName,
+    required String resourceUri,
+    int? rpcCode,
+    String? rpcMessage,
+    Object? rpcData,
+    String? reason,
+  }) {
+    final metadata = _buildRpcMetadata(
+      serverName: serverName,
+      resourceUri: resourceUri,
+      rpcCode: rpcCode,
+      rpcMessage: rpcMessage,
+      rpcData: rpcData,
+    );
+    if (reason != null) {
+      metadata['reason'] = reason;
+    }
+    return McpOperationException(
+      code: 'resource_not_found',
+      message: 'MCP resource not found: $serverName://$resourceUri',
+      metadata: metadata,
+    );
+  }
+
+  factory McpOperationException.toolCallFailed({
+    required String serverName,
+    required String toolName,
+    String? message,
+    int? rpcCode,
+    String? rpcMessage,
+    Object? rpcData,
+  }) {
+    return McpOperationException(
+      code: 'mcp_call_failed',
+      message: message ?? 'MCP tool call failed: $serverName/$toolName',
+      metadata: _buildRpcMetadata(
+        serverName: serverName,
+        toolName: toolName,
+        rpcCode: rpcCode,
+        rpcMessage: rpcMessage,
+        rpcData: rpcData,
+      ),
+    );
+  }
+
+  factory McpOperationException.readFailed({
+    required String serverName,
+    required String resourceUri,
+    String? message,
+    int? rpcCode,
+    String? rpcMessage,
+    Object? rpcData,
+  }) {
+    return McpOperationException(
+      code: 'mcp_read_failed',
+      message:
+          message ?? 'MCP resource read failed: $serverName://$resourceUri',
+      metadata: _buildRpcMetadata(
+        serverName: serverName,
+        resourceUri: resourceUri,
+        rpcCode: rpcCode,
+        rpcMessage: rpcMessage,
+        rpcData: rpcData,
+      ),
+    );
+  }
+
+  factory McpOperationException.listResourcesFailed({
+    required String serverName,
+    String? message,
+    int? rpcCode,
+    String? rpcMessage,
+    Object? rpcData,
+  }) {
+    return McpOperationException(
+      code: 'mcp_list_resources_failed',
+      message: message ?? 'MCP resources/list failed for server: $serverName',
+      metadata: _buildRpcMetadata(
+        serverName: serverName,
+        rpcCode: rpcCode,
+        rpcMessage: rpcMessage,
+        rpcData: rpcData,
+      ),
+    );
+  }
+
+  factory McpOperationException.listToolsFailed({
+    required String serverName,
+    String? message,
+    int? rpcCode,
+    String? rpcMessage,
+    Object? rpcData,
+  }) {
+    return McpOperationException(
+      code: 'mcp_list_tools_failed',
+      message: message ?? 'MCP tools/list failed for server: $serverName',
+      metadata: _buildRpcMetadata(
+        serverName: serverName,
+        rpcCode: rpcCode,
+        rpcMessage: rpcMessage,
+        rpcData: rpcData,
+      ),
+    );
+  }
+
+  final String code;
+  final String message;
+  final Map<String, Object?> metadata;
+
+  static Map<String, Object?> _buildRpcMetadata({
+    required String serverName,
+    String? toolName,
+    String? resourceUri,
+    int? rpcCode,
+    String? rpcMessage,
+    Object? rpcData,
+  }) {
+    return {
+      'source': 'mcp',
+      'serverName': serverName,
+      if (toolName != null) 'toolName': toolName,
+      if (resourceUri != null) 'resourceUri': resourceUri,
+      if (rpcCode != null) 'rpcCode': rpcCode,
+      if (rpcMessage != null) 'rpcMessage': rpcMessage,
+      if (rpcData != null) 'rpcData': rpcData,
+    };
+  }
+
+  @override
+  String toString() => '$code: $message';
+}
+
 /// MCP 服务器配置
 abstract class McpServerConfig {
   const McpServerConfig({required this.name});

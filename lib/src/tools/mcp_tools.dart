@@ -64,6 +64,7 @@ class McpToolWrapper implements Tool {
 
   @override
   Future<ToolExecutionResult> run(ToolInvocation invocation) async {
+    final qualifiedName = _QualifiedToolName.parse(invocation.name);
     try {
       final result = await manager.callTool(
         name: invocation.name,
@@ -79,7 +80,14 @@ class McpToolWrapper implements Tool {
         return ToolExecutionResult.failure(
           tool: invocation.name,
           errorCode: 'mcp_tool_error',
-          errorMessage: errorText,
+          errorMessage:
+              errorText.isEmpty ? 'MCP tool returned isError=true' : errorText,
+          metadata: {
+            'source': 'mcp',
+            'serverName': qualifiedName.serverName,
+            'toolName': qualifiedName.toolName,
+            'content': List<Object?>.from(content ?? const []),
+          },
         );
       }
 
@@ -88,11 +96,33 @@ class McpToolWrapper implements Tool {
         tool: invocation.name,
         output: outputText,
       );
+    } on McpOperationException catch (error) {
+      return ToolExecutionResult.failure(
+        tool: invocation.name,
+        errorCode: _mapMcpErrorCode(error.code),
+        errorMessage: error.message,
+        metadata: error.metadata,
+      );
+    } on FormatException catch (error) {
+      return ToolExecutionResult.failure(
+        tool: invocation.name,
+        errorCode: 'invalid_input',
+        errorMessage: error.message,
+        metadata: {
+          'source': 'mcp',
+          'tool': invocation.name,
+        },
+      );
     } catch (e) {
       return ToolExecutionResult.failure(
         tool: invocation.name,
         errorCode: 'mcp_call_failed',
         errorMessage: e.toString(),
+        metadata: {
+          'source': 'mcp',
+          'serverName': qualifiedName.serverName,
+          'toolName': qualifiedName.toolName,
+        },
       );
     }
   }
@@ -158,14 +188,15 @@ class McpReadResourceTool implements Tool {
   @override
   Future<ToolExecutionResult> run(ToolInvocation invocation) async {
     try {
-      final uri = invocation.input['uri'] as String?;
-      if (uri == null) {
+      final rawUri = invocation.input['uri'];
+      if (rawUri is! String || rawUri.trim().isEmpty) {
         return ToolExecutionResult.failure(
           tool: name,
-          errorCode: 'missing_uri',
+          errorCode: 'invalid_input',
           errorMessage: 'uri parameter is required',
         );
       }
+      final uri = rawUri.trim();
 
       final content = await manager.readResource(uri);
 
@@ -174,11 +205,21 @@ class McpReadResourceTool implements Tool {
         tool: name,
         output: output,
       );
+    } on McpOperationException catch (error) {
+      return ToolExecutionResult.failure(
+        tool: name,
+        errorCode: _mapMcpErrorCode(error.code),
+        errorMessage: error.message,
+        metadata: error.metadata,
+      );
     } catch (e) {
       return ToolExecutionResult.failure(
         tool: name,
-        errorCode: 'read_failed',
+        errorCode: 'mcp_read_failed',
         errorMessage: e.toString(),
+        metadata: const {
+          'source': 'mcp',
+        },
       );
     }
   }
@@ -234,12 +275,53 @@ class McpListResourcesTool implements Tool {
         tool: name,
         output: buffer.toString(),
       );
+    } on McpOperationException catch (error) {
+      return ToolExecutionResult.failure(
+        tool: name,
+        errorCode: _mapMcpErrorCode(error.code),
+        errorMessage: error.message,
+        metadata: error.metadata,
+      );
     } catch (e) {
       return ToolExecutionResult.failure(
         tool: name,
-        errorCode: 'list_failed',
+        errorCode: 'mcp_list_resources_failed',
         errorMessage: e.toString(),
+        metadata: const {
+          'source': 'mcp',
+        },
       );
     }
   }
+}
+
+String _mapMcpErrorCode(String code) {
+  switch (code) {
+    case 'invalid_tool_name':
+    case 'invalid_resource_uri':
+      return 'invalid_input';
+    default:
+      return code;
+  }
+}
+
+class _QualifiedToolName {
+  const _QualifiedToolName({
+    required this.serverName,
+    required this.toolName,
+  });
+
+  factory _QualifiedToolName.parse(String name) {
+    final separatorIndex = name.indexOf('/');
+    if (separatorIndex <= 0 || separatorIndex == name.length - 1) {
+      throw FormatException('MCP tool name must be in format: server/tool');
+    }
+    return _QualifiedToolName(
+      serverName: name.substring(0, separatorIndex),
+      toolName: name.substring(separatorIndex + 1),
+    );
+  }
+
+  final String serverName;
+  final String toolName;
 }

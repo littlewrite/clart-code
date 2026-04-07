@@ -18,11 +18,11 @@
 | Session 持久化 | `src/session.ts` | 是 | 已完成 | 已支持 save/load/list/fork/rename/tag；本轮已从 CLI store 解耦 |
 | Streaming event 协议 | `src/types.ts` | 是 | 已完成 | 当前事件面已覆盖 init、delta、assistant、tool_call、tool_result、result |
 | Provider 抽象 | `src/providers/*` | 是 | 已完成 | local / Claude / OpenAI 已具备 |
-| Tool loop | `src/engine.ts` | 是 | 已完成 | 优先 provider-native tool calling，fallback JSON plan；SDK 已支持 direct custom tool registration |
-| Tool 权限 | `examples/10-permissions.ts` | 是 | 部分完成 | 已有 `allow/deny/ask`、`canUseTool` 与可扩展的 `resolveToolPermission` |
-| Lifecycle hooks | `src/hooks.ts` / `examples/13-hooks.ts` | 是 | 部分完成 | 已有 session/tool hooks；缺更细粒度事件 |
-| MCP tools/resources | `sdk-mcp-server.ts` / agent options | 是 | 部分完成 | registry 已统一；transport 语义已在 SDK 类型/runtime 上收紧到 `stdio`，CLI 收尾仍后置 |
-| Session interrupt / queued input | `src/agent.ts` / Claude Code query loop | 是 | 未完成 | 目前只有 request-scoped cancellation |
+| Tool loop | `src/engine.ts` | 是 | 已完成 | 优先 provider-native tool calling，fallback JSON plan；SDK 已支持 direct custom tool registration，且第一批 builtin tools 已可真实执行 |
+| Tool 权限 | `examples/10-permissions.ts` | 是 | 部分完成 | 已有 `allow/deny/ask`、`canUseTool`、`resolveToolPermission` 与 permission decision hook |
+| Lifecycle hooks | `src/hooks.ts` / `examples/13-hooks.ts` | 是 | 部分完成 | 已有 session/tool hooks，并补了 model turn / permission decision / cancelled terminal；仍缺 interrupt 相关事件面 |
+| MCP tools/resources | `sdk-mcp-server.ts` / agent options | 是 | 部分完成 | SDK 内 registry/runtime/error 语义已收敛；CLI transport 收尾仍后置 |
+| Session interrupt / queued input | `src/agent.ts` / Claude Code query loop | 是 | 部分完成 | 已有 session 内串行 queue、`interrupt()` 与 `clearQueuedInputs()`；仍缺更细状态事件面 |
 | Session metadata convenience API | `src/session.ts` + Agent convenience | 是 | 已完成 | `ClartCodeAgent` 已支持 `snapshot/renameSession/setSessionTags/addSessionTag/removeSessionTag/forkSession` |
 | Context injection service | `src/utils/context.ts` | 以后再说 | 未开始 | 当前不应先做成产品化上下文系统 |
 | Task service | Claude Code tasks / open-agent tasks tools | 以后再说 | 未开始 | 仓库内有基础能力，但不应先公开成 SDK |
@@ -49,7 +49,7 @@
 ### 当前应该继续补齐，但仍属于 SDK 主线的能力
 
 - session-level interrupt / queued input 语义
-- 更细粒度 hooks / permission decision / cancelled terminal event
+- session-level interrupt / queued input 语义
 
 ### 当前不应该纳入的能力
 

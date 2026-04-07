@@ -6,6 +6,210 @@
 
 - 除非用户明确提出，否则当前工作默认只推进 SDK，不启动 CLI 对接 SDK 的落地。
 
+## 2026-04-07 / Stage B session interrupt / queued input 最小语义
+
+本轮完成：
+
+- 更新 `lib/src/sdk/clart_code_agent.dart`
+  - agent 现在会对并发 `query()/prompt()` 做 session 内串行化
+  - 新增最小 queue 语义：
+    - 后续 prompt 会排队等待当前 active run 完成
+    - `interrupt()` 会只打断当前 active run
+    - active run 被 interrupt 后，queued run 会自动继续消费
+  - 新增 `queuedInputCount`
+  - 新增 `clearQueuedInputs()`
+  - queued run 在开始前被取消时，会返回稳定 cancelled terminal result
+- 保留边界：
+  - 仍然只是 SDK 级最小 session queue
+  - 还不是 Claude Code 那种前台输入/后台任务/permission prompt 共享的完整状态机
+  - 也还没有更细的 queued-input 专门事件流
+
+新增测试：
+
+- 更新 `test/sdk/clart_code_agent_test.dart`
+  - 并发 prompt 自动串行排队
+  - `clearQueuedInputs()` 只取消 pending queue，不影响 active run
+  - `interrupt()` 打断当前 run 后，queued prompt 自动继续执行
+- 补跑回归：
+  - `test/sdk/sdk_helpers_test.dart`
+  - `test/sdk/session_store_test.dart`
+
+验证记录：
+
+- `HOME=/tmp DART_SUPPRESS_ANALYTICS=true dart analyze lib/src/sdk/clart_code_agent.dart lib/src/sdk/sdk_models.dart test/sdk/clart_code_agent_test.dart`
+- `HOME=/tmp DART_SUPPRESS_ANALYTICS=true dart test test/sdk/clart_code_agent_test.dart`
+- `HOME=/tmp DART_SUPPRESS_ANALYTICS=true dart test test/sdk/sdk_helpers_test.dart test/sdk/session_store_test.dart`
+
+当前剩余断点：
+
+- session interrupt / queued input 已有最小 SDK 语义，但还没有完整状态事件面
+- 如果继续只做 SDK，下一步优先级可以切到 `MCP transport` 的 CLI 收尾，或再评估更细 builtin input/error 约束
+
+## 2026-04-07 / Stage B hooks 细化
+
+本轮完成：
+
+- 更新 `lib/src/sdk/sdk_models.dart`
+  - 新增更细粒度 hooks/event：
+    - `onModelTurnStart`
+    - `onModelTurnEnd`
+    - `onToolPermissionDecision`
+    - `onCancelledTerminal`
+  - 新增事件模型：
+    - `ClartCodeModelTurnStartEvent`
+    - `ClartCodeModelTurnEndEvent`
+    - `ClartCodeToolPermissionEvent`
+    - `ClartCodeCancelledTerminalEvent`
+- 更新 `lib/src/sdk/clart_code_agent.dart`
+  - agent 主循环现在会在每轮 provider turn 前后发出 turn hooks
+  - permission 决策现在会明确区分来源：
+    - `resolveToolPermission`
+    - `canUseTool`
+  - cancellation terminal 现在会保留 stop reason，并通过专门 hook 发出
+- 取消路径小幅收口：
+  - `_stoppedError()` 现在会携带更具体的 cancellation reason
+  - `stop(reason: ...)` 的原因会继续流入 terminal cancelled event
+
+新增测试：
+
+- 更新 `test/sdk/clart_code_agent_test.dart`
+  - 覆盖 model turn start/end hook 顺序与载荷
+  - 覆盖 `onToolPermissionDecision`
+  - 覆盖 `onCancelledTerminal` 与 stop reason 回流
+
+验证记录：
+
+- `HOME=/tmp DART_SUPPRESS_ANALYTICS=true dart analyze lib/src/sdk/sdk_models.dart lib/src/sdk/clart_code_agent.dart test/sdk/clart_code_agent_test.dart test/sdk/sdk_helpers_test.dart`
+- `HOME=/tmp DART_SUPPRESS_ANALYTICS=true dart test test/sdk/clart_code_agent_test.dart test/sdk/sdk_helpers_test.dart`
+- `HOME=/tmp DART_SUPPRESS_ANALYTICS=true dart test test/tools/tool_scheduler_test.dart`
+
+当前剩余断点：
+
+- 更细粒度 hooks / permission decision 已基本收口
+- 下一步应直接进入更完整的 session interrupt / queued input / cancellation 语义
+- `MCP transport` 的 CLI 收尾继续后置
+
+## 2026-04-07 / `P0-5 MCP tool/resource` 错误语义补齐
+
+本轮完成：
+
+- 更新 `lib/src/mcp/mcp_types.dart`
+  - 新增结构化 `McpOperationException`
+  - 稳定区分：
+    - `invalid_tool_name`
+    - `invalid_resource_uri`
+    - `server_not_connected`
+    - `unsupported_transport`
+    - `tool_not_found`
+    - `resource_not_found`
+    - `mcp_call_failed`
+    - `mcp_read_failed`
+    - `mcp_list_resources_failed`
+- 更新 `lib/src/mcp/mcp_client.dart`
+  - 不再只抛零散字符串异常
+  - `tools/call` / `resources/read` / `resources/list` 现在会产出结构化 MCP error
+  - `resources/read` 返回空 contents 时也会收敛到稳定的 `resource_not_found`
+- 更新 `lib/src/mcp/mcp_manager.dart`
+  - `callTool()` / `readResource()` 不再只用裸 `Exception`
+  - 现在可区分：
+    - server 未连接
+    - unsupported transport
+    - invalid tool/resource 标识
+- 更新 `lib/src/tools/mcp_tools.dart`
+  - `McpToolWrapper` / `McpReadResourceTool` / `McpListResourcesTool` 统一输出稳定 error code
+  - MCP 返回 `isError` 时，稳定返回 `mcp_tool_error`
+  - tool/resource/list failure 现在都会带 MCP metadata
+- 更新 `lib/src/sdk/sdk_models.dart`
+- 更新 `lib/src/sdk/clart_code_agent.dart`
+  - `tool_result` 现在会透传 `metadata`
+  - agent transcript / provider 看到的 tool payload 不再只剩 `error_code` / `error_message`
+
+新增测试：
+
+- 新增 `test/tools/mcp_tools_test.dart`
+  - MCP tool success
+  - MCP `isError`
+  - `tool_not_found`
+  - read resource success/failure
+  - list resources failure
+- 更新 `test/mcp/mcp_manager_test.dart`
+  - invalid tool/resource format
+  - server 未连接
+  - unsupported transport
+- 更新 `test/sdk/clart_code_agent_test.dart`
+  - MCP tool `isError` metadata 回流到 transcript / tool payload
+  - MCP resource failure metadata 回流到 transcript / tool payload
+
+验证记录：
+
+- `HOME=/tmp DART_SUPPRESS_ANALYTICS=true dart analyze lib/src/mcp/mcp_types.dart lib/src/mcp/mcp_client.dart lib/src/mcp/mcp_manager.dart lib/src/tools/mcp_tools.dart lib/src/sdk/sdk_models.dart lib/src/sdk/clart_code_agent.dart test/tools/mcp_tools_test.dart test/mcp/mcp_manager_test.dart test/sdk/clart_code_agent_test.dart`
+- `HOME=/tmp DART_SUPPRESS_ANALYTICS=true dart test test/tools/mcp_tools_test.dart test/mcp/mcp_manager_test.dart test/sdk/clart_code_agent_test.dart`
+
+当前剩余断点：
+
+- `P0-5` 在 SDK 范围内已收尾
+- 下一步应回到更细粒度 hooks / permission decision / interrupt
+- `MCP transport` 的 CLI 收尾仍后置
+
+## 2026-04-07 / `P0-4 builtin tools` 第一批补齐
+
+本轮完成：
+
+- 更新 `lib/src/tools/builtin_tools.dart`
+  - `shell` 已从 stub 改为真实执行
+  - 支持：
+    - `command`
+    - 可选 `cwd`
+    - 可选 `env`
+    - 可选 `timeoutMs`
+  - 成功时返回真实 stdout/stderr 聚合输出与 metadata
+  - 失败时返回稳定错误码：
+    - `invalid_input`
+    - `spawn_failed`
+    - `command_failed`
+    - `timeout`
+- builtin file tools 现在可绑定 SDK session cwd
+  - `read`
+  - `write`
+- 新增 builtin tools：
+  - `edit`
+  - `glob`
+  - `grep`
+- 更新 `lib/src/tools/tool_executor.dart`
+  - `ToolExecutor.minimal()` 现在默认包含：
+    - `read`
+    - `write`
+    - `edit`
+    - `glob`
+    - `grep`
+    - `shell`
+- 更新 `lib/src/sdk/clart_code_agent.dart`
+  - agent 默认 builtin tool executor 现在会绑定到 session cwd
+  - `shell pwd`
+  - `glob`
+  - `grep`
+  - `edit`
+  都按 SDK cwd 语义执行
+
+新增测试：
+
+- 新增 `test/tools/builtin_tools_test.dart`
+  - relative `read/write`
+  - real `shell`
+  - non-zero exit code
+  - timeout
+  - `edit`
+  - `glob`
+  - `grep`
+- 更新 `test/sdk/clart_code_agent_test.dart`
+  - `write + shell` 闭环改为真实 shell cwd 断言
+  - 新增 `edit + glob + grep` agent 闭环
+
+当前剩余断点：
+
+- builtin tools 第一批已可用，但输入约束与错误语义仍可继续细化
+- 下一步应直接进入 `P0-5 MCP tool/resource` 错误语义补齐
+
 ## 2026-04-07 / `P0-3 Tool public API` 补强
 
 本轮完成：
