@@ -1,5 +1,7 @@
 /// MCP Stdio 传输实现
 /// 通过子进程的 stdin/stdout 进行 JSON-RPC 通信
+library mcp_stdio_transport;
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';

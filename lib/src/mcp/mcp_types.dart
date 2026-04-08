@@ -1,7 +1,7 @@
 // MCP (Model Context Protocol) 类型定义
 // 基于 JSON-RPC 2.0 协议
 
-enum McpTransportType { stdio, sse, http, ws }
+enum McpTransportType { stdio, sse, http, ws, sdk }
 
 enum McpServerStatus { pending, connected, failed, needsAuth, disabled }
 
@@ -14,6 +14,7 @@ const Set<McpTransportType> mcpRegistryTransportTypes = {
 
 const Set<McpTransportType> mcpRuntimeSupportedTransportTypes = {
   McpTransportType.stdio,
+  McpTransportType.sdk,
 };
 
 extension McpTransportTypeCapabilities on McpTransportType {

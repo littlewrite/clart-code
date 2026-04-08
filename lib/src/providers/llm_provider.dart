@@ -8,7 +8,7 @@ import 'http_retry.dart';
 import 'sse_parser.dart';
 
 /// Types of events emitted during streaming provider execution.
-enum ProviderStreamEventType { textDelta, done, error }
+enum ProviderStreamEventType { textDelta, done, error, streamEvent, rateLimit }
 
 /// Event emitted during streaming LLM provider execution.
 ///
@@ -21,7 +21,11 @@ class ProviderStreamEvent {
     this.model,
     this.error,
     this.toolCalls = const [],
+    this.usage,
+    this.costUsd,
     this.providerStateToken,
+    this.event,
+    this.rateLimitInfo,
   });
 
   final ProviderStreamEventType type;
@@ -30,7 +34,11 @@ class ProviderStreamEvent {
   final String? model;
   final RuntimeError? error;
   final List<QueryToolCall> toolCalls;
+  final QueryUsage? usage;
+  final double? costUsd;
   final String? providerStateToken;
+  final Map<String, Object?>? event;
+  final QueryRateLimitInfo? rateLimitInfo;
 
   factory ProviderStreamEvent.textDelta({
     required String delta,
@@ -47,6 +55,8 @@ class ProviderStreamEvent {
     required String output,
     String? model,
     List<QueryToolCall> toolCalls = const [],
+    QueryUsage? usage,
+    double? costUsd,
     String? providerStateToken,
   }) {
     return ProviderStreamEvent(
@@ -54,6 +64,8 @@ class ProviderStreamEvent {
       output: output,
       model: model,
       toolCalls: toolCalls,
+      usage: usage,
+      costUsd: costUsd,
       providerStateToken: providerStateToken,
     );
   }
@@ -63,6 +75,8 @@ class ProviderStreamEvent {
     String? output,
     String? model,
     List<QueryToolCall> toolCalls = const [],
+    QueryUsage? usage,
+    double? costUsd,
     String? providerStateToken,
   }) {
     return ProviderStreamEvent(
@@ -71,7 +85,33 @@ class ProviderStreamEvent {
       output: output,
       model: model,
       toolCalls: toolCalls,
+      usage: usage,
+      costUsd: costUsd,
       providerStateToken: providerStateToken,
+    );
+  }
+
+  factory ProviderStreamEvent.streamEvent({
+    required Map<String, Object?> event,
+    String? model,
+  }) {
+    return ProviderStreamEvent(
+      type: ProviderStreamEventType.streamEvent,
+      event: Map<String, Object?>.unmodifiable(
+        Map<String, Object?>.from(event),
+      ),
+      model: model,
+    );
+  }
+
+  factory ProviderStreamEvent.rateLimit({
+    required QueryRateLimitInfo rateLimitInfo,
+    String? model,
+  }) {
+    return ProviderStreamEvent(
+      type: ProviderStreamEventType.rateLimit,
+      rateLimitInfo: rateLimitInfo,
+      model: model,
     );
   }
 }
@@ -114,6 +154,8 @@ abstract class LlmProvider {
         output: _formatCancelledOutput(request),
         model: response.modelUsed,
         toolCalls: response.toolCalls,
+        usage: response.usage,
+        costUsd: response.costUsd,
         providerStateToken: response.providerStateToken,
       );
       return;
@@ -129,6 +171,8 @@ abstract class LlmProvider {
         output: response.output,
         model: response.modelUsed,
         toolCalls: response.toolCalls,
+        usage: response.usage,
+        costUsd: response.costUsd,
         providerStateToken: response.providerStateToken,
       );
       return;
@@ -145,6 +189,8 @@ abstract class LlmProvider {
       output: response.output,
       model: response.modelUsed,
       toolCalls: response.toolCalls,
+      usage: response.usage,
+      costUsd: response.costUsd,
       providerStateToken: response.providerStateToken,
     );
   }
@@ -264,6 +310,17 @@ class ClaudeApiProvider extends NativeToolCallingLlmProvider {
       httpRequest.add(utf8.encode(jsonEncode(body)));
 
       final httpResponse = await httpRequest.close().timeout(requestTimeout);
+      final rateLimitInfo = _extractRateLimitInfoFromHeaders(
+        httpResponse.headers,
+        provider: 'claude',
+        statusCode: httpResponse.statusCode,
+      );
+      if (request.includeObservabilityMessages && rateLimitInfo != null) {
+        yield ProviderStreamEvent.rateLimit(
+          rateLimitInfo: rateLimitInfo,
+          model: modelUsed,
+        );
+      }
       if (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300) {
         final responseText = await httpResponse.transform(utf8.decoder).join();
         final responseMap = _decodeJsonObject(responseText);
@@ -298,6 +355,15 @@ class ClaudeApiProvider extends NativeToolCallingLlmProvider {
           streamState: streamState,
         );
         modelUsed = parsed.modelUsed;
+        if (request.includeObservabilityMessages) {
+          final rawEvent = _decodeJsonObject(sseEvent.data);
+          if (rawEvent.isNotEmpty) {
+            yield ProviderStreamEvent.streamEvent(
+              event: rawEvent,
+              model: modelUsed,
+            );
+          }
+        }
         for (final event in parsed.events) {
           yield event;
         }
@@ -317,6 +383,8 @@ class ClaudeApiProvider extends NativeToolCallingLlmProvider {
                   : output,
           model: modelUsed,
           toolCalls: streamState.toolCalls,
+          usage: streamState.usage,
+          costUsd: streamState.costUsd,
         );
       }
     } catch (error) {
@@ -329,6 +397,8 @@ class ClaudeApiProvider extends NativeToolCallingLlmProvider {
           output: _formatCancelledOutput(request),
           model: modelUsed,
           toolCalls: streamState.toolCalls,
+          usage: streamState.usage,
+          costUsd: streamState.costUsd,
         );
         return;
       }
@@ -340,6 +410,8 @@ class ClaudeApiProvider extends NativeToolCallingLlmProvider {
         error: runtimeError,
         output: _formatClaudeErrorOutput(runtimeError),
         model: modelUsed,
+        usage: streamState.usage,
+        costUsd: streamState.costUsd,
       );
     } finally {
       if (identical(_activeClient, client)) {
@@ -398,6 +470,15 @@ class ClaudeApiProvider extends NativeToolCallingLlmProvider {
                       : output,
               modelUsed: responseMap['model'] as String? ?? requestedModel,
               toolCalls: toolCalls,
+              usage: _extractUsageFromMap(
+                responseMap,
+                usageKey: 'usage',
+                inputTokensKey: 'input_tokens',
+                outputTokensKey: 'output_tokens',
+                cacheCreationInputTokensKey: 'cache_creation_input_tokens',
+                cacheReadInputTokensKey: 'cache_read_input_tokens',
+              ),
+              costUsd: _extractUsdCost(responseMap),
             );
           }
 
@@ -571,6 +652,44 @@ class ClaudeApiProvider extends NativeToolCallingLlmProvider {
     return text;
   }
 
+  QueryUsage? _extractClaudeUsage(Map<String, Object?> payload) {
+    final message = payload['message'];
+    if (message is Map<String, dynamic>) {
+      final usage = _extractUsageFromMap(
+        Map<String, Object?>.from(message),
+        usageKey: 'usage',
+        inputTokensKey: 'input_tokens',
+        outputTokensKey: 'output_tokens',
+        cacheCreationInputTokensKey: 'cache_creation_input_tokens',
+        cacheReadInputTokensKey: 'cache_read_input_tokens',
+      );
+      if (usage != null) {
+        return usage;
+      }
+    }
+
+    final delta = payload['delta'];
+    if (delta is Map<String, dynamic>) {
+      return _extractUsageFromMap(
+        Map<String, Object?>.from(delta),
+        usageKey: 'usage',
+        inputTokensKey: 'input_tokens',
+        outputTokensKey: 'output_tokens',
+        cacheCreationInputTokensKey: 'cache_creation_input_tokens',
+        cacheReadInputTokensKey: 'cache_read_input_tokens',
+      );
+    }
+
+    return _extractUsageFromMap(
+      payload,
+      usageKey: 'usage',
+      inputTokensKey: 'input_tokens',
+      outputTokensKey: 'output_tokens',
+      cacheCreationInputTokensKey: 'cache_creation_input_tokens',
+      cacheReadInputTokensKey: 'cache_read_input_tokens',
+    );
+  }
+
   _ClaudeStreamPayloadParseResult _parseClaudeStreamPayload({
     required String rawPayload,
     required String? eventName,
@@ -609,6 +728,8 @@ class ClaudeApiProvider extends NativeToolCallingLlmProvider {
           output: _formatClaudeErrorOutput(runtimeError),
           model: modelUsed,
           toolCalls: streamState.toolCalls,
+          usage: streamState.usage,
+          costUsd: streamState.costUsd,
         ),
       );
       terminal = true;
@@ -622,6 +743,15 @@ class ClaudeApiProvider extends NativeToolCallingLlmProvider {
     final startedModel = _extractClaudeModel(payload);
     if (startedModel != null && startedModel.isNotEmpty) {
       modelUsed = startedModel;
+    }
+
+    final usage = _extractClaudeUsage(payload);
+    if (usage != null) {
+      streamState.usage = QueryUsage.combine([streamState.usage, usage]);
+    }
+    final costUsd = _extractUsdCost(payload);
+    if (costUsd != null) {
+      streamState.costUsd = _sumNullableDouble(streamState.costUsd, costUsd);
     }
 
     final index = payload['index'] as int?;
@@ -677,6 +807,8 @@ class ClaudeApiProvider extends NativeToolCallingLlmProvider {
                   : output,
           model: modelUsed,
           toolCalls: streamState.toolCalls,
+          usage: streamState.usage,
+          costUsd: streamState.costUsd,
         ),
       );
       terminal = true;
@@ -833,6 +965,218 @@ Map<String, Object?> _decodeJsonObject(String raw) {
   return const {};
 }
 
+QueryUsage? _extractUsageFromMap(
+  Map<String, Object?> source, {
+  required String usageKey,
+  String? inputTokensKey,
+  String? outputTokensKey,
+  String? totalTokensKey,
+  String? reasoningTokensKey,
+  String? cachedInputTokensKey,
+  String? cacheCreationInputTokensKey,
+  String? cacheReadInputTokensKey,
+  List<String>? reasoningTokensPath,
+  List<String>? cachedInputTokensPath,
+}) {
+  final usageSource = _lookupNestedMap(source, [usageKey]);
+  if (usageSource == null) {
+    return null;
+  }
+
+  final usage = QueryUsage(
+    inputTokens:
+        inputTokensKey == null ? null : _asInt(usageSource[inputTokensKey]),
+    outputTokens:
+        outputTokensKey == null ? null : _asInt(usageSource[outputTokensKey]),
+    totalTokens:
+        totalTokensKey == null ? null : _asInt(usageSource[totalTokensKey]),
+    reasoningTokens: reasoningTokensPath == null
+        ? (reasoningTokensKey == null
+            ? null
+            : _asInt(usageSource[reasoningTokensKey]))
+        : _asInt(_lookupNestedValue(usageSource, reasoningTokensPath)),
+    cachedInputTokens: cachedInputTokensPath == null
+        ? (cachedInputTokensKey == null
+            ? null
+            : _asInt(usageSource[cachedInputTokensKey]))
+        : _asInt(_lookupNestedValue(usageSource, cachedInputTokensPath)),
+    cacheCreationInputTokens: cacheCreationInputTokensKey == null
+        ? null
+        : _asInt(usageSource[cacheCreationInputTokensKey]),
+    cacheReadInputTokens: cacheReadInputTokensKey == null
+        ? null
+        : _asInt(usageSource[cacheReadInputTokensKey]),
+    raw: Map<String, Object?>.unmodifiable(usageSource),
+  );
+  return usage.isEmpty ? null : usage;
+}
+
+double? _extractUsdCost(Map<String, Object?> source) {
+  final direct = _asDouble(source['cost_usd']) ??
+      _asDouble(source['total_cost_usd']) ??
+      _asDouble(source['cost']);
+  if (direct != null) {
+    return direct;
+  }
+
+  final usage = _lookupNestedMap(source, const ['usage']);
+  if (usage != null) {
+    final usageCost = _asDouble(usage['cost_usd']) ??
+        _asDouble(usage['total_cost_usd']) ??
+        _asDouble(usage['cost']) ??
+        _asDouble(usage['total_cost']);
+    if (usageCost != null) {
+      return usageCost;
+    }
+  }
+
+  final nestedResponse = _lookupNestedMap(source, const ['response']);
+  if (nestedResponse != null) {
+    return _extractUsdCost(nestedResponse);
+  }
+
+  return null;
+}
+
+Map<String, Object?>? _lookupNestedMap(
+  Map<String, Object?> source,
+  List<String> path,
+) {
+  final value = _lookupNestedValue(source, path);
+  if (value is Map<String, Object?>) {
+    return value;
+  }
+  if (value is Map) {
+    return Map<String, Object?>.from(value);
+  }
+  return null;
+}
+
+Object? _lookupNestedValue(Map<String, Object?> source, List<String> path) {
+  Object? current = source;
+  for (final key in path) {
+    if (current is Map<String, Object?>) {
+      current = current[key];
+      continue;
+    }
+    if (current is Map) {
+      current = current[key];
+      continue;
+    }
+    return null;
+  }
+  return current;
+}
+
+int? _asInt(Object? value) {
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.toInt();
+  }
+  if (value is String) {
+    return int.tryParse(value);
+  }
+  return null;
+}
+
+double? _asDouble(Object? value) {
+  if (value is double) {
+    return value;
+  }
+  if (value is num) {
+    return value.toDouble();
+  }
+  if (value is String) {
+    return double.tryParse(value);
+  }
+  return null;
+}
+
+double? _sumNullableDouble(double? left, double? right) {
+  if (left == null) {
+    return right;
+  }
+  if (right == null) {
+    return left;
+  }
+  return left + right;
+}
+
+QueryRateLimitInfo? _extractRateLimitInfoFromHeaders(
+  HttpHeaders headers, {
+  required String provider,
+  int? statusCode,
+}) {
+  String? firstValue(List<String> names) {
+    for (final name in names) {
+      final value = headers.value(name)?.trim();
+      if (value != null && value.isNotEmpty) {
+        return value;
+      }
+    }
+    return null;
+  }
+
+  final requestsLimit = firstValue([
+    'anthropic-ratelimit-requests-limit',
+    'x-ratelimit-limit-requests',
+  ]);
+  final requestsRemaining = firstValue([
+    'anthropic-ratelimit-requests-remaining',
+    'x-ratelimit-remaining-requests',
+  ]);
+  final requestsReset = firstValue([
+    'anthropic-ratelimit-requests-reset',
+    'x-ratelimit-reset-requests',
+  ]);
+  final tokensLimit = firstValue([
+    'anthropic-ratelimit-tokens-limit',
+    'x-ratelimit-limit-tokens',
+  ]);
+  final tokensRemaining = firstValue([
+    'anthropic-ratelimit-tokens-remaining',
+    'x-ratelimit-remaining-tokens',
+  ]);
+  final tokensReset = firstValue([
+    'anthropic-ratelimit-tokens-reset',
+    'x-ratelimit-reset-tokens',
+  ]);
+  final retryAfter = firstValue([
+    'retry-after',
+  ]);
+
+  final raw = <String, Object?>{};
+  void addIfPresent(String key, String? value) {
+    if (value != null && value.isNotEmpty) {
+      raw[key] = value;
+    }
+  }
+
+  addIfPresent('requests_limit', requestsLimit);
+  addIfPresent('requests_remaining', requestsRemaining);
+  addIfPresent('requests_reset', requestsReset);
+  addIfPresent('tokens_limit', tokensLimit);
+  addIfPresent('tokens_remaining', tokensRemaining);
+  addIfPresent('tokens_reset', tokensReset);
+  addIfPresent('retry_after', retryAfter);
+
+  final info = QueryRateLimitInfo(
+    provider: provider,
+    status: statusCode == 429 ? 'rate_limited' : 'ok',
+    requestsLimit: requestsLimit,
+    requestsRemaining: requestsRemaining,
+    requestsReset: requestsReset,
+    tokensLimit: tokensLimit,
+    tokensRemaining: tokensRemaining,
+    tokensReset: tokensReset,
+    retryAfter: retryAfter,
+    raw: Map<String, Object?>.unmodifiable(raw),
+  );
+  return info.hasData ? info : null;
+}
+
 Map<String, Object?> _buildClaudeRequestBodyPayload({
   required QueryRequest request,
   String? fallbackModel,
@@ -843,6 +1187,14 @@ Map<String, Object?> _buildClaudeRequestBodyPayload({
     request.messages,
     systemMessages: systemMessages,
   );
+  final prependedSystemPrompt = request.systemPrompt?.trim();
+  if (prependedSystemPrompt != null && prependedSystemPrompt.isNotEmpty) {
+    systemMessages.insert(0, prependedSystemPrompt);
+  }
+  final appendedSystemPrompt = request.appendSystemPrompt?.trim();
+  if (appendedSystemPrompt != null && appendedSystemPrompt.isNotEmpty) {
+    systemMessages.add(appendedSystemPrompt);
+  }
 
   if (messages.isEmpty) {
     messages.add({'role': 'user', 'content': ''});
@@ -850,8 +1202,9 @@ Map<String, Object?> _buildClaudeRequestBodyPayload({
 
   return {
     'model': resolvedModel,
-    'max_tokens': _defaultClaudeMaxTokens,
-    'thinking': const {'type': 'disabled'},
+    'max_tokens': request.maxTokens ?? _defaultClaudeMaxTokens,
+    'thinking':
+        (request.thinking ?? const ClartCodeThinkingConfig.disabled()).toJson(),
     if (systemMessages.isNotEmpty) 'system': systemMessages.join('\n'),
     'messages': messages,
     if (request.toolDefinitions.isNotEmpty)
@@ -1015,6 +1368,8 @@ class _ClaudeStreamPayloadParseResult {
 class _ClaudeStreamingState {
   final Map<int, _ClaudeContentBlockState> _blocks = {};
   final List<QueryToolCall> _toolCalls = [];
+  QueryUsage? usage;
+  double? costUsd;
 
   List<QueryToolCall> get toolCalls =>
       List<QueryToolCall>.unmodifiable(_toolCalls);
@@ -1182,6 +1537,17 @@ class OpenAiApiProvider extends NativeToolCallingLlmProvider {
       httpRequest.add(utf8.encode(jsonEncode(body)));
 
       final httpResponse = await httpRequest.close().timeout(requestTimeout);
+      final rateLimitInfo = _extractRateLimitInfoFromHeaders(
+        httpResponse.headers,
+        provider: 'openai',
+        statusCode: httpResponse.statusCode,
+      );
+      if (request.includeObservabilityMessages && rateLimitInfo != null) {
+        yield ProviderStreamEvent.rateLimit(
+          rateLimitInfo: rateLimitInfo,
+          model: modelUsed,
+        );
+      }
       if (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300) {
         final responseText = await httpResponse.transform(utf8.decoder).join();
         final responseMap = _decodeJsonObject(responseText);
@@ -1215,6 +1581,15 @@ class OpenAiApiProvider extends NativeToolCallingLlmProvider {
           outputBuffer: outputBuffer,
         );
         modelUsed = parsed.modelUsed;
+        if (request.includeObservabilityMessages && sseEvent.data != '[DONE]') {
+          final rawEvent = _decodeJsonObject(sseEvent.data);
+          if (rawEvent.isNotEmpty) {
+            yield ProviderStreamEvent.streamEvent(
+              event: rawEvent,
+              model: modelUsed,
+            );
+          }
+        }
 
         final hasTextDelta = parsed.events.any(
           (event) => event.type == ProviderStreamEventType.textDelta,
@@ -1240,6 +1615,8 @@ class OpenAiApiProvider extends NativeToolCallingLlmProvider {
               output: fallback.output,
               model: fallbackModel,
               toolCalls: fallback.toolCalls,
+              usage: fallback.usage,
+              costUsd: fallback.costUsd,
               providerStateToken: fallback.providerStateToken,
             );
           } else {
@@ -1254,6 +1631,8 @@ class OpenAiApiProvider extends NativeToolCallingLlmProvider {
               output: fallback.output,
               model: fallbackModel,
               toolCalls: fallback.toolCalls,
+              usage: fallback.usage,
+              costUsd: fallback.costUsd,
               providerStateToken: fallback.providerStateToken,
             );
           }
@@ -1354,8 +1733,11 @@ class OpenAiApiProvider extends NativeToolCallingLlmProvider {
                   : output.isEmpty
                       ? '[empty-output]'
                       : output,
-              modelUsed: responseMap['model'] as String? ?? chosenModel,
+              modelUsed:
+                  _extractOpenAiResponsesModel(responseMap) ?? chosenModel,
               toolCalls: toolCalls,
+              usage: _extractOpenAiResponsesUsage(responseMap),
+              costUsd: _extractUsdCost(responseMap),
               providerStateToken: _extractOpenAiResponsesId(responseMap),
             );
           }
@@ -1462,6 +1844,16 @@ Map<String, Object?> _buildOpenAiResponsesRequestBodyPayload({
       : _buildOpenAiResponsesContinuationInput(request.messages);
 
   if (request.providerStateToken == null) {
+    final prependedSystemPrompt = request.systemPrompt?.trim();
+    if (prependedSystemPrompt != null && prependedSystemPrompt.isNotEmpty) {
+      input.add({
+        'role': 'system',
+        'content': [
+          {'type': 'input_text', 'text': prependedSystemPrompt},
+        ],
+      });
+    }
+
     for (final message in request.messages) {
       final text = switch (message.role) {
         MessageRole.tool => '[tool] ${message.text}',
@@ -1475,6 +1867,16 @@ Map<String, Object?> _buildOpenAiResponsesRequestBodyPayload({
             'type': _toOpenAiResponsesContentType(message.role),
             'text': text,
           },
+        ],
+      });
+    }
+
+    final appendedSystemPrompt = request.appendSystemPrompt?.trim();
+    if (appendedSystemPrompt != null && appendedSystemPrompt.isNotEmpty) {
+      input.add({
+        'role': 'system',
+        'content': [
+          {'type': 'input_text', 'text': appendedSystemPrompt},
         ],
       });
     }
@@ -1494,12 +1896,46 @@ Map<String, Object?> _buildOpenAiResponsesRequestBodyPayload({
     if (request.providerStateToken != null)
       'previous_response_id': request.providerStateToken,
     'input': input,
+    if (request.maxTokens != null) 'max_output_tokens': request.maxTokens,
+    if (request.effort != null)
+      'reasoning': {
+        'effort': request.effort!.name,
+      },
+    if (request.jsonSchema != null || request.outputFormat != null)
+      'text': {
+        'format': _buildOpenAiResponsesTextFormat(
+          jsonSchema: request.jsonSchema,
+          outputFormat: request.outputFormat,
+        ),
+      },
     if (request.toolDefinitions.isNotEmpty)
       'tools': request.toolDefinitions
           .map(_buildOpenAiResponsesToolDefinition)
           .toList(growable: false),
     if (request.toolDefinitions.isNotEmpty) 'tool_choice': 'auto',
   };
+}
+
+Map<String, Object?> _buildOpenAiResponsesTextFormat({
+  required ClartCodeJsonSchema? jsonSchema,
+  required ClartCodeOutputFormat? outputFormat,
+}) {
+  if (jsonSchema != null) {
+    return {
+      'type': 'json_schema',
+      'name': jsonSchema.name,
+      'schema': jsonSchema.schema,
+      'strict': jsonSchema.strict,
+    };
+  }
+
+  switch (outputFormat?.type) {
+    case ClartCodeOutputFormatType.jsonObject:
+      return const {'type': 'json_object'};
+    case ClartCodeOutputFormatType.text:
+    case null:
+      return const {'type': 'text'};
+  }
 }
 
 List<Map<String, Object?>> _buildOpenAiResponsesContinuationInput(
@@ -1628,6 +2064,30 @@ String? _extractOpenAiResponsesId(Map<String, Object?> responseMap) {
     return id;
   }
   return null;
+}
+
+QueryUsage? _extractOpenAiResponsesUsage(
+  Map<String, Object?> responseMap,
+) {
+  final nestedResponse = responseMap['response'];
+  if (nestedResponse is Map<String, dynamic>) {
+    final nestedUsage = _extractOpenAiResponsesUsage(
+      Map<String, Object?>.from(nestedResponse),
+    );
+    if (nestedUsage != null) {
+      return nestedUsage;
+    }
+  }
+
+  return _extractUsageFromMap(
+    responseMap,
+    usageKey: 'usage',
+    inputTokensKey: 'input_tokens',
+    outputTokensKey: 'output_tokens',
+    totalTokensKey: 'total_tokens',
+    reasoningTokensPath: ['output_tokens_details', 'reasoning_tokens'],
+    cachedInputTokensPath: ['input_tokens_details', 'cached_tokens'],
+  );
 }
 
 List<QueryToolCall> _extractOpenAiResponsesToolCalls(
@@ -1822,6 +2282,8 @@ _OpenAiResponsesStreamPayloadParseResult _parseOpenAiResponsesStreamPayload({
   if (effectiveType == 'response.completed') {
     final completedOutput = _extractOpenAiResponsesOutput(payload);
     final toolCalls = _extractOpenAiResponsesToolCalls(payload);
+    final usage = _extractOpenAiResponsesUsage(payload);
+    final costUsd = _extractUsdCost(payload);
     final output =
         completedOutput.isNotEmpty ? completedOutput : outputBuffer.toString();
     events.add(
@@ -1833,6 +2295,8 @@ _OpenAiResponsesStreamPayloadParseResult _parseOpenAiResponsesStreamPayload({
                 : output,
         model: modelUsed,
         toolCalls: toolCalls,
+        usage: usage,
+        costUsd: costUsd,
         providerStateToken: _extractOpenAiResponsesId(payload),
       ),
     );

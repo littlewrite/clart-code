@@ -3,8 +3,10 @@
 import 'dart:async';
 import 'dart:io';
 
+import '../tools/tool_models.dart';
 import 'mcp_client.dart';
 import 'mcp_registry.dart';
+import 'sdk_mcp_server.dart';
 import 'mcp_types.dart';
 
 /// MCP 管理器
@@ -14,6 +16,7 @@ class McpManager {
   final String registryPath;
   final _connections = <String, McpClient>{};
   final _connectionStatus = <String, McpConnection>{};
+  final _sdkServers = <String, McpSdkServerConfig>{};
 
   List<McpTransportType> get recognizedTransportTypes =>
       List<McpTransportType>.unmodifiable(mcpRegistryTransportTypes);
@@ -60,6 +63,13 @@ class McpManager {
       status: McpServerStatus.pending,
       config: config,
     );
+
+    if (config is McpSdkServerConfig) {
+      _sdkServers[name] = config;
+      final connection = config.toConnection();
+      _connectionStatus[name] = connection;
+      return connection;
+    }
 
     if (config is! McpStdioServerConfig) {
       final connection = McpConnection(
@@ -116,6 +126,7 @@ class McpManager {
   Future<void> disconnect(String name) async {
     final client = _connections.remove(name);
     await client?.disconnect();
+    _sdkServers.remove(name);
     _connectionStatus.remove(name);
   }
 
@@ -125,6 +136,7 @@ class McpManager {
       await client.disconnect();
     }
     _connections.clear();
+    _sdkServers.clear();
     _connectionStatus.clear();
   }
 
@@ -158,6 +170,19 @@ class McpManager {
         } catch (e) {
           // 忽略单个服务器的错误
         }
+      }
+    }
+
+    for (final entry in _sdkServers.entries) {
+      final server = entry.value;
+      for (final tool in server.tools) {
+        allTools.add(
+          McpTool(
+            name: '${entry.key}/${tool.name}',
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+          ),
+        );
       }
     }
 
@@ -206,6 +231,16 @@ class McpManager {
     final toolName = name.substring(separatorIndex + 1);
 
     final client = _connections[serverName];
+    if (client == null) {
+      final sdkServer = _sdkServers[serverName];
+      if (sdkServer != null) {
+        return _callSdkTool(
+          server: sdkServer,
+          toolName: toolName,
+          arguments: arguments,
+        );
+      }
+    }
     if (client == null) {
       throw _buildUnavailableServerError(serverName);
     }
@@ -264,5 +299,62 @@ class McpManager {
       serverName: serverName,
       connection: connection,
     );
+  }
+
+  Future<Map<String, Object?>> _callSdkTool({
+    required McpSdkServerConfig server,
+    required String toolName,
+    Map<String, Object?>? arguments,
+  }) async {
+    Tool? matchedTool;
+    for (final tool in server.tools) {
+      if (tool.name == toolName) {
+        matchedTool = tool;
+        break;
+      }
+    }
+    if (matchedTool == null) {
+      throw McpOperationException.toolNotFound(
+        serverName: server.name,
+        toolName: toolName,
+      );
+    }
+
+    try {
+      final result = await matchedTool.run(
+        ToolInvocation(
+          name: toolName,
+          input: arguments ?? const {},
+        ),
+      );
+
+      final message = result.ok
+          ? result.output
+          : (result.errorMessage?.trim().isNotEmpty ?? false)
+              ? result.errorMessage!
+              : 'SDK MCP tool failed: ${server.name}/$toolName';
+      final content = message.isEmpty
+          ? const <Map<String, Object?>>[]
+          : <Map<String, Object?>>[
+              {
+                'type': 'text',
+                'text': message,
+              },
+            ];
+
+      return {
+        'content': content,
+        if (!result.ok) 'isError': true,
+        if (result.metadata != null) 'metadata': result.metadata,
+      };
+    } on McpOperationException {
+      rethrow;
+    } catch (error) {
+      throw McpOperationException.toolCallFailed(
+        serverName: server.name,
+        toolName: toolName,
+        message: error.toString(),
+      );
+    }
   }
 }

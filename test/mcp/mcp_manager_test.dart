@@ -2,7 +2,9 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:test/test.dart';
 import 'package:clart_code/src/mcp/mcp_manager.dart';
+import 'package:clart_code/src/mcp/sdk_mcp_server.dart';
 import 'package:clart_code/src/mcp/mcp_types.dart';
+import 'package:clart_code/src/tools/tool_models.dart';
 
 void main() {
   group('McpManager', () {
@@ -48,6 +50,18 @@ void main() {
       expect(config.env, {'KEY': 'value'});
     });
 
+    test('saveRegistry() rejects in-process SDK MCP servers', () async {
+      await expectLater(
+        manager.saveRegistry({
+          'local': createSdkMcpServer(
+            name: 'local',
+            tools: [_TestSdkMcpTool()],
+          ),
+        }),
+        throwsA(isA<UnsupportedError>()),
+      );
+    });
+
     test('loadRegistry() parses legacy CLI list format', () async {
       final file = File(registryPath);
       await file.writeAsString(jsonEncode([
@@ -84,7 +98,7 @@ void main() {
       expect(config?.isRuntimeSupported, isFalse);
       expect(
         config?.runtimeUnsupportedReason,
-        contains('current Dart runtime supports: stdio'),
+        contains('current Dart runtime supports:'),
       );
     });
 
@@ -114,16 +128,55 @@ void main() {
 
       expect(connection.status, McpServerStatus.failed);
       expect(connection.error, contains('unsupported MCP transport'));
-      expect(
-          connection.error, contains('current Dart runtime supports: stdio'));
+      expect(connection.error, contains('current Dart runtime supports:'));
+      expect(connection.error, contains('stdio'));
     });
 
-    test('manager exposes recognized vs runtime supported transports', () {
+    test('connect() supports in-process SDK MCP servers', () async {
+      final connection = await manager.connect(
+        createSdkMcpServer(
+          name: 'local',
+          version: '1.2.3',
+          tools: [_TestSdkMcpTool()],
+        ),
+      );
+
+      expect(connection.status, McpServerStatus.connected);
+      expect(connection.config.transportType, McpTransportType.sdk);
+      expect(connection.capabilities?.tools, isTrue);
+      expect(connection.serverInfo?.version, '1.2.3');
+
+      final tools = await manager.listAllTools();
+      expect(
+        tools.map((tool) => tool.name),
+        contains('local/echo_local'),
+      );
+
+      final call = await manager.callTool(
+        name: 'local/echo_local',
+        arguments: const {'message': 'hello'},
+      );
+      expect(call['isError'], isNull);
+      expect(call['content'], [
+        {'type': 'text', 'text': 'sdk:hello'},
+      ]);
+      expect(call['metadata'], {'origin': 'sdk'});
+    });
+
+    test('manager exposes registry vs runtime supported transports', () {
       expect(
         manager.recognizedTransportTypes,
-        containsAll(McpTransportType.values),
+        containsAll([
+          McpTransportType.stdio,
+          McpTransportType.sse,
+          McpTransportType.http,
+          McpTransportType.ws,
+        ]),
       );
-      expect(manager.supportedTransportTypes, [McpTransportType.stdio]);
+      expect(
+        manager.supportedTransportTypes,
+        [McpTransportType.stdio, McpTransportType.sdk],
+      );
     });
 
     test('getConnection() returns null for non-existent server', () {
@@ -222,4 +275,34 @@ void main() {
       );
     });
   });
+}
+
+class _TestSdkMcpTool implements Tool {
+  @override
+  String get name => 'echo_local';
+
+  @override
+  String? get title => null;
+
+  @override
+  String get description => 'Echo a local in-process payload.';
+
+  @override
+  Map<String, Object?>? get inputSchema => null;
+
+  @override
+  Map<String, Object?>? get annotations => null;
+
+  @override
+  ToolExecutionHint get executionHint => ToolExecutionHint.parallelSafe;
+
+  @override
+  Future<ToolExecutionResult> run(ToolInvocation invocation) async {
+    return ToolExecutionResult.success(
+      tool: name,
+      output: 'sdk:${invocation.input['message']}',
+    ).copyWith(
+      metadata: const {'origin': 'sdk'},
+    );
+  }
 }

@@ -974,6 +974,7 @@ _RichMessageRole _mapTranscriptMessageRole(TranscriptMessageKind kind) {
     case TranscriptMessageKind.localCommand:
     case TranscriptMessageKind.localCommandStdout:
     case TranscriptMessageKind.toolResult:
+    case TranscriptMessageKind.subagent:
     case TranscriptMessageKind.system:
       return _RichMessageRole.system;
     case TranscriptMessageKind.localCommandStderr:

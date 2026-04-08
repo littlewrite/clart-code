@@ -227,6 +227,1851 @@ void main() {
     }
   });
 
+  test('agent loads skills and exposes skill tool to the model', () async {
+    final tempDir = await Directory.systemTemp.createTemp('clart_sdk_skill_');
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          skills: ClartCodeSkillsOptions(
+            includeBundledSkills: false,
+            skills: [
+              ClartCodeSkillDefinition(
+                name: 'review_local',
+                description: 'Review code in a focused scope.',
+                whenToUse: 'Use when the user asks for a focused review.',
+                argumentHint: '[scope]',
+                allowedTools: const ['read', 'grep'],
+                getPrompt: (args, context) async => [
+                  ClartCodeSkillContentBlock.text(
+                    'Review the requested scope carefully and return findings first.${args.trim().isEmpty ? '' : '\nScope: ${args.trim()}'}',
+                  ),
+                  ClartCodeSkillContentBlock.text(
+                    'Turn=${context.turn};Model=${context.model}',
+                  ),
+                ],
+              ),
+              ClartCodeSkillDefinition(
+                name: 'slash_only',
+                description: 'Only for explicit slash-style user invocation.',
+                disableModelInvocation: true,
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text('slash-only prompt'),
+                ],
+              ),
+            ],
+          ),
+          providerOverride: _ScriptedToolLoopProvider((request) {
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            if (toolPayloads.isEmpty) {
+              final systemPrompt = request.messages
+                  .where((message) => message.role == MessageRole.system)
+                  .map((message) => message.text)
+                  .join('\n');
+              expect(systemPrompt, contains('Available skills:'));
+              expect(systemPrompt, contains('review_local'));
+              expect(systemPrompt, contains('focused review'));
+              expect(systemPrompt, isNot(contains('slash_only')));
+
+              return QueryResponse.success(
+                output: jsonEncode({
+                  'tool_calls': [
+                    {
+                      'id': 'call_skill_1',
+                      'name': 'skill',
+                      'input': {
+                        'skill': 'review_local',
+                        'args': 'lib/src/sdk',
+                      },
+                    },
+                  ],
+                }),
+                modelUsed: 'skill-mock',
+              );
+            }
+
+            final skillPayload = toolPayloads.single;
+            expect(skillPayload['tool'], 'skill');
+            expect(skillPayload['ok'], isTrue);
+            expect(
+              skillPayload['output'],
+              contains('Review the requested scope carefully'),
+            );
+            expect(skillPayload['output'], contains('Turn=1;Model=skill-mock'));
+            final metadata =
+                Map<String, Object?>.from(skillPayload['metadata'] as Map);
+            expect(metadata['skill'], 'review_local');
+            expect(metadata['context'], 'inline');
+            expect(metadata['allowed_tools'], ['read', 'grep']);
+
+            return QueryResponse.success(
+              output: 'skill applied: ${metadata['skill']}',
+              modelUsed: 'skill-mock',
+            );
+          }),
+        ),
+      );
+
+      await agent.prepare();
+      expect(agent.availableSkills, ['review_local']);
+      expect(agent.availableTools, contains('skill'));
+
+      final result = await agent.prompt('review this SDK surface');
+
+      expect(result.isError, isFalse);
+      expect(result.text, 'skill applied: review_local');
+      expect(
+        result.messages.first.toolDefinitions?.map((tool) => tool.name),
+        contains('skill'),
+      );
+      expect(
+        result.messages
+            .where((message) => message.type == 'tool_result')
+            .single
+            .toolResult
+            ?.metadata?['skill'],
+        'review_local',
+      );
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test(
+      'active skill narrows tools and overrides model and effort for later turns',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_skill_runtime_');
+
+    try {
+      final seenRequests = <QueryRequest>[];
+      final lifecycle = <String>[];
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'base-model',
+          effort: ClartCodeReasoningEffort.low,
+          skills: ClartCodeSkillsOptions(
+            includeBundledSkills: false,
+            skills: [
+              ClartCodeSkillDefinition(
+                name: 'review_local',
+                description: 'Review code in a focused scope.',
+                allowedTools: const ['read'],
+                model: 'skill-model',
+                effort: ClartCodeReasoningEffort.high,
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text(
+                    'Review the requested scope carefully and only read files.',
+                  ),
+                ],
+              ),
+            ],
+          ),
+          hooks: ClartCodeAgentHooks(
+            onModelTurnStart: (event) {
+              lifecycle.add(
+                'turn:${event.turn}:model=${event.model}:tools=${event.availableTools.join(',')}',
+              );
+            },
+            onToolPermissionDecision: (event) {
+              lifecycle.add(
+                'permission:${event.context.turn}:${event.toolCall.name}:${event.decision.name}:${event.source.name}:${event.message}',
+              );
+            },
+          ),
+          providerOverride: _NativeToolLoopProvider((request) {
+            seenRequests.add(request);
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            if (seenRequests.length == 1) {
+              expect(request.effort, ClartCodeReasoningEffort.low);
+              return QueryResponse.success(
+                output: '',
+                modelUsed: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_skill_runtime_1',
+                    name: 'skill',
+                    input: {'skill': 'review_local'},
+                  ),
+                ],
+              );
+            }
+
+            if (toolPayloads.length == 1) {
+              expect(request.model, 'skill-model');
+              expect(request.effort, ClartCodeReasoningEffort.high);
+              final toolNames =
+                  request.toolDefinitions.map((tool) => tool.name).toList();
+              expect(toolNames, containsAll(['skill', 'read']));
+              expect(toolNames, isNot(contains('write')));
+              final skillPayload = toolPayloads.single;
+              expect(skillPayload['tool'], 'skill');
+              expect(skillPayload['ok'], isTrue);
+              return QueryResponse.success(
+                output: '',
+                modelUsed: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_write_runtime_1',
+                    name: 'write',
+                    input: {
+                      'path': 'blocked.txt',
+                      'content': 'should not run',
+                    },
+                  ),
+                ],
+              );
+            }
+
+            expect(request.model, 'skill-model');
+            expect(request.effort, ClartCodeReasoningEffort.high);
+            final deniedPayload = toolPayloads.last;
+            expect(deniedPayload['tool'], 'write');
+            expect(deniedPayload['ok'], isFalse);
+            expect(deniedPayload['error_code'], 'permission_denied');
+            expect(
+              deniedPayload['error_message'],
+              contains('not allowed while skill "review_local" is active'),
+            );
+            final toolNames =
+                request.toolDefinitions.map((tool) => tool.name).toList();
+            expect(toolNames, containsAll(['skill', 'read']));
+            expect(toolNames, isNot(contains('write')));
+
+            return QueryResponse.success(
+              output: 'final skill-constrained answer',
+              modelUsed: request.model,
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.prompt('review this codebase with the skill');
+
+      expect(result.isError, isFalse);
+      expect(result.text, 'final skill-constrained answer');
+      expect(result.turns, 3);
+      expect(seenRequests, hasLength(3));
+      expect(
+          lifecycle,
+          contains(
+              'turn:1:model=base-model:tools=edit,glob,grep,read,shell,skill,write'));
+      expect(lifecycle, contains('turn:2:model=skill-model:tools=read,skill'));
+      expect(lifecycle, contains('turn:3:model=skill-model:tools=read,skill'));
+      expect(
+        lifecycle.where((entry) => entry.contains('permission:2:write')).single,
+        contains(
+            ':skill:tool "write" is not allowed while skill "review_local" is active'),
+      );
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('inline skill scope is limited to the current query', () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_skill_scope_');
+
+    try {
+      final seenRequests = <QueryRequest>[];
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'base-model',
+          skills: ClartCodeSkillsOptions(
+            includeBundledSkills: false,
+            skills: [
+              ClartCodeSkillDefinition(
+                name: 'review_local',
+                description: 'Review in read-only mode for one query.',
+                allowedTools: const ['read'],
+                model: 'skill-model',
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text(
+                    'Review carefully and stay read-only for this query only.',
+                  ),
+                ],
+              ),
+            ],
+          ),
+          providerOverride: _NativeToolLoopProvider((request) {
+            seenRequests.add(request);
+            switch (seenRequests.length) {
+              case 1:
+                expect(request.model, 'base-model');
+                expect(
+                  request.toolDefinitions.map((tool) => tool.name),
+                  containsAll(['skill', 'read', 'write']),
+                );
+                return QueryResponse.success(
+                  output: '',
+                  modelUsed: request.model,
+                  toolCalls: const [
+                    QueryToolCall(
+                      id: 'call_skill_scope_1',
+                      name: 'skill',
+                      input: {'skill': 'review_local'},
+                    ),
+                  ],
+                );
+              case 2:
+                expect(request.model, 'skill-model');
+                expect(
+                  request.toolDefinitions.map((tool) => tool.name),
+                  containsAll(['skill', 'read']),
+                );
+                expect(
+                  request.toolDefinitions.map((tool) => tool.name),
+                  isNot(contains('write')),
+                );
+                final skillPayload = request.messages
+                    .where((message) => message.role == MessageRole.tool)
+                    .map((message) => _decodeToolPayload(message.text))
+                    .last;
+                final metadata =
+                    Map<String, Object?>.from(skillPayload['metadata'] as Map);
+                expect(metadata['runtime_scope'], 'current_query');
+                expect(metadata['cleanup_boundary'], 'query_end');
+                return QueryResponse.success(
+                  output: 'first query complete',
+                  modelUsed: request.model,
+                );
+              case 3:
+                expect(request.model, 'base-model');
+                expect(
+                  request.toolDefinitions.map((tool) => tool.name),
+                  containsAll(['skill', 'read', 'write']),
+                );
+                return QueryResponse.success(
+                  output: '',
+                  modelUsed: request.model,
+                  toolCalls: const [
+                    QueryToolCall(
+                      id: 'call_write_scope_1',
+                      name: 'write',
+                      input: {
+                        'path': 'scoped.txt',
+                        'content': 'second query write',
+                      },
+                    ),
+                  ],
+                );
+              case 4:
+                expect(request.model, 'base-model');
+                expect(
+                  request.toolDefinitions.map((tool) => tool.name),
+                  containsAll(['skill', 'read', 'write']),
+                );
+                final writePayload = request.messages
+                    .where((message) => message.role == MessageRole.tool)
+                    .map((message) => _decodeToolPayload(message.text))
+                    .last;
+                expect(writePayload['tool'], 'write');
+                expect(writePayload['ok'], isTrue);
+                return QueryResponse.success(
+                  output: 'second query complete',
+                  modelUsed: request.model,
+                );
+            }
+            fail('unexpected request count: ${seenRequests.length}');
+          }),
+        ),
+      );
+
+      final first = await agent.prompt('activate the review skill');
+      final second = await agent.prompt('write a file after the skill query');
+
+      expect(first.isError, isFalse);
+      expect(first.text, 'first query complete');
+      expect(second.isError, isFalse);
+      expect(second.text, 'second query complete');
+      expect(seenRequests, hasLength(4));
+      expect(
+        File('${tempDir.path}/scoped.txt').readAsStringSync(),
+        'second query write',
+      );
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('inline skill lifecycle hooks expose activation replacement and cleanup',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_skill_hooks_');
+
+    try {
+      final seenRequests = <QueryRequest>[];
+      final lifecycle = <String>[];
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'base-model',
+          skills: ClartCodeSkillsOptions(
+            includeBundledSkills: false,
+            skills: [
+              ClartCodeSkillDefinition(
+                name: 'read_only',
+                description: 'Only read files.',
+                allowedTools: const ['read'],
+                model: 'read-model',
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text('Read only.'),
+                ],
+              ),
+              ClartCodeSkillDefinition(
+                name: 'shell_only',
+                description: 'Only use shell.',
+                allowedTools: const ['shell'],
+                model: 'shell-model',
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text('Shell only.'),
+                ],
+              ),
+            ],
+          ),
+          hooks: ClartCodeAgentHooks(
+            onSkillActivation: (event) {
+              lifecycle.add(
+                'start:${event.name}:${event.turn}:${event.model}:${(event.allowedTools ?? const []).join(',')}:${event.runtimeScope}:${event.cleanupBoundary}',
+              );
+            },
+            onSkillEnd: (event) {
+              lifecycle.add(
+                'end:${event.name}:${event.reason}:${event.activatedTurn}->${event.endedTurn}:${event.model}:${(event.allowedTools ?? const []).join(',')}',
+              );
+            },
+          ),
+          providerOverride: _NativeToolLoopProvider((request) {
+            seenRequests.add(request);
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            if (seenRequests.length == 1) {
+              expect(request.model, 'base-model');
+              return QueryResponse.success(
+                output: '',
+                modelUsed: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_skill_hook_1',
+                    name: 'skill',
+                    input: {'skill': 'read_only'},
+                  ),
+                ],
+              );
+            }
+
+            if (seenRequests.length == 2) {
+              expect(request.model, 'read-model');
+              expect(toolPayloads.single['tool'], 'skill');
+              expect(toolPayloads.single['ok'], isTrue);
+              return QueryResponse.success(
+                output: '',
+                modelUsed: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_skill_hook_2',
+                    name: 'skill',
+                    input: {'skill': 'shell_only'},
+                  ),
+                ],
+              );
+            }
+
+            expect(request.model, 'shell-model');
+            expect(toolPayloads.last['tool'], 'skill');
+            expect(toolPayloads.last['ok'], isTrue);
+            return QueryResponse.success(
+              output: 'hooked skill answer',
+              modelUsed: request.model,
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.prompt('exercise inline skill hooks');
+
+      expect(result.isError, isFalse);
+      expect(result.text, 'hooked skill answer');
+      expect(seenRequests, hasLength(3));
+      expect(lifecycle, [
+        'start:read_only:1:read-model:read,skill:current_query:query_end',
+        'end:read_only:replaced_by_skill:1->2:read-model:read,skill',
+        'start:shell_only:2:shell-model:shell,skill:current_query:query_end',
+        'end:shell_only:query_end:2->3:shell-model:shell,skill',
+      ]);
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('active skill can disallow tools without collapsing the full tool set',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_skill_disallow_');
+
+    try {
+      final seenRequests = <QueryRequest>[];
+      final lifecycle = <String>[];
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'base-model',
+          skills: ClartCodeSkillsOptions(
+            includeBundledSkills: false,
+            skills: [
+              ClartCodeSkillDefinition(
+                name: 'safe_edit',
+                description: 'Keep investigation broad but block writes.',
+                disallowedTools: const ['write'],
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text(
+                    'Inspect broadly, but do not modify files.',
+                  ),
+                ],
+              ),
+            ],
+          ),
+          hooks: ClartCodeAgentHooks(
+            onModelTurnStart: (event) {
+              lifecycle.add(
+                'turn:${event.turn}:model=${event.model}:tools=${event.availableTools.join(',')}',
+              );
+            },
+            onToolPermissionDecision: (event) {
+              lifecycle.add(
+                'permission:${event.context.turn}:${event.toolCall.name}:${event.decision.name}:${event.source.name}:${event.message}',
+              );
+            },
+          ),
+          providerOverride: _NativeToolLoopProvider((request) {
+            seenRequests.add(request);
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            if (toolPayloads.isEmpty) {
+              expect(request.model, 'base-model');
+              expect(
+                request.toolDefinitions.map((tool) => tool.name),
+                containsAll(['skill', 'read', 'write']),
+              );
+              return QueryResponse.success(
+                output: '',
+                modelUsed: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_skill_disallow_1',
+                    name: 'skill',
+                    input: {'skill': 'safe_edit'},
+                  ),
+                ],
+              );
+            }
+
+            if (seenRequests.length == 2) {
+              return QueryResponse.success(
+                output: '',
+                modelUsed: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_write_disallow_1',
+                    name: 'write',
+                    input: {
+                      'path': 'blocked.txt',
+                      'content': 'should not run',
+                    },
+                  ),
+                ],
+              );
+            }
+
+            return QueryResponse.success(
+              output: 'final safe-edit answer',
+              modelUsed: request.model,
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.prompt('investigate safely with the skill');
+
+      expect(result.isError, isFalse);
+      expect(result.text, 'final safe-edit answer');
+      expect(result.turns, 3);
+      expect(seenRequests, hasLength(3));
+      expect(seenRequests.first.model, 'base-model');
+      expect(
+        seenRequests.first.toolDefinitions.map((tool) => tool.name),
+        containsAll(['skill', 'read', 'write']),
+      );
+      expect(seenRequests[1].model, 'base-model');
+      expect(
+        seenRequests[1].toolDefinitions.map((tool) => tool.name),
+        containsAll(['skill', 'read', 'shell']),
+      );
+      expect(
+        seenRequests[1].toolDefinitions.map((tool) => tool.name),
+        isNot(contains('write')),
+      );
+      expect(seenRequests[2].model, 'base-model');
+      expect(
+        seenRequests[2].toolDefinitions.map((tool) => tool.name),
+        containsAll(['skill', 'read', 'shell']),
+      );
+      expect(
+        seenRequests[2].toolDefinitions.map((tool) => tool.name),
+        isNot(contains('write')),
+      );
+      final deniedPayload = seenRequests[2]
+          .messages
+          .where((message) => message.role == MessageRole.tool)
+          .map((message) => _decodeToolPayload(message.text))
+          .last;
+      expect(deniedPayload['tool'], 'write');
+      expect(deniedPayload['ok'], isFalse);
+      expect(deniedPayload['error_code'], 'permission_denied');
+      expect(
+        deniedPayload['error_message'],
+        contains('not allowed while skill "safe_edit" is active'),
+      );
+      expect(
+        lifecycle,
+        contains(
+          'turn:2:model=base-model:tools=edit,glob,grep,read,shell,skill',
+        ),
+      );
+      expect(
+        lifecycle.where((entry) => entry.contains('permission:2:write')).single,
+        contains(
+          ':skill:tool "write" is not allowed while skill "safe_edit" is active',
+        ),
+      );
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('same-turn inline skill activation constrains later tool calls',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_skill_same_turn_');
+
+    try {
+      final seenRequests = <QueryRequest>[];
+      final lifecycle = <String>[];
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'base-model',
+          skills: ClartCodeSkillsOptions(
+            includeBundledSkills: false,
+            skills: [
+              ClartCodeSkillDefinition(
+                name: 'review_local',
+                description: 'Review code in a focused scope.',
+                allowedTools: const ['read'],
+                model: 'skill-model',
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text(
+                    'Review carefully and only read files.',
+                  ),
+                ],
+              ),
+            ],
+          ),
+          hooks: ClartCodeAgentHooks(
+            onToolPermissionDecision: (event) {
+              lifecycle.add(
+                'permission:${event.context.turn}:${event.toolCall.name}:${event.decision.name}:${event.source.name}:${event.message}',
+              );
+            },
+          ),
+          providerOverride: _NativeToolLoopProvider((request) {
+            seenRequests.add(request);
+            if (seenRequests.length == 1) {
+              expect(request.model, 'base-model');
+              return QueryResponse.success(
+                output: '',
+                modelUsed: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_skill_same_turn_1',
+                    name: 'skill',
+                    input: {'skill': 'review_local'},
+                  ),
+                  QueryToolCall(
+                    id: 'call_write_same_turn_1',
+                    name: 'write',
+                    input: {
+                      'path': 'blocked.txt',
+                      'content': 'should not run',
+                    },
+                  ),
+                ],
+              );
+            }
+
+            expect(request.model, 'skill-model');
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            expect(toolPayloads, hasLength(2));
+            expect(toolPayloads.first['tool'], 'skill');
+            expect(toolPayloads.first['ok'], isTrue);
+            expect(toolPayloads.last['tool'], 'write');
+            expect(toolPayloads.last['ok'], isFalse);
+            expect(toolPayloads.last['error_code'], 'permission_denied');
+            expect(
+              toolPayloads.last['error_message'],
+              contains('not allowed while skill "review_local" is active'),
+            );
+            return QueryResponse.success(
+              output: 'same-turn constrained answer',
+              modelUsed: request.model,
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.prompt('review this with a same-turn skill');
+
+      expect(result.isError, isFalse);
+      expect(result.text, 'same-turn constrained answer');
+      expect(result.turns, 2);
+      expect(seenRequests, hasLength(2));
+      expect(
+        lifecycle,
+        contains(
+          'permission:1:write:deny:skill:tool "write" is not allowed while skill "review_local" is active',
+        ),
+      );
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('later same-turn skill overrides earlier inline skill state', () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_skill_multi_same_');
+
+    try {
+      final seenRequests = <QueryRequest>[];
+      final lifecycle = <String>[];
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'base-model',
+          skills: ClartCodeSkillsOptions(
+            includeBundledSkills: false,
+            skills: [
+              ClartCodeSkillDefinition(
+                name: 'read_only',
+                description: 'Only read files.',
+                allowedTools: const ['read'],
+                model: 'read-model',
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text('Read only.'),
+                ],
+              ),
+              ClartCodeSkillDefinition(
+                name: 'shell_only',
+                description: 'Only use shell.',
+                allowedTools: const ['shell'],
+                model: 'shell-model',
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text('Shell only.'),
+                ],
+              ),
+            ],
+          ),
+          hooks: ClartCodeAgentHooks(
+            onToolPermissionDecision: (event) {
+              lifecycle.add(
+                'permission:${event.context.turn}:${event.toolCall.name}:${event.decision.name}:${event.source.name}:${event.message}',
+              );
+            },
+          ),
+          providerOverride: _NativeToolLoopProvider((request) {
+            seenRequests.add(request);
+            if (seenRequests.length == 1) {
+              expect(request.model, 'base-model');
+              return QueryResponse.success(
+                output: '',
+                modelUsed: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_skill_multi_1',
+                    name: 'skill',
+                    input: {'skill': 'read_only'},
+                  ),
+                  QueryToolCall(
+                    id: 'call_skill_multi_2',
+                    name: 'skill',
+                    input: {'skill': 'shell_only'},
+                  ),
+                  QueryToolCall(
+                    id: 'call_read_multi_1',
+                    name: 'read',
+                    input: {'path': 'README.md'},
+                  ),
+                ],
+              );
+            }
+
+            expect(request.model, 'shell-model');
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            expect(toolPayloads, hasLength(3));
+            expect(toolPayloads[0]['tool'], 'skill');
+            expect(toolPayloads[0]['ok'], isTrue);
+            expect(
+              Map<String, Object?>.from(
+                  toolPayloads[0]['metadata'] as Map)['skill'],
+              'read_only',
+            );
+            expect(toolPayloads[1]['tool'], 'skill');
+            expect(toolPayloads[1]['ok'], isTrue);
+            expect(
+              Map<String, Object?>.from(
+                  toolPayloads[1]['metadata'] as Map)['skill'],
+              'shell_only',
+            );
+            expect(toolPayloads[2]['tool'], 'read');
+            expect(toolPayloads[2]['ok'], isFalse);
+            expect(toolPayloads[2]['error_code'], 'permission_denied');
+            expect(
+              toolPayloads[2]['error_message'],
+              contains('not allowed while skill "shell_only" is active'),
+            );
+            return QueryResponse.success(
+              output: 'later skill wins',
+              modelUsed: request.model,
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.prompt('switch skills in the same tool batch');
+
+      expect(result.isError, isFalse);
+      expect(result.text, 'later skill wins');
+      expect(result.turns, 2);
+      expect(seenRequests, hasLength(2));
+      expect(
+        lifecycle,
+        contains(
+          'permission:1:read:deny:skill:tool "read" is not allowed while skill "shell_only" is active',
+        ),
+      );
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test(
+      'forked skill runs in isolated child agent and does not constrain parent',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_skill_fork_');
+
+    try {
+      final seenRequests = <QueryRequest>[];
+      final lifecycle = <String>[];
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'main-model',
+          skills: ClartCodeSkillsOptions(
+            includeBundledSkills: false,
+            skills: [
+              ClartCodeSkillDefinition(
+                name: 'fork_review',
+                description: 'Run a review in a child agent.',
+                context: ClartCodeSkillExecutionContext.fork,
+                allowedTools: const ['read'],
+                model: 'child-skill-model',
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text(
+                    'Review the target in the child agent and report back.',
+                  ),
+                ],
+              ),
+            ],
+          ),
+          hooks: ClartCodeAgentHooks(
+            onSkillActivation: (event) {
+              lifecycle.add('start:${event.name}');
+            },
+            onSkillEnd: (event) {
+              lifecycle.add('end:${event.name}:${event.reason}');
+            },
+          ),
+          providerOverride: _NativeToolLoopProvider((request) {
+            seenRequests.add(request);
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+
+            if (request.model == 'child-skill-model') {
+              expect(toolPayloads, isEmpty);
+              expect(
+                request.toolDefinitions.map((tool) => tool.name).toList(),
+                ['read'],
+              );
+              return QueryResponse.success(
+                output: 'fork child result',
+                modelUsed: request.model,
+              );
+            }
+
+            if (toolPayloads.isEmpty) {
+              expect(request.model, 'main-model');
+              expect(
+                request.toolDefinitions.map((tool) => tool.name),
+                containsAll(['skill', 'read', 'write']),
+              );
+              return QueryResponse.success(
+                output: '',
+                modelUsed: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_skill_fork_1',
+                    name: 'skill',
+                    input: {'skill': 'fork_review'},
+                  ),
+                ],
+              );
+            }
+
+            final skillPayload = toolPayloads.single;
+            expect(request.model, 'main-model');
+            expect(skillPayload['tool'], 'skill');
+            expect(skillPayload['ok'], isTrue);
+            expect(skillPayload['output'], contains('fork child result'));
+            final metadata =
+                Map<String, Object?>.from(skillPayload['metadata'] as Map);
+            expect(metadata['status'], 'forked');
+            expect(metadata['subagent_turns'], 1);
+            expect(metadata['subagent_model'], 'child-skill-model');
+            expect(metadata['subagent_session_id'], isA<String>());
+            final subagentMessages =
+                (metadata['subagent_messages'] as List?) ?? const [];
+            expect(subagentMessages, hasLength(4));
+            expect((subagentMessages.first as Map)['type'], 'subagent');
+            expect((subagentMessages.first as Map)['subtype'], 'start');
+            expect((subagentMessages.last as Map)['type'], 'subagent');
+            expect((subagentMessages.last as Map)['subtype'], 'end');
+            expect(
+              (subagentMessages.last as Map)['terminalSubtype'],
+              'success',
+            );
+            final toolNames =
+                request.toolDefinitions.map((tool) => tool.name).toList();
+            expect(toolNames, containsAll(['skill', 'read', 'write']));
+
+            return QueryResponse.success(
+              output: 'main final after fork skill',
+              modelUsed: request.model,
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.prompt('use a forked review skill');
+
+      expect(result.isError, isFalse);
+      expect(result.text, 'main final after fork skill');
+      expect(result.turns, 2);
+      expect(seenRequests, hasLength(3));
+      expect(lifecycle, isEmpty);
+      expect(seenRequests[0].model, 'main-model');
+      expect(seenRequests[1].model, 'child-skill-model');
+      expect(seenRequests[2].model, 'main-model');
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('forked skill child error is surfaced as a successful tool result',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_skill_fork_error_');
+
+    try {
+      final seenRequests = <QueryRequest>[];
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'main-model',
+          persistSession: false,
+          skills: ClartCodeSkillsOptions(
+            includeBundledSkills: false,
+            skills: [
+              ClartCodeSkillDefinition(
+                name: 'fork_review',
+                description: 'Run a review in a child agent.',
+                context: ClartCodeSkillExecutionContext.fork,
+                model: 'child-skill-model',
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text(
+                    'Review the target in the child agent and report back.',
+                  ),
+                ],
+              ),
+            ],
+          ),
+          providerOverride: _NativeToolLoopProvider((request) {
+            seenRequests.add(request);
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+
+            if (request.model == 'child-skill-model') {
+              return QueryResponse.failure(
+                error: RuntimeError(
+                  code: RuntimeErrorCode.providerFailure,
+                  message: 'child provider exploded',
+                  source: 'test',
+                  retriable: false,
+                ),
+                output: '[ERROR] child provider exploded',
+                modelUsed: request.model,
+              );
+            }
+
+            if (toolPayloads.isEmpty) {
+              expect(request.model, 'main-model');
+              return QueryResponse.success(
+                output: '',
+                modelUsed: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_skill_fork_error_1',
+                    name: 'skill',
+                    input: {'skill': 'fork_review'},
+                  ),
+                ],
+              );
+            }
+
+            final skillPayload = toolPayloads.single;
+            expect(request.model, 'main-model');
+            expect(skillPayload['tool'], 'skill');
+            expect(skillPayload['ok'], isTrue);
+            expect(
+              skillPayload['output'],
+              contains('[ERROR] child provider exploded'),
+            );
+            final metadata =
+                Map<String, Object?>.from(skillPayload['metadata'] as Map);
+            expect(metadata['status'], 'forked');
+            expect(metadata['subagent_is_error'], isTrue);
+            expect(metadata['subagent_error_code'], 'providerFailure');
+            expect(
+              metadata['subagent_error_message'],
+              'child provider exploded',
+            );
+            final subagentMessages =
+                (metadata['subagent_messages'] as List?) ?? const [];
+            expect(subagentMessages, isNotEmpty);
+            expect((subagentMessages.last as Map)['type'], 'subagent');
+            expect((subagentMessages.last as Map)['subtype'], 'end');
+            expect(
+              (subagentMessages.last as Map)['terminalSubtype'],
+              'error_during_execution',
+            );
+
+            return QueryResponse.success(
+              output: 'main recovered after fork skill error',
+              modelUsed: request.model,
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.prompt('use a forked review skill');
+
+      expect(result.isError, isFalse);
+      expect(result.text, 'main recovered after fork skill error');
+      expect(result.turns, 2);
+      expect(seenRequests, hasLength(3));
+      expect(seenRequests[0].model, 'main-model');
+      expect(seenRequests[1].model, 'child-skill-model');
+      expect(seenRequests[2].model, 'main-model');
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('forked skill can reuse a named agent definition', () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_skill_named_agent_');
+
+    try {
+      final seenRequests = <QueryRequest>[];
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'main-model',
+          persistSession: false,
+          agents: const ClartCodeAgentsOptions(
+            agents: [
+              ClartCodeAgentDefinition(
+                name: 'code-reviewer',
+                description: 'Review code with a tight read-only scope.',
+                prompt:
+                    'Review the requested code carefully and return findings first.',
+                allowedTools: ['read'],
+                disallowedTools: ['write'],
+                model: 'review-model',
+                effort: ClartCodeReasoningEffort.medium,
+              ),
+            ],
+          ),
+          skills: ClartCodeSkillsOptions(
+            includeBundledSkills: false,
+            skills: [
+              ClartCodeSkillDefinition(
+                name: 'fork_review',
+                description: 'Run a review in a child agent.',
+                context: ClartCodeSkillExecutionContext.fork,
+                agent: 'code-reviewer',
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text(
+                    'Inspect lib/src/sdk and report the main risks.',
+                  ),
+                ],
+              ),
+            ],
+          ),
+          providerOverride: _NativeToolLoopProvider((request) {
+            seenRequests.add(request);
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+
+            if (request.model == 'review-model') {
+              expect(request.effort, ClartCodeReasoningEffort.medium);
+              final userPrompt = request.messages
+                  .where((message) => message.role == MessageRole.user)
+                  .map((message) => message.text)
+                  .join('\n');
+              expect(
+                request.toolDefinitions.map((tool) => tool.name).toList(),
+                ['read'],
+              );
+              expect(
+                userPrompt,
+                contains(
+                  'Review the requested code carefully and return findings first.',
+                ),
+              );
+              expect(
+                userPrompt,
+                contains('Inspect lib/src/sdk and report the main risks.'),
+              );
+              return QueryResponse.success(
+                output: 'review child result',
+                modelUsed: request.model,
+              );
+            }
+
+            if (toolPayloads.isEmpty) {
+              expect(request.model, 'main-model');
+              expect(request.effort, isNull);
+              return QueryResponse.success(
+                output: '',
+                modelUsed: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_skill_named_agent_1',
+                    name: 'skill',
+                    input: {'skill': 'fork_review'},
+                  ),
+                ],
+              );
+            }
+
+            final skillPayload = toolPayloads.single;
+            expect(skillPayload['tool'], 'skill');
+            expect(skillPayload['ok'], isTrue);
+            expect(skillPayload['output'], contains('review child result'));
+            final metadata =
+                Map<String, Object?>.from(skillPayload['metadata'] as Map);
+            expect(metadata['status'], 'forked');
+            expect(metadata['agent'], 'code-reviewer');
+            expect(metadata['resolved_agent'], 'code-reviewer');
+            expect(metadata['subagent_model'], 'review-model');
+            return QueryResponse.success(
+              output: 'main final after named-agent skill',
+              modelUsed: request.model,
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.prompt('use the review skill');
+
+      expect(result.isError, isFalse);
+      expect(result.text, 'main final after named-agent skill');
+      expect(result.turns, 2);
+      expect(seenRequests, hasLength(3));
+      expect(seenRequests[0].model, 'main-model');
+      expect(seenRequests[1].model, 'review-model');
+      expect(seenRequests[2].model, 'main-model');
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('agent can run one-shot subagent with isolated options', () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_subagent_');
+
+    try {
+      final seenRequests = <QueryRequest>[];
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'parent-model',
+          providerOverride: _NativeToolLoopProvider((request) {
+            seenRequests.add(request);
+            expect(request.model, 'child-model');
+            expect(
+              request.toolDefinitions.map((tool) => tool.name).toList(),
+              ['read'],
+            );
+            return QueryResponse.success(
+              output: 'subagent answer',
+              modelUsed: request.model,
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.runSubagent(
+        'inspect the target',
+        options: const ClartCodeSubagentOptions(
+          model: 'child-model',
+          allowedTools: ['read'],
+          promptPrefix: 'You are a focused reviewer.',
+        ),
+      );
+
+      expect(result.isError, isFalse);
+      expect(result.parentSessionId, agent.sessionId);
+      expect(result.sessionId, isNot(agent.sessionId));
+      expect(
+          result.prompt, 'You are a focused reviewer.\n\ninspect the target');
+      expect(result.text, 'subagent answer');
+      expect(result.model, 'child-model');
+      expect(result.transcriptMessages, hasLength(1));
+      expect(result.transcriptMessages.single.kind,
+          TranscriptMessageKind.subagent);
+      expect(result.transcriptMessages.single.sessionId, result.sessionId);
+      expect(
+        result.transcriptMessages.single.parentSessionId,
+        result.parentSessionId,
+      );
+      expect(
+        result.transcriptMessages.single.text,
+        contains('Subagent completed.'),
+      );
+      expect(
+        result.transcriptMessages.single.text,
+        contains('output:\nsubagent answer'),
+      );
+      expect(result.cascadedMessages, hasLength(4));
+      expect(result.cascadedMessages.first.type, 'subagent');
+      expect(result.cascadedMessages.first.subtype, 'start');
+      expect(result.cascadedMessages.first.parentSessionId, agent.sessionId);
+      expect(result.cascadedMessages.first.subagentName, isNull);
+      expect(result.cascadedMessages.last.type, 'subagent');
+      expect(result.cascadedMessages.last.subtype, 'end');
+      expect(result.cascadedMessages.last.terminalSubtype, 'success');
+      expect(result.cascadedMessages.last.parentSessionId, agent.sessionId);
+      expect(seenRequests, hasLength(1));
+      expect(agent.getMessages(), isEmpty);
+      expect(agent.getTranscript(), hasLength(1));
+      expect(agent.getTranscript().single.kind, TranscriptMessageKind.subagent);
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('runSubagent can optionally expose child assistant deltas', () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_subagent_delta_');
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'parent-model',
+          providerOverride: _NativeToolLoopProvider((request) {
+            expect(request.model, 'child-model');
+            return QueryResponse.success(
+              output: 'subagent delta answer',
+              modelUsed: request.model,
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.runSubagent(
+        'inspect the target with deltas',
+        options: const ClartCodeSubagentOptions(
+          model: 'child-model',
+          cascadeAssistantDeltas: true,
+        ),
+      );
+
+      expect(result.isError, isFalse);
+      expect(result.cascadedMessages.map((message) => message.type), [
+        'subagent',
+        'system',
+        'assistant_delta',
+        'assistant',
+        'subagent',
+      ]);
+      expect(result.cascadedMessages[2].delta, 'subagent delta answer');
+      expect(result.cascadedMessages[2].parentSessionId, agent.sessionId);
+      expect(result.cascadedMessages.last.subtype, 'end');
+      expect(result.cascadedMessages.last.terminalSubtype, 'success');
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('runSubagent emits hooks and child hook events include parent session',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_subagent_hooks_');
+
+    try {
+      final lifecycle = <String>[];
+      late ClartCodeAgent agent;
+      agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'parent-model',
+          providerOverride: _NativeToolLoopProvider((request) {
+            expect(request.model, 'child-model');
+            expect(
+              request.toolDefinitions.map((tool) => tool.name).toList(),
+              ['read'],
+            );
+            return QueryResponse.success(
+              output: 'subagent hook answer',
+              modelUsed: request.model,
+            );
+          }),
+          hooks: ClartCodeAgentHooks(
+            onSubagentStart: (event) {
+              lifecycle.add(
+                'sub_start:${event.name}:${event.parentSessionId == agent.sessionId}',
+              );
+            },
+            onSubagentEnd: (event) {
+              lifecycle.add(
+                'sub_end:${event.name}:${event.result.parentSessionId == agent.sessionId}:${event.result.isError}',
+              );
+            },
+            onSessionStart: (event) {
+              lifecycle.add(
+                'session_start:${event.sessionId == agent.sessionId}:${event.parentSessionId == agent.sessionId}',
+              );
+            },
+            onSessionEnd: (event) {
+              lifecycle.add(
+                'session_end:${event.sessionId == agent.sessionId}:${event.parentSessionId == agent.sessionId}:${event.result.isError}',
+              );
+            },
+          ),
+        ),
+      );
+
+      final result = await agent.runSubagent(
+        'inspect hook target',
+        options: const ClartCodeSubagentOptions(
+          name: 'reviewer',
+          model: 'child-model',
+          allowedTools: ['read'],
+          inheritHooks: true,
+        ),
+      );
+
+      expect(result.isError, isFalse);
+      expect(result.name, 'reviewer');
+      expect(result.parentSessionId, agent.sessionId);
+      expect(lifecycle, [
+        'sub_start:reviewer:true',
+        'session_start:false:true',
+        'session_end:false:true:false',
+        'sub_end:reviewer:true:false',
+      ]);
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('parent stop cascades cancellation to active child agent', () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_subagent_cancel_');
+
+    try {
+      final lifecycle = <String>[];
+      final provider = _SubagentCancellationProvider();
+      late ClartCodeAgent agent;
+      agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'parent-model',
+          persistSession: false,
+          agents: const ClartCodeAgentsOptions(
+            agents: [
+              ClartCodeAgentDefinition(
+                name: 'code-reviewer',
+                description: 'Review code in a child agent.',
+                prompt: 'Review the delegated target.',
+                allowedTools: ['read'],
+                model: 'child-model',
+              ),
+            ],
+          ),
+          providerOverride: provider,
+          hooks: ClartCodeAgentHooks(
+            onSubagentStart: (event) {
+              lifecycle.add('sub_start:${event.name}');
+            },
+            onSubagentEnd: (event) {
+              lifecycle.add(
+                'sub_end:${event.name}:${event.result.isError}:${event.reason}',
+              );
+            },
+            onCancelledTerminal: (event) {
+              lifecycle.add('cancelled:${event.reason}');
+            },
+          ),
+        ),
+      );
+
+      final pending = agent.prompt('delegate and then stop');
+      await provider.childStarted.future;
+      await agent.stop(reason: 'parent_stop_subagent');
+      final result = await pending;
+
+      expect(provider.cancelCalled, isTrue);
+      expect(result.isError, isTrue);
+      expect(result.error?.code, RuntimeErrorCode.cancelled);
+      expect(lifecycle, [
+        'sub_start:code-reviewer',
+        'sub_end:code-reviewer:true:parent_stop_subagent',
+        'cancelled:parent_stop_subagent',
+      ]);
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('agent loads named agents and executes agent tool via child agent',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_named_agent_');
+
+    try {
+      final seenRequests = <QueryRequest>[];
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'parent-model',
+          agents: const ClartCodeAgentsOptions(
+            agents: [
+              ClartCodeAgentDefinition(
+                name: 'code-reviewer',
+                description: 'Review code with a tight read-only scope.',
+                prompt:
+                    'Review the requested code carefully and return findings first.',
+                allowedTools: ['read'],
+                model: 'review-model',
+              ),
+            ],
+          ),
+          providerOverride: _NativeToolLoopProvider((request) {
+            seenRequests.add(request);
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+
+            if (request.model == 'review-model') {
+              final systemPrompt = request.messages
+                  .where((message) => message.role == MessageRole.system)
+                  .map((message) => message.text)
+                  .join('\n');
+              final userPrompt = request.messages
+                  .where((message) => message.role == MessageRole.user)
+                  .map((message) => message.text)
+                  .join('\n');
+              expect(systemPrompt, isNot(contains('Available agents:')));
+              expect(
+                request.toolDefinitions.map((tool) => tool.name).toList(),
+                ['read'],
+              );
+              expect(
+                userPrompt,
+                contains(
+                    'Review the requested code carefully and return findings first.'),
+              );
+              expect(userPrompt, contains('inspect lib/src/sdk'));
+              return QueryResponse.success(
+                output: 'review child result',
+                modelUsed: request.model,
+              );
+            }
+
+            if (toolPayloads.isEmpty) {
+              final systemPrompt = request.messages
+                  .where((message) => message.role == MessageRole.system)
+                  .map((message) => message.text)
+                  .join('\n');
+              expect(systemPrompt, contains('Available agents:'));
+              expect(systemPrompt, contains('code-reviewer'));
+              expect(systemPrompt, contains('tight read-only scope'));
+              expect(
+                request.toolDefinitions.map((tool) => tool.name),
+                containsAll(['agent', 'read', 'write']),
+              );
+              return QueryResponse.success(
+                output: '',
+                modelUsed: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_agent_1',
+                    name: 'agent',
+                    input: {
+                      'agent': 'code-reviewer',
+                      'prompt': 'inspect lib/src/sdk',
+                    },
+                  ),
+                ],
+              );
+            }
+
+            final agentPayload = toolPayloads.single;
+            expect(request.model, 'parent-model');
+            expect(agentPayload['tool'], 'agent');
+            expect(agentPayload['ok'], isTrue);
+            expect(agentPayload['output'], contains('review child result'));
+            final metadata =
+                Map<String, Object?>.from(agentPayload['metadata'] as Map);
+            expect(metadata['agent'], 'code-reviewer');
+            expect(metadata['allowed_tools'], ['read']);
+            expect(metadata['subagent_turns'], 1);
+            expect(metadata['subagent_model'], 'review-model');
+            expect(metadata['subagent_session_id'], isA<String>());
+            final subagentMessages =
+                (metadata['subagent_messages'] as List?) ?? const [];
+            expect(subagentMessages, hasLength(4));
+            expect((subagentMessages.first as Map)['type'], 'subagent');
+            expect((subagentMessages.first as Map)['subtype'], 'start');
+            expect((subagentMessages.last as Map)['type'], 'subagent');
+            expect((subagentMessages.last as Map)['subtype'], 'end');
+            expect(
+              (subagentMessages.last as Map)['terminalSubtype'],
+              'success',
+            );
+            final toolNames =
+                request.toolDefinitions.map((tool) => tool.name).toList();
+            expect(toolNames, containsAll(['agent', 'read', 'write']));
+
+            return QueryResponse.success(
+              output: 'main final after agent tool',
+              modelUsed: request.model,
+            );
+          }),
+        ),
+      );
+
+      await agent.prepare();
+      expect(agent.availableAgents, ['code-reviewer']);
+      expect(agent.availableTools, contains('agent'));
+
+      final result = await agent.prompt('delegate a focused code review');
+
+      expect(result.isError, isFalse);
+      expect(result.text, 'main final after agent tool');
+      expect(result.turns, 2);
+      expect(seenRequests, hasLength(3));
+      expect(seenRequests[0].model, 'parent-model');
+      expect(seenRequests[1].model, 'review-model');
+      expect(seenRequests[2].model, 'parent-model');
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('query live-merges child events before parent tool result', () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_live_subagent_');
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'parent-model',
+          agents: const ClartCodeAgentsOptions(
+            agents: [
+              ClartCodeAgentDefinition(
+                name: 'code-reviewer',
+                description: 'Review code with a tight read-only scope.',
+                prompt: 'Review the delegated target carefully.',
+                allowedTools: ['read'],
+                model: 'child-model',
+                cascadeAssistantDeltas: true,
+              ),
+            ],
+          ),
+          providerOverride: _StreamingNativeToolLoopProvider((request) async* {
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+
+            if (request.model == 'parent-model' && toolPayloads.isEmpty) {
+              yield ProviderStreamEvent.done(
+                output: '',
+                model: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_agent_stream_1',
+                    name: 'agent',
+                    input: {
+                      'agent': 'code-reviewer',
+                      'prompt': 'inspect lib/src/sdk',
+                    },
+                  ),
+                ],
+              );
+              return;
+            }
+
+            if (request.model == 'child-model') {
+              yield ProviderStreamEvent.textDelta(
+                delta: 'child delta that should stay private',
+                model: request.model,
+              );
+              yield ProviderStreamEvent.done(
+                output: 'child merged answer',
+                model: request.model,
+              );
+              return;
+            }
+
+            expect(request.model, 'parent-model');
+            expect(toolPayloads, hasLength(1));
+            expect(toolPayloads.single['tool'], 'agent');
+            yield ProviderStreamEvent.done(
+              output: 'main final after child merge',
+              model: request.model,
+            );
+          }),
+        ),
+      );
+
+      final messages =
+          await agent.query('delegate a focused code review').toList();
+      expect(messages.map((message) => message.type), [
+        'system',
+        'tool_call',
+        'subagent',
+        'system',
+        'assistant_delta',
+        'assistant',
+        'subagent',
+        'tool_result',
+        'assistant',
+        'result',
+      ]);
+
+      final childMessages = messages
+          .where((message) => message.parentSessionId == agent.sessionId)
+          .toList();
+      expect(childMessages.map((message) => message.type), [
+        'subagent',
+        'system',
+        'assistant_delta',
+        'assistant',
+        'subagent',
+      ]);
+      expect(childMessages.first.subtype, 'start');
+      expect(childMessages.first.subagentName, 'code-reviewer');
+      expect(childMessages[1].subtype, 'init');
+      expect(
+        childMessages[2].delta,
+        'child delta that should stay private',
+      );
+      expect(childMessages[3].text, 'child merged answer');
+      expect(childMessages[4].subtype, 'end');
+      expect(childMessages[4].terminalSubtype, 'success');
+
+      final childResultIndex = messages.indexOf(childMessages.last);
+      final parentToolResultIndex =
+          messages.indexWhere((message) => message.type == 'tool_result');
+      expect(childResultIndex, lessThan(parentToolResultIndex));
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('agent loads named agents from directories', () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_agent_dir_');
+    final agentsDir = Directory('${tempDir.path}/agents');
+    await agentsDir.create(recursive: true);
+    await File('${agentsDir.path}/code-reviewer.md').writeAsString('''
+---
+name: code-reviewer
+description: Review SDK code from a local agents directory.
+tools: [read]
+model: review-model
+---
+# Code Reviewer
+
+Review the requested SDK scope and return findings first.
+''');
+
+    try {
+      final seenRequests = <QueryRequest>[];
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'parent-model',
+          agents: ClartCodeAgentsOptions(
+            directories: [agentsDir.path],
+          ),
+          providerOverride: _NativeToolLoopProvider((request) {
+            seenRequests.add(request);
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+
+            if (request.model == 'review-model') {
+              final userPrompt = request.messages
+                  .where((message) => message.role == MessageRole.user)
+                  .map((message) => message.text)
+                  .join('\n');
+              expect(
+                request.toolDefinitions.map((tool) => tool.name).toList(),
+                ['read'],
+              );
+              expect(userPrompt, contains('Base directory for this agent'));
+              expect(userPrompt, contains('Review the requested SDK scope'));
+              return QueryResponse.success(
+                output: 'directory agent result',
+                modelUsed: request.model,
+              );
+            }
+
+            if (toolPayloads.isEmpty) {
+              expect(
+                request.toolDefinitions.map((tool) => tool.name),
+                containsAll(['agent', 'read', 'write']),
+              );
+              return QueryResponse.success(
+                output: '',
+                modelUsed: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_agent_dir_1',
+                    name: 'agent',
+                    input: {
+                      'agent': 'code-reviewer',
+                      'prompt': 'inspect lib/src/sdk',
+                    },
+                  ),
+                ],
+              );
+            }
+
+            final agentPayload = toolPayloads.single;
+            expect(agentPayload['tool'], 'agent');
+            expect(agentPayload['ok'], isTrue);
+            expect(agentPayload['output'], contains('directory agent result'));
+            return QueryResponse.success(
+              output: 'final after directory agent',
+              modelUsed: request.model,
+            );
+          }),
+        ),
+      );
+
+      await agent.prepare();
+      expect(agent.availableAgents, ['code-reviewer']);
+      expect(agent.availableTools, contains('agent'));
+
+      final result = await agent.prompt('delegate from local agent dir');
+
+      expect(result.isError, isFalse);
+      expect(result.text, 'final after directory agent');
+      expect(seenRequests, hasLength(3));
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
   test('prompt executes edit glob and grep tools', () async {
     final tempDir = await Directory.systemTemp.createTemp(
       'clart_sdk_builtin_batch_',
@@ -730,6 +2575,81 @@ void main() {
     }
   });
 
+  test('prompt injects in-process SDK MCP tools into agent runtime', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_mcp_sdk_',
+    );
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          mcp: ClartCodeMcpOptions(
+            sdkServers: [
+              createSdkMcpServer(
+                name: 'local',
+                version: '1.2.3',
+                tools: [_SdkEchoTool()],
+              ),
+            ],
+          ),
+          providerOverride: _ScriptedToolLoopProvider((request) {
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            if (toolPayloads.isEmpty) {
+              return QueryResponse.success(
+                output: jsonEncode({
+                  'tool_calls': [
+                    {
+                      'id': 'call_mcp_sdk_1',
+                      'name': 'local/echo_local',
+                      'input': {'message': 'hello sdk mcp'},
+                    },
+                  ],
+                }),
+                modelUsed: 'mcp-sdk-mock',
+              );
+            }
+
+            return QueryResponse.success(
+              output: 'mcp sdk final: ${toolPayloads.single['output']}',
+              modelUsed: 'mcp-sdk-mock',
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.prompt('use local sdk mcp tool');
+
+      expect(result.isError, isFalse);
+      expect(result.text, 'mcp sdk final: sdk:hello sdk mcp');
+      expect(agent.mcpConnections, hasLength(1));
+      expect(agent.mcpConnections.single.name, 'local');
+      expect(
+        agent.mcpConnections.single.config.transportType,
+        McpTransportType.sdk,
+      );
+      expect(agent.mcpConnections.single.serverInfo?.version, '1.2.3');
+      expect(agent.availableTools, contains('local/echo_local'));
+      expect(agent.availableTools, isNot(contains('mcp_list_resources')));
+
+      final toolResultMessage = agent.getTranscript().lastWhere(
+          (message) => message.kind == TranscriptMessageKind.toolResult);
+      final toolPayload = _decodeToolPayload(toolResultMessage.text);
+      final metadata =
+          Map<String, Object?>.from(toolPayload['metadata'] as Map);
+      expect(metadata['origin'], 'sdk');
+      expect(metadata['serverName'], 'local');
+      expect(metadata['toolName'], 'echo_local');
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
   test('agent transcript preserves MCP tool isError metadata', () async {
     final tempDir = await Directory.systemTemp.createTemp(
       'clart_sdk_mcp_tool_error_',
@@ -934,6 +2854,83 @@ void main() {
       expect(definition.title, 'Custom Echo');
       expect(definition.annotations, {'category': 'test'});
       expect(definition.inputSchema?['type'], 'object');
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('agent registers custom tools built with tool helper DSL', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_custom_tool_dsl_',
+    );
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          tools: [
+            tool(
+              name: 'echo_tool_dsl',
+              title: 'Echo Tool DSL',
+              description: 'Uppercases text through helper DSL.',
+              inputSchema: const {
+                'type': 'object',
+                'properties': {
+                  'text': {'type': 'string'},
+                },
+                'required': ['text'],
+              },
+              annotations: const {
+                'origin': 'dsl',
+              },
+              executionHint: ToolExecutionHint.parallelSafe,
+              run: (invocation) => ToolExecutionResult.success(
+                tool: 'echo_tool_dsl',
+                output:
+                    (invocation.input['text'] as String? ?? '').toUpperCase(),
+              ),
+            ),
+          ],
+          providerOverride: _ScriptedToolLoopProvider((request) {
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            if (toolPayloads.isEmpty) {
+              return QueryResponse.success(
+                output: jsonEncode({
+                  'tool_calls': [
+                    {
+                      'id': 'call_custom_dsl_1',
+                      'name': 'echo_tool_dsl',
+                      'input': {'text': 'hello dsl'},
+                    },
+                  ],
+                }),
+                modelUsed: 'tool-mock',
+              );
+            }
+
+            return QueryResponse.success(
+              output: 'dsl=${toolPayloads.single['output']}',
+              modelUsed: 'tool-mock',
+            );
+          }),
+        ),
+      );
+
+      final result = await agent.prompt('use tool helper');
+
+      expect(result.isError, false);
+      expect(result.text, 'dsl=HELLO DSL');
+      final definition = agent.toolDefinitions.firstWhere(
+        (tool) => tool.name == 'echo_tool_dsl',
+      );
+      expect(definition.title, 'Echo Tool DSL');
+      expect(definition.annotations, {'origin': 'dsl'});
+      expect(definition.executionHint, ToolExecutionHint.parallelSafe.name);
     } finally {
       if (tempDir.existsSync()) {
         tempDir.deleteSync(recursive: true);
@@ -1329,6 +3326,509 @@ void main() {
       }
     }
   });
+
+  test('query stream surfaces active inline skill cancellation before result',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_skill_stream_cancel_');
+
+    try {
+      final provider = _SkillCancelableProvider();
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'base-model',
+          persistSession: false,
+          skills: ClartCodeSkillsOptions(
+            includeBundledSkills: false,
+            skills: [
+              ClartCodeSkillDefinition(
+                name: 'read_only',
+                description: 'Only read files.',
+                allowedTools: const ['read'],
+                model: 'skill-model',
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text('Read only.'),
+                ],
+              ),
+            ],
+          ),
+          providerOverride: provider,
+        ),
+      );
+
+      final pending = agent.query('cancel with active skill').toList();
+      await provider.secondTurnStarted.future;
+      await agent.stop(reason: 'skill_cancel');
+      final messages = await pending;
+
+      expect(provider.cancelCalled, isTrue);
+      expect(messages.map((message) => message.type), [
+        'system',
+        'tool_call',
+        'tool_result',
+        'skill',
+        'result',
+      ]);
+      final skillMessage =
+          messages.firstWhere((message) => message.type == 'skill');
+      expect(skillMessage.subtype, 'end');
+      expect(skillMessage.terminalSubtype, 'cancelled');
+      expect(skillMessage.skillName, 'read_only');
+      expect(skillMessage.turn, 2);
+      expect(skillMessage.isError, isTrue);
+      expect(skillMessage.text, contains('STOPPED'));
+      expect(skillMessage.error?.code, RuntimeErrorCode.cancelled);
+      expect(messages.last.type, 'result');
+      expect(messages.last.subtype, 'error_stopped');
+      expect(
+        messages.indexOf(skillMessage),
+        lessThan(messages.indexOf(messages.last)),
+      );
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('query stream surfaces active inline skill error before result',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_skill_stream_error_');
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'base-model',
+          persistSession: false,
+          skills: ClartCodeSkillsOptions(
+            includeBundledSkills: false,
+            skills: [
+              ClartCodeSkillDefinition(
+                name: 'read_only',
+                description: 'Only read files.',
+                allowedTools: const ['read'],
+                model: 'skill-model',
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text('Read only.'),
+                ],
+              ),
+            ],
+          ),
+          providerOverride: _SkillErrorProvider(),
+        ),
+      );
+
+      final messages = await agent.query('error with active skill').toList();
+
+      expect(messages.map((message) => message.type), [
+        'system',
+        'tool_call',
+        'tool_result',
+        'skill',
+        'result',
+      ]);
+      final skillMessage =
+          messages.firstWhere((message) => message.type == 'skill');
+      expect(skillMessage.subtype, 'end');
+      expect(skillMessage.terminalSubtype, 'error');
+      expect(skillMessage.skillName, 'read_only');
+      expect(skillMessage.turn, 2);
+      expect(skillMessage.isError, isTrue);
+      expect(skillMessage.text, contains('provider exploded'));
+      expect(skillMessage.error?.code, RuntimeErrorCode.providerFailure);
+      expect(messages.last.type, 'result');
+      expect(messages.last.subtype, 'error_during_execution');
+      expect(
+        messages.indexOf(skillMessage),
+        lessThan(messages.indexOf(messages.last)),
+      );
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test(
+      'query stream keeps inline skill replacement and query-end cleanup on hooks only',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('clart_sdk_skill_stream_scope_');
+
+    try {
+      final seenRequests = <QueryRequest>[];
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'base-model',
+          persistSession: false,
+          skills: ClartCodeSkillsOptions(
+            includeBundledSkills: false,
+            skills: [
+              ClartCodeSkillDefinition(
+                name: 'read_only',
+                description: 'Only read files.',
+                allowedTools: const ['read'],
+                model: 'read-model',
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text('Read only.'),
+                ],
+              ),
+              ClartCodeSkillDefinition(
+                name: 'shell_only',
+                description: 'Only use shell.',
+                allowedTools: const ['shell'],
+                model: 'shell-model',
+                getPrompt: (args, context) async => const [
+                  ClartCodeSkillContentBlock.text('Shell only.'),
+                ],
+              ),
+            ],
+          ),
+          providerOverride: _NativeToolLoopProvider((request) {
+            seenRequests.add(request);
+            if (seenRequests.length == 1) {
+              return QueryResponse.success(
+                output: '',
+                modelUsed: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_skill_stream_1',
+                    name: 'skill',
+                    input: {'skill': 'read_only'},
+                  ),
+                ],
+              );
+            }
+
+            if (seenRequests.length == 2) {
+              return QueryResponse.success(
+                output: '',
+                modelUsed: request.model,
+                toolCalls: const [
+                  QueryToolCall(
+                    id: 'call_skill_stream_2',
+                    name: 'skill',
+                    input: {'skill': 'shell_only'},
+                  ),
+                ],
+              );
+            }
+
+            return QueryResponse.success(
+              output: 'skill stream remains quiet',
+              modelUsed: request.model,
+            );
+          }),
+        ),
+      );
+
+      final messages =
+          await agent.query('keep normal skill lifecycle off stream').toList();
+
+      expect(seenRequests, hasLength(3));
+      expect(messages.map((message) => message.type), [
+        'system',
+        'tool_call',
+        'tool_result',
+        'tool_call',
+        'tool_result',
+        'assistant_delta',
+        'assistant',
+        'result',
+      ]);
+      expect(
+        messages.where((message) => message.type == 'skill'),
+        isEmpty,
+      );
+      expect(messages.last.subtype, 'success');
+      expect(messages.last.text, 'skill stream remains quiet');
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('per-call request surface reaches provider and can suppress deltas',
+      () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_request_surface_',
+    );
+
+    try {
+      final provider = _RequestSurfaceCapturingProvider();
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          providerOverride: provider,
+          persistSession: false,
+          systemPrompt: 'agent system',
+          appendSystemPrompt: 'agent append',
+          maxTokens: 64,
+          includePartialMessages: true,
+        ),
+      );
+
+      final messages = await agent
+          .query(
+            'return structured output',
+            effort: ClartCodeReasoningEffort.high,
+            request: const ClartCodeRequestOptions(
+              systemPrompt: 'per-call system',
+              appendSystemPrompt: 'per-call append',
+              maxTokens: 128,
+              maxBudgetUsd: 1.5,
+              thinking: ClartCodeThinkingConfig.enabled(budgetTokens: 32),
+              jsonSchema: ClartCodeJsonSchema(
+                name: 'reply_schema',
+                schema: {
+                  'type': 'object',
+                  'properties': {
+                    'answer': {'type': 'string'},
+                  },
+                  'required': ['answer'],
+                },
+              ),
+              outputFormat: ClartCodeOutputFormat.jsonObject(),
+              includePartialMessages: false,
+              includeObservabilityMessages: true,
+            ),
+          )
+          .toList();
+
+      expect(
+        messages.where((message) => message.type == 'assistant_delta'),
+        isEmpty,
+      );
+
+      final request = provider.lastRequest;
+      expect(request, isNotNull);
+      expect(request!.effort, ClartCodeReasoningEffort.high);
+      expect(request.systemPrompt, 'per-call system');
+      expect(request.appendSystemPrompt, 'per-call append');
+      expect(request.maxTokens, 128);
+      expect(request.maxBudgetUsd, 1.5);
+      expect(request.thinking?.isEnabled, isTrue);
+      expect(request.thinking?.budgetTokens, 32);
+      expect(request.jsonSchema?.name, 'reply_schema');
+      expect(request.outputFormat?.type, ClartCodeOutputFormatType.jsonObject);
+      expect(request.includePartialMessages, isFalse);
+      expect(request.includeObservabilityMessages, isTrue);
+      expect(messages.last.text, '{"answer":"captured"}');
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('maxBudgetUsd stops query once cumulative cost exceeds budget',
+      () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_budget_enforcement_',
+    );
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          providerOverride: _BudgetSurfaceProvider(),
+          persistSession: false,
+        ),
+      );
+
+      final result = await agent.prompt(
+        'stay within budget',
+        request: const ClartCodeRequestOptions(maxBudgetUsd: 0.20),
+      );
+
+      expect(result.isError, isTrue);
+      expect(result.error?.code, RuntimeErrorCode.budgetExceeded);
+      expect(result.messages.last.subtype, 'error_budget_exceeded');
+      expect(result.costUsd, 0.30);
+      expect(result.modelUsage, hasLength(1));
+      expect(result.modelUsage!.single.costUsd, 0.30);
+      expect(result.text, contains('maxBudgetUsd'));
+      expect(result.text, contains('Last model output'));
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('query can opt into observability messages', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_observability_surface_',
+    );
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          providerOverride: _ObservabilitySurfaceProvider(),
+          persistSession: false,
+        ),
+      );
+
+      final messages = await agent
+          .query(
+            'show observability',
+            request: const ClartCodeRequestOptions(
+              includeObservabilityMessages: true,
+            ),
+          )
+          .toList();
+
+      expect(messages.map((message) => message.type), [
+        'system',
+        'system',
+        'rate_limit_event',
+        'stream_event',
+        'assistant_delta',
+        'assistant',
+        'result',
+      ]);
+      expect(messages[1].subtype, 'status');
+      expect(messages[1].status, 'running_model');
+      expect(messages[2].rateLimitInfo?.provider, 'test');
+      expect(messages[2].rateLimitInfo?.status, 'ok');
+      expect(messages[3].event?['type'], 'response.output_text.delta');
+      expect(messages[3].event?['delta'], 'obs');
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test(
+      'native tool continuation emits status and compact boundary observability messages',
+      () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_compact_boundary_',
+    );
+    final file = File('${tempDir.path}/native_observability.txt');
+    await file.writeAsString('native observability body');
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          providerOverride: _NativeToolLoopProvider((request) {
+            final toolPayloads = request.messages
+                .where((message) => message.role == MessageRole.tool)
+                .map((message) => _decodeToolPayload(message.text))
+                .toList();
+            if (toolPayloads.isEmpty) {
+              return QueryResponse.success(
+                output: '',
+                modelUsed: 'native-observability-model',
+                providerStateToken: 'resp_compact_1',
+                toolCalls: [
+                  QueryToolCall(
+                    id: 'call_read_compact_1',
+                    name: 'read',
+                    input: {'path': file.path},
+                  ),
+                ],
+              );
+            }
+
+            return QueryResponse.success(
+              output: 'native observability final',
+              modelUsed: 'native-observability-model',
+              providerStateToken: 'resp_compact_2',
+            );
+          }),
+          persistSession: false,
+        ),
+      );
+
+      final messages = await agent
+          .query(
+            'show compact boundary',
+            request: const ClartCodeRequestOptions(
+              includeObservabilityMessages: true,
+            ),
+          )
+          .toList();
+
+      expect(messages.map((message) => message.type), [
+        'system',
+        'system',
+        'system',
+        'system',
+        'tool_call',
+        'system',
+        'tool_result',
+        'system',
+        'assistant_delta',
+        'assistant',
+        'result',
+      ]);
+      expect(messages[1].subtype, 'status');
+      expect(messages[1].status, 'running_model');
+      expect(messages[1].turn, 1);
+      expect(messages[2].subtype, 'status');
+      expect(messages[2].status, 'compacting');
+      expect(messages[3].subtype, 'compact_boundary');
+      expect(messages[3].compactMetadata?['reason'], 'provider_state_token');
+      expect(messages[3].compactMetadata?['next_turn'], 2);
+      expect(messages[3].compactMetadata?['tool_call_count'], 1);
+      expect(messages[3].compactMetadata?['provider_state_token'],
+          'resp_compact_1');
+      expect(messages[5].subtype, 'status');
+      expect(messages[5].status, 'running_tools');
+      expect(messages[7].subtype, 'status');
+      expect(messages[7].status, 'running_model');
+      expect(messages[7].turn, 2);
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('prompt result exposes usage cost and model usage observability',
+      () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_usage_surface_',
+    );
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          providerOverride: _UsageSurfaceProvider(),
+          persistSession: false,
+        ),
+      );
+
+      final result = await agent.prompt('measure usage');
+
+      expect(result.isError, isFalse);
+      expect(result.usage?.inputTokens, 7);
+      expect(result.usage?.outputTokens, 5);
+      expect(result.usage?.totalTokens, 12);
+      expect(result.costUsd, 0.25);
+      expect(result.modelUsage, hasLength(1));
+      expect(result.modelUsage!.single.model, 'usage-surface-model');
+      expect(result.modelUsage!.single.usage?.totalTokens, 12);
+      expect(result.modelUsage!.single.costUsd, 0.25);
+      expect(result.messages.last.usage?.totalTokens, 12);
+      expect(result.messages.last.costUsd, 0.25);
+      expect(result.messages.last.modelUsage, hasLength(1));
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
 }
 
 Map<String, Object?> _decodeToolPayload(String raw) {
@@ -1351,6 +3851,71 @@ class _NativeToolLoopProvider extends NativeToolCallingLlmProvider {
 
   @override
   Future<QueryResponse> run(QueryRequest request) async => _handler(request);
+}
+
+class _StreamingNativeToolLoopProvider extends NativeToolCallingLlmProvider {
+  _StreamingNativeToolLoopProvider(this._handler);
+
+  final Stream<ProviderStreamEvent> Function(QueryRequest request) _handler;
+
+  @override
+  Future<QueryResponse> run(QueryRequest request) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Stream<ProviderStreamEvent> stream(QueryRequest request) => _handler(request);
+}
+
+class _SubagentCancellationProvider extends LlmProvider {
+  final Completer<void> childStarted = Completer<void>();
+  final Completer<void> _cancelled = Completer<void>();
+  bool cancelCalled = false;
+
+  @override
+  Future<void> cancelActiveRequest() async {
+    cancelCalled = true;
+    if (!_cancelled.isCompleted) {
+      _cancelled.complete();
+    }
+  }
+
+  @override
+  Future<QueryResponse> run(QueryRequest request) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
+    if (request.model == 'parent-model') {
+      yield ProviderStreamEvent.done(
+        output: jsonEncode({
+          'tool_calls': [
+            {
+              'id': 'call_agent_cancel_1',
+              'name': 'agent',
+              'input': {
+                'agent': 'code-reviewer',
+                'prompt': 'inspect cancellation target',
+              },
+            },
+          ],
+        }),
+        model: request.model,
+      );
+      return;
+    }
+
+    if (request.model == 'child-model') {
+      if (!childStarted.isCompleted) {
+        childStarted.complete();
+      }
+      await _cancelled.future;
+      return;
+    }
+
+    throw StateError('unexpected model: ${request.model}');
+  }
 }
 
 class _FakeMcpManager extends McpManager {
@@ -1436,6 +4001,36 @@ class _FakeMcpManager extends McpManager {
   }
 }
 
+class _SdkEchoTool implements Tool {
+  @override
+  String get name => 'echo_local';
+
+  @override
+  String? get title => null;
+
+  @override
+  String get description => 'Echo through in-process SDK MCP.';
+
+  @override
+  Map<String, Object?>? get inputSchema => null;
+
+  @override
+  Map<String, Object?>? get annotations => null;
+
+  @override
+  ToolExecutionHint get executionHint => ToolExecutionHint.parallelSafe;
+
+  @override
+  Future<ToolExecutionResult> run(ToolInvocation invocation) async {
+    return ToolExecutionResult.success(
+      tool: name,
+      output: 'sdk:${invocation.input['message']}',
+    ).copyWith(
+      metadata: const {'origin': 'sdk'},
+    );
+  }
+}
+
 class _CancelableProvider extends LlmProvider {
   final Completer<void> _cancelled = Completer<void>();
   bool cancelCalled = false;
@@ -1457,6 +4052,184 @@ class _CancelableProvider extends LlmProvider {
   @override
   Future<QueryResponse> run(QueryRequest request) {
     throw UnimplementedError();
+  }
+}
+
+class _SkillCancelableProvider extends LlmProvider {
+  final Completer<void> secondTurnStarted = Completer<void>();
+  final Completer<void> _cancelled = Completer<void>();
+  int _requestCount = 0;
+  bool cancelCalled = false;
+
+  @override
+  Future<void> cancelActiveRequest() async {
+    cancelCalled = true;
+    if (!_cancelled.isCompleted) {
+      _cancelled.complete();
+    }
+  }
+
+  @override
+  Future<QueryResponse> run(QueryRequest request) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
+    _requestCount += 1;
+    if (_requestCount == 1) {
+      yield ProviderStreamEvent.done(
+        output: '',
+        model: request.model,
+        toolCalls: const [
+          QueryToolCall(
+            id: 'call_skill_stream_cancel_1',
+            name: 'skill',
+            input: {'skill': 'read_only'},
+          ),
+        ],
+      );
+      return;
+    }
+
+    if (!secondTurnStarted.isCompleted) {
+      secondTurnStarted.complete();
+    }
+    await _cancelled.future;
+    throw StateError('cancelled');
+  }
+}
+
+class _SkillErrorProvider extends LlmProvider {
+  int _requestCount = 0;
+
+  @override
+  Future<QueryResponse> run(QueryRequest request) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
+    _requestCount += 1;
+    if (_requestCount == 1) {
+      yield ProviderStreamEvent.done(
+        output: '',
+        model: request.model,
+        toolCalls: const [
+          QueryToolCall(
+            id: 'call_skill_stream_error_1',
+            name: 'skill',
+            input: {'skill': 'read_only'},
+          ),
+        ],
+      );
+      return;
+    }
+
+    yield ProviderStreamEvent.error(
+      error: RuntimeError(
+        code: RuntimeErrorCode.providerFailure,
+        message: 'provider exploded',
+        source: 'test_provider',
+        retriable: false,
+      ),
+      output: '[ERROR] provider exploded',
+      model: request.model,
+    );
+  }
+}
+
+class _RequestSurfaceCapturingProvider extends NativeToolCallingLlmProvider {
+  QueryRequest? lastRequest;
+
+  @override
+  Future<QueryResponse> run(QueryRequest request) async {
+    lastRequest = request;
+    return QueryResponse.success(
+      output: '{"answer":"captured"}',
+      modelUsed: request.model ?? 'request-surface-model',
+    );
+  }
+}
+
+class _BudgetSurfaceProvider extends NativeToolCallingLlmProvider {
+  int _turn = 0;
+
+  @override
+  Future<QueryResponse> run(QueryRequest request) async {
+    _turn += 1;
+    if (_turn == 1) {
+      return QueryResponse.success(
+        output: '',
+        modelUsed: 'budget-model',
+        toolCalls: const [
+          QueryToolCall(
+            id: 'call_budget_1',
+            name: 'read',
+            input: {'path': 'README.md'},
+          ),
+        ],
+        costUsd: 0.30,
+      );
+    }
+
+    return QueryResponse.success(
+      output: 'should not reach second turn',
+      modelUsed: 'budget-model',
+      costUsd: 0.01,
+    );
+  }
+}
+
+class _ObservabilitySurfaceProvider extends LlmProvider {
+  @override
+  Future<QueryResponse> run(QueryRequest request) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Stream<ProviderStreamEvent> stream(QueryRequest request) async* {
+    if (request.includeObservabilityMessages) {
+      yield ProviderStreamEvent.rateLimit(
+        rateLimitInfo: const QueryRateLimitInfo(
+          provider: 'test',
+          status: 'ok',
+          requestsRemaining: '9',
+        ),
+        model: 'observability-model',
+      );
+      yield ProviderStreamEvent.streamEvent(
+        event: const {
+          'type': 'response.output_text.delta',
+          'delta': 'obs',
+        },
+        model: 'observability-model',
+      );
+    }
+    yield ProviderStreamEvent.textDelta(
+      delta: 'visible',
+      model: 'observability-model',
+    );
+    yield ProviderStreamEvent.done(
+      output: 'visible',
+      model: 'observability-model',
+    );
+  }
+}
+
+class _UsageSurfaceProvider extends NativeToolCallingLlmProvider {
+  @override
+  Future<QueryResponse> run(QueryRequest request) async {
+    return QueryResponse.success(
+      output: 'usage aware',
+      modelUsed: 'usage-surface-model',
+      usage: const QueryUsage(
+        inputTokens: 7,
+        outputTokens: 5,
+        totalTokens: 12,
+      ),
+      costUsd: 0.25,
+    );
   }
 }
 

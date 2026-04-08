@@ -3,6 +3,8 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 
+import '../agents/agent_registry.dart';
+import '../agents/load_agents_dir.dart';
 import '../core/app_config.dart';
 import '../core/conversation_session.dart';
 import '../core/models.dart';
@@ -16,7 +18,13 @@ import '../mcp/mcp_types.dart';
 import '../providers/llm_provider.dart';
 import '../providers/provider_strategy.dart';
 import '../runtime/app_runtime.dart';
+import '../skills/bundled_skills.dart';
+import '../skills/load_skills_dir.dart';
+import '../skills/skill_models.dart';
+import '../skills/skill_registry.dart';
+import '../tools/agent_tool.dart';
 import '../tools/mcp_tools.dart';
+import '../tools/skill_tool.dart';
 import '../tools/tool_executor.dart';
 import '../tools/tool_models.dart';
 import '../tools/tool_permissions.dart';
@@ -65,11 +73,19 @@ class ClartCodeAgent {
   bool _stopNotified = false;
   String? _stopReason;
   String? _activeModel;
+  ClartCodeReasoningEffort? _activeEffort;
   QueryCancellationController? _activeCancellationController;
+  final Set<QueryCancellationController>
+      _activeSubagentCancellationControllers = <QueryCancellationController>{};
   McpManager? _mcpManager;
+  ClartCodeAgentRegistry? _agentRegistry;
+  ClartCodeSkillRegistry? _skillRegistry;
+  String? _parentSessionId;
   bool _runtimePrepared = false;
   final Queue<_QueuedAgentRun> _pendingRuns = Queue<_QueuedAgentRun>();
   bool _drainingRuns = false;
+  StreamController<ClartCodeSdkMessage>? _activeQueryMessageController;
+  int? _activeSkillToolTurn;
 
   int _toolCallCounter = 0;
 
@@ -98,12 +114,31 @@ class ClartCodeAgent {
   List<String> get availableTools =>
       toolDefinitions.map((tool) => tool.name).toList(growable: false);
 
+  List<String> get availableSkills =>
+      skillDefinitions.map((skill) => skill.name).toList(growable: false);
+
+  List<String> get availableAgents =>
+      agentDefinitions.map((agent) => agent.name).toList(growable: false);
+
   List<ClartCodeToolDefinition> get toolDefinitions {
     final definitions = _runtime.toolExecutor.registry.all
         .map(ClartCodeToolDefinition.fromTool)
         .toList();
     definitions.sort((left, right) => left.name.compareTo(right.name));
     return List<ClartCodeToolDefinition>.unmodifiable(definitions);
+  }
+
+  List<ClartCodeSkillDefinition> get skillDefinitions {
+    final definitions = _skillRegistry?.modelInvocable.toList() ?? const [];
+    definitions.sort((left, right) => left.name.compareTo(right.name));
+    return List<ClartCodeSkillDefinition>.unmodifiable(definitions);
+  }
+
+  List<ClartCodeAgentDefinition> get agentDefinitions {
+    final definitions =
+        (_agentRegistry?.all.toList() ?? _normalizedAgentDefinitions());
+    definitions.sort((left, right) => left.name.compareTo(right.name));
+    return List<ClartCodeAgentDefinition>.unmodifiable(definitions);
   }
 
   List<McpConnection> get mcpConnections {
@@ -196,12 +231,17 @@ class ClartCodeAgent {
   }
 
   Future<void> stop({String reason = 'manual_stop'}) async {
-    if (!_queryInProgress || _stopRequested) {
+    if ((!_queryInProgress && _activeSubagentCancellationControllers.isEmpty) ||
+        _stopRequested) {
       return;
     }
     _stopRequested = true;
     _stopReason = reason;
     _activeCancellationController?.cancel(reason);
+    for (final controller
+        in _activeSubagentCancellationControllers.toList(growable: false)) {
+      controller.cancel(reason);
+    }
     if (_stopNotified) {
       return;
     }
@@ -213,6 +253,7 @@ class ClartCodeAgent {
         provider: _config.provider,
         model: _activeModel ?? _config.model,
         reason: reason,
+        parentSessionId: _parentSessionId,
       ),
     );
   }
@@ -248,11 +289,14 @@ class ClartCodeAgent {
   Stream<ClartCodeSdkMessage> query(
     String prompt, {
     String? model,
+    ClartCodeReasoningEffort? effort,
+    ClartCodeRequestOptions request = const ClartCodeRequestOptions(),
     QueryCancellationSignal? cancellationSignal,
   }) async* {
     final run = _QueuedAgentRun(
       prompt: prompt,
       model: model,
+      request: effort == null ? request : request.copyWith(effort: effort),
       cancellationSignal: cancellationSignal,
     );
     if (cancellationSignal?.isCancelled ?? false) {
@@ -269,8 +313,43 @@ class ClartCodeAgent {
   Stream<ClartCodeSdkMessage> _executeQuery(
     String prompt, {
     String? model,
+    ClartCodeRequestOptions request = const ClartCodeRequestOptions(),
     QueryCancellationSignal? cancellationSignal,
-  }) async* {
+  }) {
+    final controller = StreamController<ClartCodeSdkMessage>();
+    unawaited(() async {
+      _activeQueryMessageController = controller;
+      try {
+        await _executeQueryInto(
+          controller,
+          prompt,
+          model: model,
+          request: request,
+          cancellationSignal: cancellationSignal,
+        );
+      } catch (error, stackTrace) {
+        if (!controller.isClosed) {
+          controller.addError(error, stackTrace);
+        }
+      } finally {
+        if (identical(_activeQueryMessageController, controller)) {
+          _activeQueryMessageController = null;
+        }
+        if (!controller.isClosed) {
+          await controller.close();
+        }
+      }
+    }());
+    return controller.stream;
+  }
+
+  Future<void> _executeQueryInto(
+    StreamController<ClartCodeSdkMessage> controller,
+    String prompt, {
+    String? model,
+    ClartCodeRequestOptions request = const ClartCodeRequestOptions(),
+    QueryCancellationSignal? cancellationSignal,
+  }) async {
     final watch = Stopwatch()..start();
     try {
       await _ensureRuntimeReady();
@@ -281,15 +360,18 @@ class ClartCodeAgent {
         source: 'sdk_agent',
         retriable: false,
       );
-      yield ClartCodeSdkMessage.result(
-        sessionId: _sessionId,
-        subtype: 'error_runtime_init',
-        text: '[ERROR] ${runtimeError.message}',
-        isError: true,
-        model: model ?? _config.model,
-        turns: 0,
-        error: runtimeError,
-        durationMs: watch.elapsedMilliseconds,
+      _emitToController(
+        controller,
+        ClartCodeSdkMessage.result(
+          sessionId: _sessionId,
+          subtype: 'error_runtime_init',
+          text: '[ERROR] ${runtimeError.message}',
+          isError: true,
+          model: model ?? _config.model,
+          turns: 0,
+          error: runtimeError,
+          durationMs: watch.elapsedMilliseconds,
+        ),
       );
       return;
     }
@@ -297,15 +379,17 @@ class ClartCodeAgent {
     final submission = submitter.submit(prompt, model: model ?? _config.model);
     final processed = _inputProcessor.process(submission);
     final definitions = toolDefinitions;
-    final providerToolDefinitions = _providerToolDefinitions(definitions);
     final normalizedMaxTurns = _options.maxTurns < 1 ? 1 : _options.maxTurns;
 
-    yield ClartCodeSdkMessage.systemInit(
-      sessionId: _sessionId,
-      cwd: _cwd,
-      model: model ?? _config.model,
-      tools: availableTools,
-      toolDefinitions: definitions,
+    _emitToController(
+      controller,
+      ClartCodeSdkMessage.systemInit(
+        sessionId: _sessionId,
+        cwd: _cwd,
+        model: model ?? _config.model,
+        tools: availableTools,
+        toolDefinitions: definitions,
+      ),
     );
 
     if (!processed.isQuery) {
@@ -322,21 +406,39 @@ class ClartCodeAgent {
             : processed.transcriptMessages,
       );
       _persistSession();
-      yield ClartCodeSdkMessage.result(
-        sessionId: _sessionId,
-        subtype: 'error_invalid_input',
-        text: output,
-        isError: true,
-        model: model ?? _config.model,
-        turns: 0,
-        error: error,
-        durationMs: watch.elapsedMilliseconds,
+      _emitToController(
+        controller,
+        ClartCodeSdkMessage.result(
+          sessionId: _sessionId,
+          subtype: 'error_invalid_input',
+          text: output,
+          isError: true,
+          model: model ?? _config.model,
+          turns: 0,
+          error: error,
+          durationMs: watch.elapsedMilliseconds,
+        ),
       );
       return;
     }
 
     final userPrompt = processed.submission.raw;
     final selectedModel = model ?? _config.model;
+    final selectedEffort = request.effort ?? _options.effort;
+    final selectedSystemPrompt = _normalizedPromptText(request.systemPrompt) ??
+        _normalizedPromptText(_options.systemPrompt);
+    final selectedAppendSystemPrompt =
+        _normalizedPromptText(request.appendSystemPrompt) ??
+            _normalizedPromptText(_options.appendSystemPrompt);
+    final selectedMaxTokens = request.maxTokens ?? _options.maxTokens;
+    final selectedMaxBudgetUsd = request.maxBudgetUsd ?? _options.maxBudgetUsd;
+    final selectedThinking = request.thinking ?? _options.thinking;
+    final selectedJsonSchema = request.jsonSchema ?? _options.jsonSchema;
+    final selectedOutputFormat = request.outputFormat ?? _options.outputFormat;
+    final includePartialMessages =
+        request.includePartialMessages ?? _options.includePartialMessages;
+    final includeObservabilityMessages = request.includeObservabilityMessages ??
+        _options.includeObservabilityMessages;
     _queryInProgress = true;
     _stopRequested = cancellationSignal?.isCancelled ?? false;
     _stopNotified = false;
@@ -344,6 +446,7 @@ class ClartCodeAgent {
         ? cancellationSignal?.reason ?? 'request cancelled'
         : null;
     _activeModel = selectedModel;
+    _activeEffort = selectedEffort;
     StreamSubscription<void>? externalCancellationSub;
     if (cancellationSignal != null) {
       externalCancellationSub = cancellationSignal.onCancel.listen((_) {
@@ -371,14 +474,67 @@ class ClartCodeAgent {
         model: selectedModel,
         availableTools: availableTools,
         toolDefinitions: definitions,
+        parentSessionId: _parentSessionId,
       ),
     );
 
     var modelUsed = selectedModel;
+    QueryUsage? cumulativeUsage;
+    double? cumulativeCostUsd;
+    final modelUsageByModel = <String, QueryModelUsage>{};
+    _ActiveSkillState? activeSkill;
     var completedTurns = 0;
+    Future<void> endActiveSkill({
+      required String reason,
+      required int endedTurn,
+      required String? model,
+      RuntimeError? error,
+      String? text,
+      int? durationMs,
+    }) async {
+      final current = activeSkill;
+      if (current == null) {
+        return;
+      }
+      activeSkill = null;
+      if (_shouldEmitSkillTerminalMessage(reason)) {
+        _emitToController(
+          controller,
+          _buildSkillTerminalMessage(
+            activeSkill: current,
+            reason: reason,
+            endedTurn: endedTurn,
+            model: model,
+            error: error,
+            text: text,
+            durationMs: durationMs,
+          ),
+        );
+      }
+      await _emitSkillEndHook(
+        prompt: userPrompt,
+        activeSkill: current,
+        model: model,
+        effort: _skillRuntimeEffort(
+          currentEffort: selectedEffort,
+          activeSkill: current,
+        ),
+        endedTurn: endedTurn,
+        reason: reason,
+      );
+    }
+
     try {
       for (var turn = 1; turn <= normalizedMaxTurns; turn++) {
         if (_stopRequested) {
+          await endActiveSkill(
+            reason: 'cancelled',
+            endedTurn: completedTurns,
+            model: modelUsed,
+            error: _stoppedError(),
+            text: '[STOPPED] request cancelled',
+            durationMs: watch.elapsedMilliseconds,
+          );
           final stoppedResult = await _finishWithError(
             watch: watch,
             prompt: userPrompt,
@@ -386,12 +542,38 @@ class ClartCodeAgent {
             turns: completedTurns,
             subtype: 'error_stopped',
             error: _stoppedError(),
+            usage: cumulativeUsage,
+            costUsd: cumulativeCostUsd,
+            modelUsage: _modelUsageListFromMap(modelUsageByModel),
           );
-          yield stoppedResult;
+          _emitToController(controller, stoppedResult);
           return;
         }
 
         completedTurns = turn;
+        final effectiveToolDefinitions = _effectiveToolDefinitions(
+          definitions,
+          activeSkill,
+        );
+        final effectiveProviderToolDefinitions =
+            _providerToolDefinitions(effectiveToolDefinitions);
+        final effectiveTurnModel = _effectiveTurnModel(
+          selectedModel,
+          activeSkill,
+        );
+        final effectiveTurnEffort = _effectiveTurnEffort(
+          selectedEffort,
+          activeSkill,
+        );
+        _activeModel = effectiveTurnModel;
+        _activeEffort = effectiveTurnEffort;
+        _maybeEmitStatusMessage(
+          controller,
+          enabled: includeObservabilityMessages,
+          status: 'running_model',
+          model: effectiveTurnModel,
+          turn: turn,
+        );
         await _options.hooks.onModelTurnStart?.call(
           ClartCodeModelTurnStartEvent(
             sessionId: _sessionId,
@@ -399,23 +581,37 @@ class ClartCodeAgent {
             provider: _config.provider,
             prompt: userPrompt,
             turn: turn,
-            model: modelUsed,
-            availableTools: availableTools,
+            model: effectiveTurnModel,
+            availableTools: effectiveToolDefinitions
+                .map((tool) => tool.name)
+                .toList(growable: false),
+            parentSessionId: _parentSessionId,
           ),
         );
         final request = _buildToolLoopRequest(
           messages: providerStateToken == null
               ? workingMessages
               : pendingProviderMessages,
-          model: selectedModel,
-          toolDefinitions: definitions,
-          providerToolDefinitions: providerToolDefinitions,
+          model: effectiveTurnModel,
+          systemPrompt: selectedSystemPrompt,
+          appendSystemPrompt: selectedAppendSystemPrompt,
+          maxTokens: selectedMaxTokens,
+          maxBudgetUsd: selectedMaxBudgetUsd,
+          thinking: selectedThinking,
+          jsonSchema: selectedJsonSchema,
+          outputFormat: selectedOutputFormat,
+          includePartialMessages: includePartialMessages,
+          includeObservabilityMessages: includeObservabilityMessages,
+          toolDefinitions: effectiveToolDefinitions,
+          providerToolDefinitions: effectiveProviderToolDefinitions,
+          effort: effectiveTurnEffort,
           providerStateToken: providerStateToken,
           cancellationSignal: (_activeCancellationController =
                   QueryCancellationController())
               .signal,
         );
         final turnWatch = Stopwatch()..start();
+        final previousProviderStateToken = providerStateToken;
         final turnResult = await _runProviderTurn(request: request, turn: turn);
         turnWatch.stop();
         _activeCancellationController?.close();
@@ -432,6 +628,20 @@ class ClartCodeAgent {
         final toolCalls = turnResult.toolCalls.isNotEmpty
             ? _sdkToolCallsFromProviderToolCalls(turnResult.toolCalls)
             : _parseToolCalls(turnResult.rawOutput);
+        cumulativeUsage = QueryUsage.combine([
+          cumulativeUsage,
+          turnResult.usage,
+        ]);
+        cumulativeCostUsd = _sumNullableDouble(
+          cumulativeCostUsd,
+          turnResult.costUsd,
+        );
+        _recordModelUsage(
+          modelUsageByModel,
+          model: modelUsed,
+          usage: turnResult.usage,
+          costUsd: turnResult.costUsd,
+        );
 
         await _options.hooks.onModelTurnEnd?.call(
           ClartCodeModelTurnEndEvent(
@@ -446,19 +656,78 @@ class ClartCodeAgent {
             toolCalls: toolCalls,
             durationMs: turnWatch.elapsedMilliseconds,
             error: turnResult.error,
+            usage: turnResult.usage,
+            costUsd: turnResult.costUsd,
+            parentSessionId: _parentSessionId,
           ),
         );
 
-        for (final delta in turnResult.deltas) {
-          yield ClartCodeSdkMessage.assistantDelta(
-            sessionId: _sessionId,
-            delta: delta,
-            model: modelUsed,
-            turn: turn,
-          );
+        if (includeObservabilityMessages) {
+          for (final event in turnResult.observabilityEvents) {
+            switch (event.type) {
+              case ProviderStreamEventType.streamEvent:
+                final payload = event.event;
+                if (payload == null || payload.isEmpty) {
+                  continue;
+                }
+                _emitToController(
+                  controller,
+                  ClartCodeSdkMessage.streamEvent(
+                    sessionId: _sessionId,
+                    event: payload,
+                    model: event.model ?? modelUsed,
+                    turn: turn,
+                  ),
+                );
+                break;
+              case ProviderStreamEventType.rateLimit:
+                final info = event.rateLimitInfo;
+                if (info == null) {
+                  continue;
+                }
+                _emitToController(
+                  controller,
+                  ClartCodeSdkMessage.rateLimitEvent(
+                    sessionId: _sessionId,
+                    rateLimitInfo: info,
+                    model: event.model ?? modelUsed,
+                    turn: turn,
+                  ),
+                );
+                break;
+              case ProviderStreamEventType.textDelta:
+              case ProviderStreamEventType.done:
+              case ProviderStreamEventType.error:
+                break;
+            }
+          }
+        }
+
+        if (includePartialMessages) {
+          for (final delta in turnResult.deltas) {
+            _emitToController(
+              controller,
+              ClartCodeSdkMessage.assistantDelta(
+                sessionId: _sessionId,
+                delta: delta,
+                model: modelUsed,
+                turn: turn,
+              ),
+            );
+          }
         }
 
         if (turnResult.error != null) {
+          await endActiveSkill(
+            reason: turnResult.error!.code == RuntimeErrorCode.cancelled
+                ? 'cancelled'
+                : 'error',
+            endedTurn: turn,
+            model: modelUsed,
+            error: turnResult.error!,
+            text: turnResult.output,
+            durationMs: watch.elapsedMilliseconds,
+          );
           final terminal = await _finishWithError(
             watch: watch,
             prompt: userPrompt,
@@ -468,13 +737,80 @@ class ClartCodeAgent {
                 ? 'error_stopped'
                 : 'error_during_execution',
             error: turnResult.error!,
+            usage: cumulativeUsage,
+            costUsd: cumulativeCostUsd,
+            modelUsage: _modelUsageListFromMap(modelUsageByModel),
             terminalOutput: turnResult.output,
           );
-          yield terminal;
+          _emitToController(controller, terminal);
+          return;
+        }
+
+        final budgetError = _budgetExceededError(
+          maxBudgetUsd: selectedMaxBudgetUsd,
+          costUsd: cumulativeCostUsd,
+        );
+        if (budgetError != null) {
+          await endActiveSkill(
+            reason: 'error',
+            endedTurn: turn,
+            model: modelUsed,
+            error: budgetError,
+            text: _formatBudgetExceededOutput(
+              error: budgetError,
+              terminalOutput: turnResult.output,
+            ),
+            durationMs: watch.elapsedMilliseconds,
+          );
+          final terminal = await _finishWithError(
+            watch: watch,
+            prompt: userPrompt,
+            modelUsed: modelUsed,
+            turns: completedTurns,
+            subtype: 'error_budget_exceeded',
+            error: budgetError,
+            usage: cumulativeUsage,
+            costUsd: cumulativeCostUsd,
+            modelUsage: _modelUsageListFromMap(modelUsageByModel),
+            terminalOutput: _formatBudgetExceededOutput(
+              error: budgetError,
+              terminalOutput: turnResult.output,
+            ),
+          );
+          _emitToController(controller, terminal);
           return;
         }
 
         final output = turnResult.output;
+        final shouldEmitCompactBoundary = includeObservabilityMessages &&
+            toolCalls.isNotEmpty &&
+            _providerStateTokenChanged(
+              previous: previousProviderStateToken,
+              next: turnResult.providerStateToken,
+            );
+        if (shouldEmitCompactBoundary) {
+          _maybeEmitStatusMessage(
+            controller,
+            enabled: true,
+            status: 'compacting',
+            model: modelUsed,
+            turn: turn,
+          );
+          _emitToController(
+            controller,
+            ClartCodeSdkMessage.compactBoundary(
+              sessionId: _sessionId,
+              compactMetadata: _buildCompactBoundaryMetadata(
+                turn: turn,
+                toolCalls: toolCalls,
+                previousProviderStateToken: previousProviderStateToken,
+                nextProviderStateToken: turnResult.providerStateToken,
+              ),
+              model: modelUsed,
+              turn: turn,
+            ),
+          );
+        }
         if (toolCalls.isEmpty) {
           _conversation.appendHistoryMessages([
             ChatMessage(role: MessageRole.assistant, text: output),
@@ -484,11 +820,19 @@ class ClartCodeAgent {
           ]);
           _persistSession();
           watch.stop();
-          yield ClartCodeSdkMessage.assistant(
-            sessionId: _sessionId,
-            text: output,
+          await endActiveSkill(
+            reason: 'query_end',
+            endedTurn: turn,
             model: modelUsed,
-            turn: turn,
+          );
+          _emitToController(
+            controller,
+            ClartCodeSdkMessage.assistant(
+              sessionId: _sessionId,
+              text: output,
+              model: modelUsed,
+              turn: turn,
+            ),
           );
           final promptResult = ClartCodePromptResult(
             sessionId: _sessionId,
@@ -498,6 +842,9 @@ class ClartCodeAgent {
             messages: const [],
             model: modelUsed,
             durationMs: watch.elapsedMilliseconds,
+            usage: cumulativeUsage,
+            costUsd: cumulativeCostUsd,
+            modelUsage: _modelUsageListFromMap(modelUsageByModel),
           );
           await _options.hooks.onSessionEnd?.call(
             ClartCodeSessionEndEvent(
@@ -507,16 +854,23 @@ class ClartCodeAgent {
               prompt: userPrompt,
               model: modelUsed,
               result: promptResult,
+              parentSessionId: _parentSessionId,
             ),
           );
-          yield ClartCodeSdkMessage.result(
-            sessionId: _sessionId,
-            subtype: 'success',
-            text: output,
-            isError: false,
-            model: modelUsed,
-            turns: completedTurns,
-            durationMs: watch.elapsedMilliseconds,
+          _emitToController(
+            controller,
+            ClartCodeSdkMessage.result(
+              sessionId: _sessionId,
+              subtype: 'success',
+              text: output,
+              isError: false,
+              model: modelUsed,
+              turns: completedTurns,
+              durationMs: watch.elapsedMilliseconds,
+              usage: cumulativeUsage,
+              costUsd: cumulativeCostUsd,
+              modelUsage: _modelUsageListFromMap(modelUsageByModel),
+            ),
           );
           return;
         }
@@ -535,13 +889,23 @@ class ClartCodeAgent {
         pendingProviderMessages = const [];
 
         for (final toolCall in toolCalls) {
-          yield ClartCodeSdkMessage.toolCall(
-            sessionId: _sessionId,
-            toolCall: toolCall,
-            model: modelUsed,
-            turn: turn,
+          _emitToController(
+            controller,
+            ClartCodeSdkMessage.toolCall(
+              sessionId: _sessionId,
+              toolCall: toolCall,
+              model: modelUsed,
+              turn: turn,
+            ),
           );
         }
+        _maybeEmitStatusMessage(
+          controller,
+          enabled: includeObservabilityMessages,
+          status: 'running_tools',
+          model: modelUsed,
+          turn: turn,
+        );
 
         final invocationMap = Map<ToolInvocation, ClartCodeToolCall>.identity();
         final invocations = toolCalls.map((toolCall) {
@@ -553,7 +917,16 @@ class ClartCodeAgent {
           invocationMap[invocation] = toolCall;
           return invocation;
         }).toList(growable: false);
-        final needsPermissionResolver = _options.canUseTool != null ||
+        final hasActiveSkillRestriction = (activeSkill?.allowedTools != null &&
+                activeSkill!.allowedTools!.isNotEmpty) ||
+            (activeSkill?.disallowedTools != null &&
+                activeSkill!.disallowedTools!.isNotEmpty);
+        final mayActivateSkillWithinBatch = invocations.any(
+          (invocation) => invocation.name == 'skill',
+        );
+        final needsPermissionResolver = hasActiveSkillRestriction ||
+            mayActivateSkillWithinBatch ||
+            _options.canUseTool != null ||
             invocations.any(
               (invocation) => _runtime.toolExecutor.permissionPolicy.shouldAsk(
                 invocation.name,
@@ -569,6 +942,14 @@ class ClartCodeAgent {
                         (candidate) => candidate.id == invocation.id,
                       );
                   final context = _toolContext(turn: turn, model: modelUsed);
+                  final skillRestriction = await _resolveSkillRestriction(
+                    activeSkill: activeSkill,
+                    toolCall: toolCall,
+                    context: context,
+                  );
+                  if (skillRestriction != null) {
+                    return skillRestriction;
+                  }
                   final permissionOutcome =
                       await _options.resolveToolPermission?.call(
                     toolCall,
@@ -623,6 +1004,7 @@ class ClartCodeAgent {
                 },
           hooks: ToolExecutionHooks(
             beforeExecute: (invocation) async {
+              _activeSkillToolTurn = turn;
               final toolCall = invocationMap[invocation] ??
                   toolCalls.firstWhere(
                     (candidate) => candidate.id == invocation.id,
@@ -633,6 +1015,38 @@ class ClartCodeAgent {
                   toolCall: toolCall,
                 ),
               );
+            },
+            afterExecute: (invocation, result) async {
+              try {
+                final nextSkill = _skillStateFromToolResult(
+                  result,
+                  turn: turn,
+                );
+                if (nextSkill != null) {
+                  if (activeSkill != null) {
+                    await endActiveSkill(
+                      reason: 'replaced_by_skill',
+                      endedTurn: turn,
+                      model: modelUsed,
+                    );
+                  }
+                  activeSkill = nextSkill;
+                  await _emitSkillActivationHook(
+                    prompt: userPrompt,
+                    activeSkill: nextSkill,
+                    model: _skillRuntimeModel(
+                      currentModel: modelUsed,
+                      activeSkill: nextSkill,
+                    ),
+                    effort: _skillRuntimeEffort(
+                      currentEffort: effectiveTurnEffort,
+                      activeSkill: nextSkill,
+                    ),
+                  );
+                }
+              } finally {
+                _activeSkillToolTurn = null;
+              }
             },
           ),
         );
@@ -669,17 +1083,35 @@ class ClartCodeAgent {
           _conversation.appendTranscriptMessages([
             TranscriptMessage.toolResult(toolMessage.text),
           ]);
-          yield ClartCodeSdkMessage.toolResult(
-            sessionId: _sessionId,
-            toolResult: sdkResult,
-            model: modelUsed,
-            turn: turn,
+          _emitToController(
+            controller,
+            ClartCodeSdkMessage.toolResult(
+              sessionId: _sessionId,
+              toolResult: sdkResult,
+              model: modelUsed,
+              turn: turn,
+            ),
           );
         }
 
         _persistSession();
       }
 
+      await endActiveSkill(
+        reason: 'max_turns_reached',
+        endedTurn: completedTurns,
+        model: modelUsed,
+        error: RuntimeError(
+          code: RuntimeErrorCode.unknown,
+          message:
+              'agent reached max turns ($normalizedMaxTurns) before producing a final assistant response',
+          source: 'sdk_agent',
+          retriable: false,
+        ),
+        text:
+            '[ERROR] agent reached max turns ($normalizedMaxTurns) before producing a final assistant response',
+        durationMs: watch.elapsedMilliseconds,
+      );
       final terminal = await _finishWithError(
         watch: watch,
         prompt: userPrompt,
@@ -693,8 +1125,11 @@ class ClartCodeAgent {
           source: 'sdk_agent',
           retriable: false,
         ),
+        usage: cumulativeUsage,
+        costUsd: cumulativeCostUsd,
+        modelUsage: _modelUsageListFromMap(modelUsageByModel),
       );
-      yield terminal;
+      _emitToController(controller, terminal);
     } finally {
       await externalCancellationSub?.cancel();
       _activeCancellationController?.close();
@@ -708,17 +1143,31 @@ class ClartCodeAgent {
   Future<ClartCodePromptResult> prompt(
     String prompt, {
     String? model,
+    ClartCodeReasoningEffort? effort,
+    ClartCodeRequestOptions request = const ClartCodeRequestOptions(),
     QueryCancellationSignal? cancellationSignal,
   }) async {
     final messages = <ClartCodeSdkMessage>[];
     await for (final message in query(
       prompt,
       model: model,
+      effort: effort,
+      request: request,
       cancellationSignal: cancellationSignal,
     )) {
       messages.add(message);
     }
 
+    return _promptResultFromMessages(
+      messages,
+      fallbackModel: model ?? _config.model,
+    );
+  }
+
+  ClartCodePromptResult _promptResultFromMessages(
+    List<ClartCodeSdkMessage> messages, {
+    required String? fallbackModel,
+  }) {
     final result = messages.lastWhere(
       (message) => message.type == 'result',
       orElse: () => ClartCodeSdkMessage.result(
@@ -726,6 +1175,7 @@ class ClartCodeAgent {
         subtype: 'error_missing_result',
         text: 'Prompt completed without a terminal result.',
         isError: true,
+        model: fallbackModel,
       ),
     );
 
@@ -738,7 +1188,169 @@ class ClartCodeAgent {
       model: result.model,
       error: result.error,
       durationMs: result.durationMs,
+      usage: result.usage,
+      costUsd: result.costUsd,
+      modelUsage: result.modelUsage == null
+          ? null
+          : List<QueryModelUsage>.unmodifiable(result.modelUsage!),
     );
+  }
+
+  Future<ClartCodeSubagentResult> runSubagent(
+    String prompt, {
+    ClartCodeSubagentOptions options = const ClartCodeSubagentOptions(),
+    QueryCancellationSignal? cancellationSignal,
+  }) async {
+    final normalizedPrompt = prompt.trim();
+    if (normalizedPrompt.isEmpty) {
+      throw ArgumentError.value(
+          prompt, 'prompt', 'subagent prompt cannot be empty');
+    }
+
+    final effectivePromptPrefix = options.promptPrefix?.trim();
+    final effectivePrompt =
+        effectivePromptPrefix == null || effectivePromptPrefix.isEmpty
+            ? normalizedPrompt
+            : '$effectivePromptPrefix\n\n$normalizedPrompt';
+    final subagentName = _stringMetadata(options.name);
+    final childAgent = ClartCodeAgent(
+      _buildChildAgentOptions(
+        model: options.model,
+        effort: options.effort,
+        allowedTools: options.allowedTools,
+        disallowedTools: options.disallowedTools,
+        inheritMcp: options.inheritMcp,
+        inheritAgents: options.inheritAgents,
+        inheritSkills: options.inheritSkills,
+        inheritHooks: options.inheritHooks,
+      ),
+    );
+    childAgent._parentSessionId = _sessionId;
+    final linkedCancellationController = QueryCancellationController();
+    _activeSubagentCancellationControllers.add(linkedCancellationController);
+    StreamSubscription<void>? externalCancellationSub;
+    if (cancellationSignal != null) {
+      if (cancellationSignal.isCancelled) {
+        linkedCancellationController.cancel(
+          cancellationSignal.reason ?? 'request cancelled',
+        );
+      } else {
+        externalCancellationSub = cancellationSignal.onCancel.listen((_) {
+          linkedCancellationController.cancel(
+            cancellationSignal.reason ?? 'request cancelled',
+          );
+        });
+      }
+    }
+    if (_stopRequested) {
+      linkedCancellationController.cancel(
+        _stopReason ?? 'request cancelled',
+      );
+    }
+    await _options.hooks.onSubagentStart?.call(
+      ClartCodeSubagentStartEvent(
+        parentSessionId: _sessionId,
+        sessionId: childAgent.sessionId,
+        cwd: childAgent.cwd,
+        provider: _config.provider,
+        prompt: effectivePrompt,
+        name: subagentName,
+        model: options.model ?? childAgent.model,
+      ),
+    );
+    try {
+      _maybeEmitLiveSubagentMessage(
+        _buildSubagentCascadedStartMessage(
+          sessionId: childAgent.sessionId,
+          parentSessionId: _sessionId,
+          prompt: effectivePrompt,
+          name: subagentName,
+          model: options.model ?? childAgent.model,
+        ),
+      );
+      final messages = <ClartCodeSdkMessage>[];
+      await for (final message in childAgent.query(
+        effectivePrompt,
+        model: options.model,
+        cancellationSignal: linkedCancellationController.signal,
+      )) {
+        messages.add(message);
+        _maybeEmitLiveSubagentMessage(
+          _cascadeSubagentMessage(
+            parentSessionId: _sessionId,
+            name: subagentName,
+            message: message,
+            includeAssistantDeltas: options.cascadeAssistantDeltas,
+          ),
+        );
+      }
+      final result = childAgent._promptResultFromMessages(
+        messages,
+        fallbackModel: options.model ?? childAgent.model ?? _config.model,
+      );
+      final transcriptMessages = _buildSubagentTranscriptMessages(
+        sessionId: childAgent.sessionId,
+        parentSessionId: _sessionId,
+        prompt: effectivePrompt,
+        text: result.text,
+        turns: result.turns,
+        isError: result.isError,
+        name: subagentName,
+        model: result.model,
+        error: result.error,
+      );
+      final cascadedMessages = _buildSubagentCascadedMessages(
+        sessionId: childAgent.sessionId,
+        parentSessionId: _sessionId,
+        prompt: effectivePrompt,
+        name: subagentName,
+        model: result.model,
+        messages: result.messages,
+        includeAssistantDeltas: options.cascadeAssistantDeltas,
+      );
+      if (transcriptMessages.isNotEmpty) {
+        _conversation.appendTranscriptMessages(transcriptMessages);
+        _persistSession();
+      }
+      final subagentResult = ClartCodeSubagentResult(
+        parentSessionId: _sessionId,
+        sessionId: childAgent.sessionId,
+        cwd: childAgent.cwd,
+        prompt: effectivePrompt,
+        text: result.text,
+        turns: result.turns,
+        isError: result.isError,
+        messages: result.messages,
+        cascadedMessages: List<ClartCodeSdkMessage>.unmodifiable(
+          cascadedMessages,
+        ),
+        transcriptMessages:
+            List<TranscriptMessage>.unmodifiable(transcriptMessages),
+        name: subagentName,
+        model: result.model,
+        error: result.error,
+        durationMs: result.durationMs,
+        usage: result.usage,
+        costUsd: result.costUsd,
+        modelUsage: result.modelUsage,
+      );
+      await _options.hooks.onSubagentEnd?.call(
+        ClartCodeSubagentEndEvent(
+          parentSessionId: _sessionId,
+          result: subagentResult,
+          provider: _config.provider,
+          name: subagentName,
+          reason: linkedCancellationController.signal.reason,
+        ),
+      );
+      return subagentResult;
+    } finally {
+      _activeSubagentCancellationControllers
+          .remove(linkedCancellationController);
+      linkedCancellationController.close();
+      await externalCancellationSub?.cancel();
+      await childAgent.close();
+    }
   }
 
   void _enqueueRun(_QueuedAgentRun run) {
@@ -766,6 +1378,7 @@ class ClartCodeAgent {
             _executeQuery(
               run.prompt,
               model: run.model,
+              request: run.request,
               cancellationSignal: run.cancellationSignal,
             ),
           );
@@ -813,6 +1426,7 @@ class ClartCodeAgent {
         model: run.model ?? _config.model,
         result: result,
         reason: reason,
+        parentSessionId: _parentSessionId,
       ),
     );
     run.controller.add(
@@ -870,6 +1484,8 @@ class ClartCodeAgent {
       toolExecutor: toolExecutor,
     );
     _engine = QueryEngine(_runtime);
+    _agentRegistry = null;
+    _skillRegistry = null;
     _runtimePrepared = false;
   }
 
@@ -910,10 +1526,88 @@ class ClartCodeAgent {
     if (_runtimePrepared) {
       return;
     }
+    if (_options.skills != null) {
+      await _ensureSkillsLoaded(_options.skills!);
+    }
+    if (_options.agents != null) {
+      await _ensureAgentsLoaded(_options.agents!);
+    }
     if (_options.mcp != null) {
       await _ensureMcpToolsLoaded(_options.mcp!);
     }
     _runtimePrepared = true;
+  }
+
+  Future<void> _ensureAgentsLoaded(ClartCodeAgentsOptions options) async {
+    final registry = options.registry?.copy() ?? ClartCodeAgentRegistry();
+    registry.registerAll(_normalizedAgentDefinitions());
+
+    for (final directory in options.directories) {
+      final trimmed = directory.trim();
+      if (trimmed.isEmpty) {
+        continue;
+      }
+      registry.registerAll(
+        await loadAgentsDir(_resolveAgentPath(trimmed)),
+      );
+    }
+
+    _agentRegistry = registry;
+    final definitions = agentDefinitions;
+    if (!options.enableTool ||
+        definitions.isEmpty ||
+        !_isToolEnabled('agent') ||
+        _runtime.toolExecutor.registry.lookup('agent') != null) {
+      return;
+    }
+
+    _runtime.toolExecutor.registry.register(
+      AgentTool(
+        agents: definitions,
+        runner: _runNamedAgent,
+      ),
+    );
+  }
+
+  Future<void> _ensureSkillsLoaded(ClartCodeSkillsOptions options) async {
+    final registry = options.registry?.copy() ?? ClartCodeSkillRegistry();
+    if (options.includeBundledSkills) {
+      initBundledSkills(registry);
+    }
+    registry.registerAll(options.skills);
+
+    for (final directory in options.directories) {
+      final trimmed = directory.trim();
+      if (trimmed.isEmpty) {
+        continue;
+      }
+      registry.registerAll(
+        await loadSkillsDir(_resolveAgentPath(trimmed)),
+      );
+    }
+
+    _skillRegistry = registry;
+    if (!options.enableTool ||
+        registry.modelInvocable.isEmpty ||
+        !_isToolEnabled('skill') ||
+        _runtime.toolExecutor.registry.lookup('skill') != null) {
+      return;
+    }
+
+    _runtime.toolExecutor.registry.register(
+      SkillTool(
+        registry: registry,
+        cwd: _cwd,
+        sessionId: _sessionId,
+        provider: _config.provider,
+        model: _activeModel ?? _config.model,
+        effort: _options.effort,
+        contextBuilder: _buildSkillToolContext,
+        agentResolver: _lookupNamedAgentDefinition,
+        agentDefinitionsBuilder: () => agentDefinitions,
+        forkRunner: _runForkedSkill,
+      ),
+    );
   }
 
   Future<void> _ensureMcpToolsLoaded(ClartCodeMcpOptions options) async {
@@ -948,13 +1642,39 @@ class ClartCodeAgent {
         ?.map((name) => name.trim())
         .where((name) => name.isNotEmpty)
         .toList(growable: false);
+    final sdkServers = options.sdkServers;
+    final sdkServerNames = <String>{
+      for (final server in sdkServers) server.name,
+    };
+    final registry = await manager.loadRegistry();
+
+    for (final serverName in sdkServerNames) {
+      if (registry.containsKey(serverName)) {
+        throw ArgumentError(
+          'duplicate MCP server name in registry and sdkServers: $serverName',
+        );
+      }
+    }
+
     if (selectedServers == null || selectedServers.isEmpty) {
+      for (final server in sdkServers) {
+        await manager.connect(server);
+      }
       await manager.connectAll();
       return;
     }
 
-    final registry = await manager.loadRegistry();
+    final connectedSdkServers = <String>{};
     for (final serverName in selectedServers) {
+      if (sdkServerNames.contains(serverName)) {
+        if (connectedSdkServers.add(serverName)) {
+          final server = sdkServers.firstWhere(
+            (item) => item.name == serverName,
+          );
+          await manager.connect(server);
+        }
+        continue;
+      }
       final config = registry[serverName];
       if (config == null) {
         throw ArgumentError('unknown MCP server: $serverName');
@@ -966,28 +1686,165 @@ class ClartCodeAgent {
   QueryRequest _buildToolLoopRequest({
     required List<ChatMessage> messages,
     required String? model,
+    required String? systemPrompt,
+    required String? appendSystemPrompt,
+    required int? maxTokens,
+    required double? maxBudgetUsd,
+    required ClartCodeThinkingConfig? thinking,
+    required ClartCodeJsonSchema? jsonSchema,
+    required ClartCodeOutputFormat? outputFormat,
+    required bool includePartialMessages,
+    required bool includeObservabilityMessages,
+    required ClartCodeReasoningEffort? effort,
     required List<ClartCodeToolDefinition> toolDefinitions,
     required List<QueryToolDefinition> providerToolDefinitions,
     required String? providerStateToken,
     required QueryCancellationSignal? cancellationSignal,
   }) {
     final useNativeToolCalling = _runtime.provider.supportsNativeToolCalling;
+    final agentProtocolPrompt = _buildAgentProtocolPrompt();
+    final skillProtocolPrompt = _buildSkillProtocolPrompt();
+    final outputFormatPrompt = _buildOutputFormatPrompt(
+      jsonSchema: jsonSchema,
+      outputFormat: outputFormat,
+    );
     return QueryRequest(
       messages: [
+        if (agentProtocolPrompt != null)
+          ChatMessage(
+            role: MessageRole.system,
+            text: agentProtocolPrompt,
+          ),
+        if (skillProtocolPrompt != null)
+          ChatMessage(
+            role: MessageRole.system,
+            text: skillProtocolPrompt,
+          ),
         if (toolDefinitions.isNotEmpty && !useNativeToolCalling)
           ChatMessage(
             role: MessageRole.system,
             text: _buildToolProtocolPrompt(toolDefinitions),
           ),
+        if (outputFormatPrompt != null)
+          ChatMessage(
+            role: MessageRole.system,
+            text: outputFormatPrompt,
+          ),
         ...messages,
       ],
       maxTurns: _options.maxTurns,
       model: model,
+      effort: effort,
+      systemPrompt: systemPrompt,
+      appendSystemPrompt: appendSystemPrompt,
+      maxTokens: maxTokens,
+      maxBudgetUsd: maxBudgetUsd,
+      thinking: thinking,
+      jsonSchema: jsonSchema,
+      outputFormat: outputFormat,
+      includePartialMessages: includePartialMessages,
+      includeObservabilityMessages: includeObservabilityMessages,
       toolDefinitions:
           useNativeToolCalling ? providerToolDefinitions : const [],
       providerStateToken: useNativeToolCalling ? providerStateToken : null,
       cancellationSignal: cancellationSignal,
     );
+  }
+
+  String? _buildOutputFormatPrompt({
+    required ClartCodeJsonSchema? jsonSchema,
+    required ClartCodeOutputFormat? outputFormat,
+  }) {
+    if (jsonSchema != null) {
+      final buffer = StringBuffer()
+        ..writeln('Return valid JSON only.')
+        ..writeln(
+          'The final response must strictly match this JSON schema:',
+        )
+        ..write(jsonEncode(jsonSchema.schema));
+      return buffer.toString();
+    }
+    if (outputFormat?.type == ClartCodeOutputFormatType.jsonObject) {
+      return 'Return a valid JSON object only. Do not wrap it in markdown.';
+    }
+    return null;
+  }
+
+  String? _normalizedPromptText(String? value) {
+    final normalized = value?.trim();
+    if (normalized == null || normalized.isEmpty) {
+      return null;
+    }
+    return normalized;
+  }
+
+  void _recordModelUsage(
+    Map<String, QueryModelUsage> usageByModel, {
+    required String? model,
+    QueryUsage? usage,
+    double? costUsd,
+  }) {
+    final normalizedModel = model?.trim();
+    if (normalizedModel == null || normalizedModel.isEmpty) {
+      return;
+    }
+    final existing = usageByModel[normalizedModel];
+    usageByModel[normalizedModel] = existing == null
+        ? QueryModelUsage(
+            model: normalizedModel,
+            usage: usage,
+            costUsd: costUsd,
+          )
+        : existing.merge(
+            usage: usage,
+            costUsd: costUsd,
+          );
+  }
+
+  List<QueryModelUsage>? _modelUsageListFromMap(
+    Map<String, QueryModelUsage> usageByModel,
+  ) {
+    if (usageByModel.isEmpty) {
+      return null;
+    }
+    return List<QueryModelUsage>.unmodifiable(usageByModel.values);
+  }
+
+  double? _sumNullableDouble(double? left, double? right) {
+    if (left == null) {
+      return right;
+    }
+    if (right == null) {
+      return left;
+    }
+    return left + right;
+  }
+
+  RuntimeError? _budgetExceededError({
+    required double? maxBudgetUsd,
+    required double? costUsd,
+  }) {
+    if (maxBudgetUsd == null || costUsd == null || costUsd <= maxBudgetUsd) {
+      return null;
+    }
+    return RuntimeError(
+      code: RuntimeErrorCode.budgetExceeded,
+      message:
+          'query exceeded maxBudgetUsd (\$${costUsd.toStringAsFixed(4)} > \$${maxBudgetUsd.toStringAsFixed(4)})',
+      source: 'sdk_agent',
+      retriable: false,
+    );
+  }
+
+  String _formatBudgetExceededOutput({
+    required RuntimeError error,
+    required String? terminalOutput,
+  }) {
+    final output = terminalOutput?.trim() ?? '';
+    if (output.isEmpty) {
+      return '[ERROR] ${error.message}';
+    }
+    return '[ERROR] ${error.message}\n\nLast model output:\n$output';
   }
 
   List<QueryToolDefinition> _providerToolDefinitions(
@@ -1002,6 +1859,44 @@ class ClartCodeAgent {
           ),
         )
         .toList(growable: false);
+  }
+
+  List<ClartCodeToolDefinition> _effectiveToolDefinitions(
+    List<ClartCodeToolDefinition> allToolDefinitions,
+    _ActiveSkillState? activeSkill,
+  ) {
+    final allowedTools = activeSkill?.allowedTools;
+    final disallowedTools = activeSkill?.disallowedTools;
+    var filtered = allToolDefinitions;
+    if (allowedTools != null && allowedTools.isNotEmpty) {
+      filtered = filtered
+          .where((tool) => allowedTools.contains(tool.name))
+          .toList(growable: false);
+    }
+    if (disallowedTools == null || disallowedTools.isEmpty) {
+      return filtered;
+    }
+    return filtered
+        .where((tool) => !disallowedTools.contains(tool.name))
+        .toList(growable: false);
+  }
+
+  String? _effectiveTurnModel(
+    String? selectedModel,
+    _ActiveSkillState? activeSkill,
+  ) {
+    final override = activeSkill?.modelOverride?.trim();
+    if (override == null || override.isEmpty) {
+      return selectedModel;
+    }
+    return override;
+  }
+
+  ClartCodeReasoningEffort? _effectiveTurnEffort(
+    ClartCodeReasoningEffort? selectedEffort,
+    _ActiveSkillState? activeSkill,
+  ) {
+    return activeSkill?.effortOverride ?? selectedEffort;
   }
 
   String _buildToolProtocolPrompt(
@@ -1031,17 +1926,212 @@ class ClartCodeAgent {
     return buffer.toString().trimRight();
   }
 
+  Future<ToolPermissionResolution?> _resolveSkillRestriction({
+    required _ActiveSkillState? activeSkill,
+    required ClartCodeToolCall toolCall,
+    required ClartCodeToolContext context,
+  }) async {
+    final disallowedTools = activeSkill?.disallowedTools;
+    if (disallowedTools != null &&
+        disallowedTools.isNotEmpty &&
+        disallowedTools.contains(toolCall.name)) {
+      final message =
+          'tool "${toolCall.name}" is not allowed while skill "${activeSkill!.name}" is active';
+      final hook = _options.hooks.onToolPermissionDecision;
+      if (hook != null) {
+        await Future<void>.value(
+          hook(
+            ClartCodeToolPermissionEvent(
+              context: context,
+              toolCall: toolCall,
+              decision: ClartCodeToolPermissionDecision.deny,
+              source: ClartCodeToolPermissionSource.skill,
+              message: message,
+            ),
+          ),
+        );
+      }
+      return ToolPermissionResolution.deny(message: message);
+    }
+
+    final allowedTools = activeSkill?.allowedTools;
+    if (allowedTools == null || allowedTools.isEmpty) {
+      return null;
+    }
+    if (allowedTools.contains(toolCall.name)) {
+      return null;
+    }
+
+    final message =
+        'tool "${toolCall.name}" is not allowed while skill "${activeSkill!.name}" is active';
+    final hook = _options.hooks.onToolPermissionDecision;
+    if (hook != null) {
+      await Future<void>.value(
+        hook(
+          ClartCodeToolPermissionEvent(
+            context: context,
+            toolCall: toolCall,
+            decision: ClartCodeToolPermissionDecision.deny,
+            source: ClartCodeToolPermissionSource.skill,
+            message: message,
+          ),
+        ),
+      );
+    }
+    return ToolPermissionResolution.deny(message: message);
+  }
+
+  _ActiveSkillState? _skillStateFromToolResult(
+    ToolExecutionResult result, {
+    required int turn,
+  }) {
+    final state = _skillStateFromToolResultBase(result);
+    if (state == null) {
+      return null;
+    }
+    return state.copyWith(activatedTurn: turn);
+  }
+
+  _ActiveSkillState? _skillStateFromToolResultBase(ToolExecutionResult result) {
+    if (!result.ok || result.tool != 'skill') {
+      return null;
+    }
+    final metadata = result.metadata;
+    if (metadata == null) {
+      return null;
+    }
+    if (_stringMetadata(metadata['status']) != 'inline') {
+      return null;
+    }
+
+    final name = _stringMetadata(metadata['resolved_name']) ??
+        _stringMetadata(metadata['skill']);
+    if (name == null || name.isEmpty) {
+      return null;
+    }
+
+    final allowedTools = _stringListMetadata(metadata['allowed_tools']);
+    final disallowedTools = _stringListMetadata(metadata['disallowed_tools']);
+    final normalizedAllowedTools = allowedTools == null || allowedTools.isEmpty
+        ? <String>[]
+        : <String>{
+            ...allowedTools,
+            if (_runtime.toolExecutor.registry.lookup('skill') != null) 'skill',
+          }.where((tool) => tool.trim().isNotEmpty).toList()
+      ..sort();
+    final normalizedDisallowedTools = <String>{
+      ...?disallowedTools,
+    }
+        .where(
+          (tool) => tool.trim().isNotEmpty && tool != 'skill',
+        )
+        .toList()
+      ..sort();
+
+    return _ActiveSkillState(
+      name: name,
+      allowedTools: normalizedAllowedTools.isEmpty
+          ? null
+          : Set<String>.unmodifiable(normalizedAllowedTools.toSet()),
+      disallowedTools: normalizedDisallowedTools.isEmpty
+          ? null
+          : Set<String>.unmodifiable(normalizedDisallowedTools.toSet()),
+      modelOverride: _stringMetadata(metadata['model']),
+      effortOverride: _reasoningEffortMetadata(metadata['effort']),
+      runtimeScope:
+          _stringMetadata(metadata['runtime_scope']) ?? 'current_query',
+      cleanupBoundary:
+          _stringMetadata(metadata['cleanup_boundary']) ?? 'query_end',
+      activatedTurn: 0,
+    );
+  }
+
+  String? _buildSkillProtocolPrompt() {
+    if (_runtime.toolExecutor.registry.lookup('skill') == null) {
+      return null;
+    }
+
+    final skills = skillDefinitions;
+    if (skills.isEmpty) {
+      return null;
+    }
+
+    final buffer = StringBuffer()
+      ..writeln(
+          'You may use the skill tool when a specialized workflow matches the user request.')
+      ..writeln(
+        'If one of the listed skills is clearly relevant, call the skill tool before continuing the task.',
+      )
+      ..writeln('Available skills:');
+
+    for (final skill in skills) {
+      buffer.write('- ${skill.name}: ${skill.description}');
+      if (skill.whenToUse != null && skill.whenToUse!.trim().isNotEmpty) {
+        buffer.write(' Trigger when: ${skill.whenToUse!.trim()}');
+      }
+      if (skill.argumentHint != null && skill.argumentHint!.trim().isNotEmpty) {
+        buffer.write(' Args: ${skill.argumentHint!.trim()}');
+      }
+      if (skill.effort != null) {
+        buffer.write(' Effort: ${skill.effort!.name}');
+      }
+      buffer.writeln();
+    }
+
+    return buffer.toString().trimRight();
+  }
+
+  String? _buildAgentProtocolPrompt() {
+    if (_runtime.toolExecutor.registry.lookup('agent') == null) {
+      return null;
+    }
+
+    final definitions = agentDefinitions;
+    if (definitions.isEmpty) {
+      return null;
+    }
+
+    final buffer = StringBuffer()
+      ..writeln(
+          'You may use the agent tool to delegate a focused subtask to a named subagent.')
+      ..writeln(
+        'Only delegate when one of the listed agents is clearly a good fit for the task.',
+      )
+      ..writeln('Available agents:');
+
+    for (final agent in definitions) {
+      buffer.write('- ${agent.name}: ${agent.description}');
+      final model = agent.model?.trim();
+      if (model != null && model.isNotEmpty) {
+        buffer.write(' Model: $model');
+      }
+      if (agent.effort != null) {
+        buffer.write(' Effort: ${agent.effort!.name}');
+      }
+      final allowedTools = agent.allowedTools;
+      if (allowedTools != null && allowedTools.isNotEmpty) {
+        buffer.write(' Tools: ${allowedTools.join(', ')}');
+      }
+      buffer.writeln();
+    }
+
+    return buffer.toString().trimRight();
+  }
+
   Future<_ProviderTurnResult> _runProviderTurn({
     required QueryRequest request,
     required int turn,
   }) async {
     final deltas = <String>[];
+    final observabilityEvents = <_ProviderObservabilityEvent>[];
     final outputBuffer = StringBuffer();
     var toolCalls = const <QueryToolCall>[];
     RuntimeError? terminalError;
     String? terminalOutput;
     String? modelUsed = request.model;
     String? providerStateToken;
+    QueryUsage? usage;
+    double? costUsd;
 
     await for (final event in _engine.runStream(request)) {
       if (_stopRequested) {
@@ -1066,13 +2156,28 @@ class ClartCodeAgent {
         case ProviderStreamEventType.done:
           terminalOutput = event.output ?? outputBuffer.toString();
           toolCalls = event.toolCalls;
+          usage = event.usage;
+          costUsd = event.costUsd;
           providerStateToken = event.providerStateToken;
           break;
         case ProviderStreamEventType.error:
           terminalError = event.error;
           terminalOutput = event.output ?? outputBuffer.toString();
           toolCalls = event.toolCalls;
+          usage = event.usage;
+          costUsd = event.costUsd;
           providerStateToken = event.providerStateToken;
+          break;
+        case ProviderStreamEventType.streamEvent:
+        case ProviderStreamEventType.rateLimit:
+          observabilityEvents.add(
+            _ProviderObservabilityEvent(
+              type: event.type,
+              model: event.model,
+              event: event.event,
+              rateLimitInfo: event.rateLimitInfo,
+            ),
+          );
           break;
       }
     }
@@ -1086,7 +2191,10 @@ class ClartCodeAgent {
       modelUsed: modelUsed,
       error: terminalError,
       toolCalls: toolCalls,
+      usage: usage,
+      costUsd: costUsd,
       providerStateToken: providerStateToken,
+      observabilityEvents: observabilityEvents,
     );
   }
 
@@ -1272,6 +2380,59 @@ class ClartCodeAgent {
     return normalized.isEmpty ? '[empty-output]' : normalized;
   }
 
+  void _maybeEmitStatusMessage(
+    StreamController<ClartCodeSdkMessage> controller, {
+    required bool enabled,
+    required String status,
+    required String? model,
+    required int turn,
+  }) {
+    if (!enabled) {
+      return;
+    }
+    _emitToController(
+      controller,
+      ClartCodeSdkMessage.systemStatus(
+        sessionId: _sessionId,
+        status: status,
+        model: model,
+        turn: turn,
+      ),
+    );
+  }
+
+  bool _providerStateTokenChanged({
+    required String? previous,
+    required String? next,
+  }) {
+    final normalizedNext = next?.trim();
+    if (normalizedNext == null || normalizedNext.isEmpty) {
+      return false;
+    }
+    final normalizedPrevious = previous?.trim();
+    return normalizedPrevious != normalizedNext;
+  }
+
+  Map<String, Object?> _buildCompactBoundaryMetadata({
+    required int turn,
+    required List<ClartCodeToolCall> toolCalls,
+    required String? previousProviderStateToken,
+    required String? nextProviderStateToken,
+  }) {
+    return {
+      'reason': 'provider_state_token',
+      'scope': 'provider_managed_context',
+      'next_turn': turn + 1,
+      'tool_call_count': toolCalls.length,
+      if (previousProviderStateToken != null &&
+          previousProviderStateToken.trim().isNotEmpty)
+        'previous_provider_state_token': previousProviderStateToken,
+      if (nextProviderStateToken != null &&
+          nextProviderStateToken.trim().isNotEmpty)
+        'provider_state_token': nextProviderStateToken,
+    };
+  }
+
   ClartCodeToolContext _toolContext({
     required int turn,
     required String? model,
@@ -1282,6 +2443,530 @@ class ClartCodeAgent {
       provider: _config.provider,
       turn: turn,
       model: model,
+      parentSessionId: _parentSessionId,
+    );
+  }
+
+  ClartCodeSkillContext _buildSkillToolContext() {
+    return ClartCodeSkillContext(
+      cwd: _cwd,
+      sessionId: _sessionId,
+      provider: _config.provider,
+      model: _activeModel ?? _config.model,
+      effort: _activeEffort ?? _options.effort,
+      turn: _activeSkillToolTurn,
+    );
+  }
+
+  String? _skillRuntimeModel({
+    required String? currentModel,
+    required _ActiveSkillState activeSkill,
+  }) {
+    final override = activeSkill.modelOverride?.trim();
+    if (override == null || override.isEmpty) {
+      return currentModel;
+    }
+    return override;
+  }
+
+  ClartCodeReasoningEffort? _skillRuntimeEffort({
+    required ClartCodeReasoningEffort? currentEffort,
+    required _ActiveSkillState activeSkill,
+  }) {
+    return activeSkill.effortOverride ?? currentEffort;
+  }
+
+  Future<void> _emitSkillActivationHook({
+    required String prompt,
+    required _ActiveSkillState activeSkill,
+    required String? model,
+    required ClartCodeReasoningEffort? effort,
+  }) async {
+    await _options.hooks.onSkillActivation?.call(
+      ClartCodeSkillActivationEvent(
+        sessionId: _sessionId,
+        cwd: _cwd,
+        provider: _config.provider,
+        prompt: prompt,
+        turn: activeSkill.activatedTurn,
+        name: activeSkill.name,
+        runtimeScope: activeSkill.runtimeScope,
+        cleanupBoundary: activeSkill.cleanupBoundary,
+        model: model,
+        effort: effort,
+        allowedTools: activeSkill.allowedTools?.toList(growable: false),
+        disallowedTools: activeSkill.disallowedTools?.toList(growable: false),
+        parentSessionId: _parentSessionId,
+      ),
+    );
+  }
+
+  Future<void> _emitSkillEndHook({
+    required String prompt,
+    required _ActiveSkillState activeSkill,
+    required String? model,
+    required ClartCodeReasoningEffort? effort,
+    required int endedTurn,
+    required String reason,
+  }) async {
+    await _options.hooks.onSkillEnd?.call(
+      ClartCodeSkillEndEvent(
+        sessionId: _sessionId,
+        cwd: _cwd,
+        provider: _config.provider,
+        prompt: prompt,
+        name: activeSkill.name,
+        activatedTurn: activeSkill.activatedTurn,
+        endedTurn: endedTurn,
+        reason: reason,
+        runtimeScope: activeSkill.runtimeScope,
+        cleanupBoundary: activeSkill.cleanupBoundary,
+        model: model,
+        effort: effort,
+        allowedTools: activeSkill.allowedTools?.toList(growable: false),
+        disallowedTools: activeSkill.disallowedTools?.toList(growable: false),
+        parentSessionId: _parentSessionId,
+      ),
+    );
+  }
+
+  bool _shouldEmitSkillTerminalMessage(String reason) {
+    // Keep normal inline-skill lifecycle (`query_end` / `replaced_by_skill`)
+    // on hooks only. The query stream only gets a minimal synthetic
+    // `skill/end` when an active skill is being torn down by an abnormal
+    // terminal path, so the public stream surface stays close to the TS SDK.
+    return reason == 'cancelled' ||
+        reason == 'error' ||
+        reason == 'max_turns_reached';
+  }
+
+  ClartCodeSdkMessage _buildSkillTerminalMessage({
+    required _ActiveSkillState activeSkill,
+    required String reason,
+    required int endedTurn,
+    required String? model,
+    RuntimeError? error,
+    String? text,
+    int? durationMs,
+  }) {
+    return ClartCodeSdkMessage.skill(
+      sessionId: _sessionId,
+      subtype: 'end',
+      terminalSubtype: reason,
+      skillName: activeSkill.name,
+      text: text,
+      model: model,
+      turn: endedTurn,
+      isError: true,
+      error: error,
+      durationMs: durationMs,
+    );
+  }
+
+  String _resolveAgentPath(String path) {
+    if (_isAbsolutePath(path)) {
+      return path;
+    }
+    return '$_cwd/$path';
+  }
+
+  bool _isAbsolutePath(String path) {
+    if (path.startsWith(Platform.pathSeparator)) {
+      return true;
+    }
+    return RegExp(r'^[a-zA-Z]:[\\/]').hasMatch(path);
+  }
+
+  String? _stringMetadata(Object? value) {
+    if (value is! String) {
+      return null;
+    }
+    final normalized = value.trim();
+    return normalized.isEmpty ? null : normalized;
+  }
+
+  List<String>? _stringListMetadata(Object? value) {
+    if (value is! List) {
+      return null;
+    }
+    final normalized = value
+        .whereType<String>()
+        .map((item) => item.trim())
+        .where((item) => item.isNotEmpty)
+        .toSet()
+        .toList()
+      ..sort();
+    return normalized;
+  }
+
+  ClartCodeReasoningEffort? _reasoningEffortMetadata(Object? value) {
+    return parseClartCodeReasoningEffort(value);
+  }
+
+  ClartCodeAgentDefinition? _lookupNamedAgentDefinition(String name) {
+    final normalized = name.trim();
+    if (normalized.isEmpty) {
+      return null;
+    }
+    for (final definition in agentDefinitions) {
+      if (definition.name == normalized) {
+        return definition;
+      }
+    }
+    return null;
+  }
+
+  Future<SkillForkExecutionResult> _runForkedSkill(
+    ClartCodeSkillDefinition skill,
+    String args,
+    String promptText,
+    ClartCodeSkillContext context, {
+    ClartCodeAgentDefinition? agentDefinition,
+  }) async {
+    final allowedTools = skill.allowedTools.isEmpty
+        ? agentDefinition?.allowedTools
+        : skill.allowedTools;
+    final disallowedTools = _mergeToolNames(
+      agentDefinition?.disallowedTools,
+      skill.disallowedTools,
+    );
+    final result = await runSubagent(
+      promptText,
+      options: ClartCodeSubagentOptions(
+        name: skill.name,
+        model: skill.model ??
+            agentDefinition?.model ??
+            context.model ??
+            _config.model,
+        effort: skill.effort ?? agentDefinition?.effort ?? context.effort,
+        allowedTools: allowedTools,
+        disallowedTools: disallowedTools,
+        promptPrefix: agentDefinition?.prompt,
+        inheritMcp: agentDefinition?.inheritMcp ?? true,
+        inheritSkills: false,
+        inheritHooks: false,
+        cascadeAssistantDeltas: skill.cascadeAssistantDeltas ||
+            (agentDefinition?.cascadeAssistantDeltas ?? false),
+      ),
+    );
+    return SkillForkExecutionResult(
+      output: result.text,
+      turns: result.turns,
+      isError: result.isError,
+      cascadedMessages: result.cascadedMessages,
+      name: result.name,
+      model: result.model,
+      sessionId: result.sessionId,
+      parentSessionId: result.parentSessionId,
+      errorCode: result.error?.code.name,
+      errorMessage: result.error?.message,
+    );
+  }
+
+  List<String>? _mergeToolNames(List<String>? base, List<String>? extra) {
+    final merged = [
+      ...?base,
+      ...?extra,
+    ];
+    if (merged.isEmpty) {
+      return null;
+    }
+    return _normalizeToolNames(merged);
+  }
+
+  List<TranscriptMessage> _buildSubagentTranscriptMessages({
+    required String sessionId,
+    required String parentSessionId,
+    required String prompt,
+    required String text,
+    required int turns,
+    required bool isError,
+    required String? name,
+    required String? model,
+    RuntimeError? error,
+  }) {
+    final label = name == null ? 'Subagent' : 'Subagent "$name"';
+    final lines = <String>[
+      '$label ${isError ? 'failed' : 'completed'}.',
+      'session_id: $sessionId',
+      'turns: $turns',
+      if (model != null && model.trim().isNotEmpty) 'model: $model',
+      'prompt:',
+      prompt,
+      'output:',
+      text,
+    ];
+    if (error != null) {
+      lines.insert(
+        3,
+        'error: ${error.code.name}${error.message.trim().isEmpty ? '' : ' - ${error.message}'}',
+      );
+    }
+    return [
+      TranscriptMessage.subagent(
+        lines.join('\n'),
+        sessionId: sessionId,
+        parentSessionId: parentSessionId,
+        name: name,
+      ),
+    ];
+  }
+
+  List<ClartCodeSdkMessage> _buildSubagentCascadedMessages({
+    required String sessionId,
+    required String parentSessionId,
+    required String prompt,
+    required String? name,
+    required String? model,
+    required List<ClartCodeSdkMessage> messages,
+    required bool includeAssistantDeltas,
+  }) {
+    final cascaded = <ClartCodeSdkMessage>[
+      _buildSubagentCascadedStartMessage(
+        sessionId: sessionId,
+        parentSessionId: parentSessionId,
+        prompt: prompt,
+        name: name,
+        model: model,
+      ),
+    ];
+    for (final message in messages) {
+      final cascadedMessage = _cascadeSubagentMessage(
+        parentSessionId: parentSessionId,
+        name: name,
+        message: message,
+        includeAssistantDeltas: includeAssistantDeltas,
+      );
+      if (cascadedMessage == null) {
+        continue;
+      }
+      cascaded.add(cascadedMessage);
+    }
+    return cascaded;
+  }
+
+  void _emitToController(
+    StreamController<ClartCodeSdkMessage>? controller,
+    ClartCodeSdkMessage message,
+  ) {
+    if (controller == null || controller.isClosed) {
+      return;
+    }
+    controller.add(message);
+  }
+
+  void _maybeEmitLiveSubagentMessage(ClartCodeSdkMessage? message) {
+    if (message == null) {
+      return;
+    }
+    _emitToController(_activeQueryMessageController, message);
+  }
+
+  ClartCodeSdkMessage _buildSubagentCascadedStartMessage({
+    required String sessionId,
+    required String parentSessionId,
+    required String prompt,
+    required String? name,
+    required String? model,
+  }) {
+    return ClartCodeSdkMessage.subagent(
+      sessionId: sessionId,
+      parentSessionId: parentSessionId,
+      subtype: 'start',
+      text: prompt,
+      model: model,
+      subagentName: name,
+    );
+  }
+
+  ClartCodeSdkMessage _buildSubagentCascadedEndMessage({
+    required String parentSessionId,
+    required String? name,
+    required ClartCodeSdkMessage terminalMessage,
+  }) {
+    return ClartCodeSdkMessage.subagent(
+      sessionId: terminalMessage.sessionId,
+      parentSessionId: parentSessionId,
+      subtype: 'end',
+      terminalSubtype: terminalMessage.subtype,
+      text: terminalMessage.text,
+      model: terminalMessage.model,
+      subagentName: name,
+      turns: terminalMessage.turns,
+      isError: terminalMessage.isError,
+      error: terminalMessage.error,
+      durationMs: terminalMessage.durationMs,
+    );
+  }
+
+  ClartCodeSdkMessage? _cascadeSubagentMessage({
+    required String parentSessionId,
+    required String? name,
+    required ClartCodeSdkMessage message,
+    required bool includeAssistantDeltas,
+  }) {
+    if (message.type == 'assistant_delta' && !includeAssistantDeltas) {
+      return null;
+    }
+    if (message.type == 'result') {
+      return _buildSubagentCascadedEndMessage(
+        parentSessionId: parentSessionId,
+        name: name,
+        terminalMessage: message,
+      );
+    }
+    return ClartCodeSdkMessage(
+      type: message.type,
+      sessionId: message.sessionId,
+      subtype: message.subtype,
+      text: message.text,
+      delta: message.delta,
+      model: message.model,
+      turn: message.turn,
+      turns: message.turns,
+      isError: message.isError,
+      error: message.error,
+      cwd: message.cwd,
+      tools: message.tools,
+      toolDefinitions: message.toolDefinitions,
+      toolCall: message.toolCall,
+      toolResult: message.toolResult,
+      durationMs: message.durationMs,
+      parentSessionId: parentSessionId,
+      subagentName: name,
+    );
+  }
+
+  List<ClartCodeAgentDefinition> _normalizedAgentDefinitions() {
+    final rawDefinitions = _options.agents?.agents ?? const [];
+    if (rawDefinitions.isEmpty) {
+      return const [];
+    }
+
+    final byName = <String, ClartCodeAgentDefinition>{};
+    for (final definition in rawDefinitions) {
+      final name = definition.name.trim();
+      if (name.isEmpty) {
+        throw ArgumentError('agent definition name cannot be empty');
+      }
+      if (byName.containsKey(name)) {
+        throw ArgumentError('duplicate agent definition name: $name');
+      }
+      if (definition.description.trim().isEmpty) {
+        throw ArgumentError('agent "$name" description cannot be empty');
+      }
+      if (definition.prompt.trim().isEmpty) {
+        throw ArgumentError('agent "$name" prompt cannot be empty');
+      }
+      byName[name] = ClartCodeAgentDefinition(
+        name: name,
+        description: definition.description.trim(),
+        prompt: definition.prompt.trim(),
+        allowedTools: definition.allowedTools == null
+            ? null
+            : _normalizeToolNames(definition.allowedTools!),
+        disallowedTools: _normalizeToolNames(definition.disallowedTools),
+        model: _stringMetadata(definition.model),
+        effort: definition.effort,
+        inheritMcp: definition.inheritMcp,
+        cascadeAssistantDeltas: definition.cascadeAssistantDeltas,
+      );
+    }
+
+    return byName.values.toList(growable: false);
+  }
+
+  List<String> _normalizeToolNames(List<String> tools) {
+    final normalized = tools
+        .map((tool) => tool.trim())
+        .where((tool) => tool.isNotEmpty)
+        .toSet()
+        .toList()
+      ..sort();
+    return List<String>.unmodifiable(normalized);
+  }
+
+  Future<AgentExecutionResult> _runNamedAgent(
+    ClartCodeAgentDefinition definition,
+    String prompt, {
+    String? model,
+  }) async {
+    final result = await runSubagent(
+      prompt,
+      options: ClartCodeSubagentOptions(
+        name: definition.name,
+        model: model ?? definition.model ?? _config.model,
+        effort: definition.effort ?? _options.effort,
+        allowedTools: definition.allowedTools,
+        disallowedTools: definition.disallowedTools,
+        promptPrefix: definition.prompt,
+        inheritMcp: definition.inheritMcp,
+        inheritAgents: false,
+        inheritSkills: false,
+        inheritHooks: false,
+        cascadeAssistantDeltas: definition.cascadeAssistantDeltas,
+      ),
+    );
+    return AgentExecutionResult(
+      output: result.text,
+      turns: result.turns,
+      isError: result.isError,
+      cascadedMessages: result.cascadedMessages,
+      name: result.name,
+      model: result.model,
+      sessionId: result.sessionId,
+      parentSessionId: result.parentSessionId,
+      errorCode: result.error?.code.name,
+      errorMessage: result.error?.message,
+    );
+  }
+
+  ClartCodeAgentOptions _buildChildAgentOptions({
+    String? model,
+    ClartCodeReasoningEffort? effort,
+    List<String>? allowedTools,
+    List<String>? disallowedTools,
+    required bool inheritMcp,
+    required bool inheritAgents,
+    required bool inheritSkills,
+    required bool inheritHooks,
+  }) {
+    return ClartCodeAgentOptions(
+      provider: _options.provider,
+      model: model ?? _config.model,
+      effort: effort ?? _options.effort,
+      claudeApiKey: _options.claudeApiKey,
+      claudeBaseUrl: _options.claudeBaseUrl,
+      openAiApiKey: _options.openAiApiKey,
+      openAiBaseUrl: _options.openAiBaseUrl,
+      cwd: _cwd,
+      persistSession: false,
+      providerOverride: _options.providerOverride,
+      toolExecutor: _options.toolExecutor,
+      tools: _options.tools,
+      allowedTools: allowedTools ?? _options.allowedTools,
+      disallowedTools: disallowedTools ?? _options.disallowedTools,
+      permissionMode: _options.permissionMode,
+      maxTurns: _options.maxTurns,
+      systemPrompt: _options.systemPrompt,
+      appendSystemPrompt: _options.appendSystemPrompt,
+      maxTokens: _options.maxTokens,
+      maxBudgetUsd: _options.maxBudgetUsd,
+      thinking: _options.thinking,
+      jsonSchema: _options.jsonSchema,
+      outputFormat: _options.outputFormat,
+      includePartialMessages: _options.includePartialMessages,
+      includeObservabilityMessages: _options.includeObservabilityMessages,
+      permissionPolicy: _options.permissionPolicy,
+      telemetry: _options.telemetry,
+      securityGuard: _options.securityGuard,
+      canUseTool: _options.canUseTool,
+      resolveToolPermission: _options.resolveToolPermission,
+      hooks: inheritHooks ? _options.hooks : const ClartCodeAgentHooks(),
+      mcp: inheritMcp ? _options.mcp : null,
+      agents: inheritAgents ? _options.agents : null,
+      skills: inheritSkills ? _options.skills : null,
+      mcpManagerOverride: _options.mcpManagerOverride,
     );
   }
 
@@ -1313,6 +2998,9 @@ class ClartCodeAgent {
     required int turns,
     required String subtype,
     required RuntimeError error,
+    QueryUsage? usage,
+    double? costUsd,
+    List<QueryModelUsage>? modelUsage,
     String? terminalOutput,
   }) async {
     final output = _normalizeFailureOutput(error, terminalOutput);
@@ -1330,6 +3018,11 @@ class ClartCodeAgent {
       model: modelUsed,
       error: error,
       durationMs: watch.elapsedMilliseconds,
+      usage: usage,
+      costUsd: costUsd,
+      modelUsage: modelUsage == null
+          ? null
+          : List<QueryModelUsage>.unmodifiable(modelUsage),
     );
     if (error.code == RuntimeErrorCode.cancelled) {
       await _options.hooks.onCancelledTerminal?.call(
@@ -1341,6 +3034,7 @@ class ClartCodeAgent {
           model: modelUsed,
           result: result,
           reason: _stopReason ?? 'request cancelled',
+          parentSessionId: _parentSessionId,
         ),
       );
     }
@@ -1352,6 +3046,7 @@ class ClartCodeAgent {
         prompt: prompt,
         model: modelUsed,
         result: result,
+        parentSessionId: _parentSessionId,
       ),
     );
     return ClartCodeSdkMessage.result(
@@ -1363,6 +3058,9 @@ class ClartCodeAgent {
       turns: turns,
       error: error,
       durationMs: watch.elapsedMilliseconds,
+      usage: usage,
+      costUsd: costUsd,
+      modelUsage: modelUsage,
     );
   }
 }
@@ -1379,7 +3077,10 @@ class _ProviderTurnResult {
     required this.toolCalls,
     this.modelUsed,
     this.error,
+    this.usage,
+    this.costUsd,
     this.providerStateToken,
+    this.observabilityEvents = const [],
   });
 
   final int turn;
@@ -1389,18 +3090,81 @@ class _ProviderTurnResult {
   final List<QueryToolCall> toolCalls;
   final String? modelUsed;
   final RuntimeError? error;
+  final QueryUsage? usage;
+  final double? costUsd;
   final String? providerStateToken;
+  final List<_ProviderObservabilityEvent> observabilityEvents;
+}
+
+class _ProviderObservabilityEvent {
+  const _ProviderObservabilityEvent({
+    required this.type,
+    this.model,
+    this.event,
+    this.rateLimitInfo,
+  });
+
+  final ProviderStreamEventType type;
+  final String? model;
+  final Map<String, Object?>? event;
+  final QueryRateLimitInfo? rateLimitInfo;
+}
+
+class _ActiveSkillState {
+  const _ActiveSkillState({
+    required this.name,
+    required this.runtimeScope,
+    required this.cleanupBoundary,
+    required this.activatedTurn,
+    this.allowedTools,
+    this.disallowedTools,
+    this.modelOverride,
+    this.effortOverride,
+  });
+
+  final String name;
+  final String runtimeScope;
+  final String cleanupBoundary;
+  final int activatedTurn;
+  final Set<String>? allowedTools;
+  final Set<String>? disallowedTools;
+  final String? modelOverride;
+  final ClartCodeReasoningEffort? effortOverride;
+
+  _ActiveSkillState copyWith({
+    String? name,
+    String? runtimeScope,
+    String? cleanupBoundary,
+    int? activatedTurn,
+    Set<String>? allowedTools,
+    Set<String>? disallowedTools,
+    String? modelOverride,
+    ClartCodeReasoningEffort? effortOverride,
+  }) {
+    return _ActiveSkillState(
+      name: name ?? this.name,
+      runtimeScope: runtimeScope ?? this.runtimeScope,
+      cleanupBoundary: cleanupBoundary ?? this.cleanupBoundary,
+      activatedTurn: activatedTurn ?? this.activatedTurn,
+      allowedTools: allowedTools ?? this.allowedTools,
+      disallowedTools: disallowedTools ?? this.disallowedTools,
+      modelOverride: modelOverride ?? this.modelOverride,
+      effortOverride: effortOverride ?? this.effortOverride,
+    );
+  }
 }
 
 class _QueuedAgentRun {
   _QueuedAgentRun({
     required this.prompt,
     required this.model,
+    required this.request,
     required this.cancellationSignal,
   });
 
   final String prompt;
   final String? model;
+  final ClartCodeRequestOptions request;
   final QueryCancellationSignal? cancellationSignal;
   final StreamController<ClartCodeSdkMessage> controller =
       StreamController<ClartCodeSdkMessage>();

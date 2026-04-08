@@ -203,6 +203,9 @@ class TurnExecutor {
             );
             complete(result);
             break;
+          case ProviderStreamEventType.streamEvent:
+          case ProviderStreamEventType.rateLimit:
+            break;
           case ProviderStreamEventType.error:
             final result = buildError(
               error: event.error ??

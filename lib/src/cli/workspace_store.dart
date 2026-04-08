@@ -357,12 +357,7 @@ class WorkspaceSessionSnapshot {
                 'text': message.text,
               })
           .toList(),
-      'transcript': transcript
-          .map((message) => {
-                'kind': message.kind.name,
-                'text': message.text,
-              })
-          .toList(),
+      'transcript': transcript.map((message) => message.toJson()).toList(),
     };
   }
 
@@ -581,24 +576,7 @@ MessageRole? _parseMessageRole(String? raw) {
 }
 
 TranscriptMessage _transcriptMessageFromJson(Map<String, Object?> json) {
-  final text = json['text'] as String? ?? '';
-  switch (json['kind'] as String?) {
-    case 'userPrompt':
-      return TranscriptMessage.userPrompt(text);
-    case 'localCommand':
-      return TranscriptMessage.localCommand(text);
-    case 'localCommandStdout':
-      return TranscriptMessage.localCommandStdout(text);
-    case 'localCommandStderr':
-      return TranscriptMessage.localCommandStderr(text);
-    case 'assistant':
-      return TranscriptMessage.assistant(text);
-    case 'toolResult':
-      return TranscriptMessage.toolResult(text);
-    case 'system':
-    default:
-      return TranscriptMessage.system(text);
-  }
+  return TranscriptMessage.fromJson(json);
 }
 
 String _buildWorkspaceSessionTitle(

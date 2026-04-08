@@ -3,6 +3,17 @@ import 'dart:convert';
 
 import 'tool_models.dart';
 
+List<Tool> builtinBaseTools({String? cwd}) {
+  return [
+    ReadTool(cwd: cwd),
+    WriteTool(cwd: cwd),
+    EditTool(cwd: cwd),
+    GlobTool(cwd: cwd),
+    GrepTool(cwd: cwd),
+    ShellTool(cwd: cwd),
+  ];
+}
+
 class ReadTool implements Tool {
   const ReadTool({this.cwd});
 
@@ -37,27 +48,54 @@ class ReadTool implements Tool {
 
   @override
   Future<ToolExecutionResult> run(ToolInvocation invocation) async {
-    final path = invocation.input['path'] as String?;
-    if (path == null || path.trim().isEmpty) {
+    try {
+      final path = _requiredTrimmedStringInput(
+        invocation.input,
+        'path',
+        tool: name,
+      );
+      final resolvedPath = _resolvePath(path, cwd: cwd);
+      final entityType = FileSystemEntity.typeSync(resolvedPath);
+      if (entityType == FileSystemEntityType.notFound) {
+        return ToolExecutionResult.failure(
+          tool: name,
+          errorCode: 'file_not_found',
+          errorMessage: 'file not found: $resolvedPath',
+          metadata: {
+            'path': resolvedPath,
+            if (cwd != null) 'cwd': cwd,
+          },
+        );
+      }
+      if (entityType != FileSystemEntityType.file) {
+        return ToolExecutionResult.failure(
+          tool: name,
+          errorCode: 'path_is_directory',
+          errorMessage: 'read tool requires a file path: $resolvedPath',
+          metadata: {
+            'path': resolvedPath,
+            if (cwd != null) 'cwd': cwd,
+          },
+        );
+      }
+
+      final file = File(resolvedPath);
+      final content = await file.readAsString();
+      return ToolExecutionResult(
+        tool: name,
+        ok: true,
+        output: content,
+        metadata: {
+          'path': file.path,
+          if (cwd != null) 'cwd': cwd,
+        },
+      );
+    } on FormatException catch (error) {
       return ToolExecutionResult.failure(
         tool: name,
         errorCode: 'invalid_input',
-        errorMessage: 'read tool requires non-empty "path"',
+        errorMessage: error.message,
       );
-    }
-
-    final file = File(_resolvePath(path, cwd: cwd));
-    if (!file.existsSync()) {
-      return ToolExecutionResult.failure(
-        tool: name,
-        errorCode: 'file_not_found',
-        errorMessage: 'file not found: ${file.path}',
-      );
-    }
-
-    try {
-      final content = await file.readAsString();
-      return ToolExecutionResult.success(tool: name, output: content);
     } catch (error) {
       return ToolExecutionResult.failure(
         tool: name,
@@ -106,31 +144,50 @@ class WriteTool implements Tool {
 
   @override
   Future<ToolExecutionResult> run(ToolInvocation invocation) async {
-    final path = invocation.input['path'] as String?;
-    final content = invocation.input['content'] as String?;
-
-    if (path == null || path.trim().isEmpty) {
-      return ToolExecutionResult.failure(
-        tool: name,
-        errorCode: 'invalid_input',
-        errorMessage: 'write tool requires non-empty "path"',
-      );
-    }
-
-    if (content == null) {
-      return ToolExecutionResult.failure(
-        tool: name,
-        errorCode: 'invalid_input',
-        errorMessage: 'write tool requires "content"',
-      );
-    }
-
     try {
-      final file = File(_resolvePath(path, cwd: cwd));
+      final path = _requiredTrimmedStringInput(
+        invocation.input,
+        'path',
+        tool: name,
+      );
+      final content = _requiredStringInput(
+        invocation.input,
+        'content',
+        tool: name,
+      );
+      final resolvedPath = _resolvePath(path, cwd: cwd);
+      final entityType = FileSystemEntity.typeSync(resolvedPath);
+      if (entityType == FileSystemEntityType.directory) {
+        return ToolExecutionResult.failure(
+          tool: name,
+          errorCode: 'path_is_directory',
+          errorMessage: 'write tool requires a file path: $resolvedPath',
+          metadata: {
+            'path': resolvedPath,
+            if (cwd != null) 'cwd': cwd,
+          },
+        );
+      }
+
+      final file = File(resolvedPath);
       await file.parent.create(recursive: true);
       await file.writeAsString(content);
-      return ToolExecutionResult.success(
-          tool: name, output: 'WROTE ${file.path}');
+      return ToolExecutionResult(
+        tool: name,
+        ok: true,
+        output: 'WROTE ${file.path}',
+        metadata: {
+          'path': file.path,
+          'bytes': utf8.encode(content).length,
+          if (cwd != null) 'cwd': cwd,
+        },
+      );
+    } on FormatException catch (error) {
+      return ToolExecutionResult.failure(
+        tool: name,
+        errorCode: 'invalid_input',
+        errorMessage: error.message,
+      );
     } catch (error) {
       return ToolExecutionResult.failure(
         tool: name,
@@ -193,29 +250,46 @@ class ShellTool implements Tool {
   @override
   Future<ToolExecutionResult> run(ToolInvocation invocation) async {
     try {
-      final command = (invocation.input['command'] as String?)?.trim() ?? '';
-      if (command.isEmpty) {
+      final command = _requiredTrimmedStringInput(
+        invocation.input,
+        'command',
+        tool: name,
+      );
+      final requestedCwd = _optionalTrimmedStringInput(
+        invocation.input,
+        'cwd',
+        tool: name,
+      );
+      final workingDirectory = _resolveWorkingDirectory(
+            requestedCwd,
+            cwd: cwd,
+          ) ??
+          Directory.current.path;
+      final timeoutMs = _optionalPositiveIntInput(
+            invocation.input,
+            'timeoutMs',
+            tool: name,
+          ) ??
+          defaultTimeout.inMilliseconds;
+      final workingDirectoryType = FileSystemEntity.typeSync(workingDirectory);
+      if (workingDirectoryType == FileSystemEntityType.notFound) {
         return ToolExecutionResult.failure(
           tool: name,
-          errorCode: 'invalid_input',
-          errorMessage: 'shell tool requires non-empty "command"',
+          errorCode: 'path_not_found',
+          errorMessage: 'shell cwd not found: $workingDirectory',
+          metadata: {
+            'cwd': workingDirectory,
+          },
         );
       }
-
-      final requestedCwd = (invocation.input['cwd'] as String?)?.trim();
-      final workingDirectory = _resolveWorkingDirectory(
-        requestedCwd,
-        cwd: cwd,
-      );
-      final rawTimeoutMs = invocation.input['timeoutMs'];
-      final timeoutMs = rawTimeoutMs == null
-          ? defaultTimeout.inMilliseconds
-          : (rawTimeoutMs as num?)?.toInt();
-      if (timeoutMs == null || timeoutMs < 1) {
+      if (workingDirectoryType != FileSystemEntityType.directory) {
         return ToolExecutionResult.failure(
           tool: name,
-          errorCode: 'invalid_input',
-          errorMessage: 'shell tool "timeoutMs" must be a positive integer',
+          errorCode: 'path_not_directory',
+          errorMessage: 'shell cwd must be a directory: $workingDirectory',
+          metadata: {
+            'cwd': workingDirectory,
+          },
         );
       }
 
@@ -346,48 +420,64 @@ class EditTool implements Tool {
 
   @override
   Future<ToolExecutionResult> run(ToolInvocation invocation) async {
-    final path = (invocation.input['path'] as String?)?.trim() ?? '';
-    final oldText = invocation.input['oldText'] as String?;
-    final newText = invocation.input['newText'] as String?;
-    final replaceAll = invocation.input['replaceAll'] as bool? ?? false;
-    if (path.isEmpty) {
-      return ToolExecutionResult.failure(
-        tool: name,
-        errorCode: 'invalid_input',
-        errorMessage: 'edit tool requires non-empty "path"',
-      );
-    }
-    if (oldText == null || oldText.isEmpty) {
-      return ToolExecutionResult.failure(
-        tool: name,
-        errorCode: 'invalid_input',
-        errorMessage: 'edit tool requires non-empty "oldText"',
-      );
-    }
-    if (newText == null) {
-      return ToolExecutionResult.failure(
-        tool: name,
-        errorCode: 'invalid_input',
-        errorMessage: 'edit tool requires "newText"',
-      );
-    }
-
-    final file = File(_resolvePath(path, cwd: cwd));
-    if (!file.existsSync()) {
-      return ToolExecutionResult.failure(
-        tool: name,
-        errorCode: 'file_not_found',
-        errorMessage: 'file not found: ${file.path}',
-      );
-    }
-
     try {
+      final path = _requiredTrimmedStringInput(
+        invocation.input,
+        'path',
+        tool: name,
+      );
+      final oldText = _requiredTrimmedStringInput(
+        invocation.input,
+        'oldText',
+        tool: name,
+      );
+      final newText = _requiredStringInput(
+        invocation.input,
+        'newText',
+        tool: name,
+      );
+      final replaceAll = _optionalBoolInput(
+            invocation.input,
+            'replaceAll',
+            tool: name,
+          ) ??
+          false;
+      final resolvedPath = _resolvePath(path, cwd: cwd);
+      final entityType = FileSystemEntity.typeSync(resolvedPath);
+      if (entityType == FileSystemEntityType.notFound) {
+        return ToolExecutionResult.failure(
+          tool: name,
+          errorCode: 'file_not_found',
+          errorMessage: 'file not found: $resolvedPath',
+          metadata: {
+            'path': resolvedPath,
+            if (cwd != null) 'cwd': cwd,
+          },
+        );
+      }
+      if (entityType != FileSystemEntityType.file) {
+        return ToolExecutionResult.failure(
+          tool: name,
+          errorCode: 'path_is_directory',
+          errorMessage: 'edit tool requires a file path: $resolvedPath',
+          metadata: {
+            'path': resolvedPath,
+            if (cwd != null) 'cwd': cwd,
+          },
+        );
+      }
+
+      final file = File(resolvedPath);
       final original = await file.readAsString();
       if (!original.contains(oldText)) {
         return ToolExecutionResult.failure(
           tool: name,
           errorCode: 'text_not_found',
           errorMessage: 'oldText was not found in ${file.path}',
+          metadata: {
+            'path': file.path,
+            if (cwd != null) 'cwd': cwd,
+          },
         );
       }
       final replacements = _countOccurrences(original, oldText);
@@ -403,7 +493,14 @@ class EditTool implements Tool {
         metadata: {
           'path': file.path,
           'replacements': appliedCount,
+          if (cwd != null) 'cwd': cwd,
         },
+      );
+    } on FormatException catch (error) {
+      return ToolExecutionResult.failure(
+        tool: name,
+        errorCode: 'invalid_input',
+        errorMessage: error.message,
       );
     } catch (error) {
       return ToolExecutionResult.failure(
@@ -454,46 +551,72 @@ class GlobTool implements Tool {
 
   @override
   Future<ToolExecutionResult> run(ToolInvocation invocation) async {
-    final pattern = (invocation.input['pattern'] as String?)?.trim() ?? '';
-    if (pattern.isEmpty) {
+    try {
+      final pattern = _requiredTrimmedStringInput(
+        invocation.input,
+        'pattern',
+        tool: name,
+      );
+      final requestedCwd = _optionalTrimmedStringInput(
+        invocation.input,
+        'cwd',
+        tool: name,
+      );
+      final root = _resolveWorkingDirectory(requestedCwd, cwd: cwd) ??
+          Directory.current.path;
+      final entityType = FileSystemEntity.typeSync(root);
+      if (entityType == FileSystemEntityType.notFound) {
+        return ToolExecutionResult.failure(
+          tool: name,
+          errorCode: 'path_not_found',
+          errorMessage: 'glob root not found: $root',
+          metadata: {
+            'cwd': root,
+            'pattern': pattern,
+          },
+        );
+      }
+      if (entityType != FileSystemEntityType.directory) {
+        return ToolExecutionResult.failure(
+          tool: name,
+          errorCode: 'path_not_directory',
+          errorMessage: 'glob cwd must be a directory: $root',
+          metadata: {
+            'cwd': root,
+            'pattern': pattern,
+          },
+        );
+      }
+
+      final directory = Directory(root);
+      final matcher = _globToRegExp(pattern);
+      final matches = <String>[];
+      await for (final entity
+          in directory.list(recursive: true, followLinks: false)) {
+        final relativePath = _relativePath(entity.path, directory.path);
+        final normalized = _normalizeForMatch(relativePath);
+        if (matcher.hasMatch(normalized)) {
+          matches.add(relativePath);
+        }
+      }
+      matches.sort();
+      return ToolExecutionResult(
+        tool: name,
+        ok: true,
+        output: matches.join('\n'),
+        metadata: {
+          'count': matches.length,
+          'cwd': directory.path,
+          'pattern': pattern,
+        },
+      );
+    } on FormatException catch (error) {
       return ToolExecutionResult.failure(
         tool: name,
         errorCode: 'invalid_input',
-        errorMessage: 'glob tool requires non-empty "pattern"',
+        errorMessage: error.message,
       );
     }
-
-    final root = _resolveWorkingDirectory(
-          (invocation.input['cwd'] as String?)?.trim(),
-          cwd: cwd,
-        ) ??
-        Directory.current.path;
-    final directory = Directory(root);
-    if (!directory.existsSync()) {
-      return ToolExecutionResult.failure(
-        tool: name,
-        errorCode: 'path_not_found',
-        errorMessage: 'glob root not found: $root',
-      );
-    }
-
-    final matcher = _globToRegExp(pattern);
-    final matches = <String>[];
-    await for (final entity
-        in directory.list(recursive: true, followLinks: false)) {
-      final relativePath = _relativePath(entity.path, directory.path);
-      final normalized = _normalizeForMatch(relativePath);
-      if (matcher.hasMatch(normalized)) {
-        matches.add(relativePath);
-      }
-    }
-    matches.sort();
-    return ToolExecutionResult(
-      tool: name,
-      ok: true,
-      output: matches.join('\n'),
-      metadata: {'count': matches.length, 'cwd': directory.path},
-    );
   }
 }
 
@@ -546,75 +669,183 @@ class GrepTool implements Tool {
 
   @override
   Future<ToolExecutionResult> run(ToolInvocation invocation) async {
-    final pattern = (invocation.input['pattern'] as String?)?.trim() ?? '';
-    if (pattern.isEmpty) {
+    try {
+      final pattern = _requiredTrimmedStringInput(
+        invocation.input,
+        'pattern',
+        tool: name,
+      );
+      final searchPath = _optionalTrimmedStringInput(
+            invocation.input,
+            'path',
+            tool: name,
+          ) ??
+          '.';
+      final resolvedPath = _resolvePath(searchPath, cwd: cwd);
+      final regexEnabled = _optionalBoolInput(
+            invocation.input,
+            'regex',
+            tool: name,
+          ) ??
+          false;
+      final caseSensitive = _optionalBoolInput(
+            invocation.input,
+            'caseSensitive',
+            tool: name,
+          ) ??
+          true;
+      final entityType = FileSystemEntity.typeSync(resolvedPath);
+      if (entityType == FileSystemEntityType.notFound) {
+        return ToolExecutionResult.failure(
+          tool: name,
+          errorCode: 'path_not_found',
+          errorMessage: 'grep path not found: $resolvedPath',
+          metadata: {
+            'path': resolvedPath,
+            'pattern': pattern,
+          },
+        );
+      }
+
+      RegExp? matcher;
+      if (regexEnabled) {
+        try {
+          matcher =
+              RegExp(pattern, caseSensitive: caseSensitive, multiLine: true);
+        } catch (error) {
+          return ToolExecutionResult.failure(
+            tool: name,
+            errorCode: 'invalid_regex',
+            errorMessage: 'invalid regex: $error',
+            metadata: {
+              'path': resolvedPath,
+              'pattern': pattern,
+            },
+          );
+        }
+      }
+
+      final matches = <String>[];
+      final rootPath = entityType == FileSystemEntityType.directory
+          ? resolvedPath
+          : File(resolvedPath).parent.path;
+      await for (final file
+          in _enumerateSearchFiles(resolvedPath, entityType)) {
+        try {
+          final lines = await file.readAsLines();
+          for (var index = 0; index < lines.length; index++) {
+            final line = lines[index];
+            final matched = regexEnabled
+                ? matcher!.hasMatch(line)
+                : _containsPattern(
+                    line,
+                    pattern,
+                    caseSensitive: caseSensitive,
+                  );
+            if (matched) {
+              matches.add(
+                '${_relativePath(file.path, rootPath)}:${index + 1}:$line',
+              );
+            }
+          }
+        } catch (_) {
+          // Skip unreadable or non-text files to keep grep resilient.
+        }
+      }
+      return ToolExecutionResult(
+        tool: name,
+        ok: true,
+        output: matches.join('\n'),
+        metadata: {
+          'count': matches.length,
+          'path': resolvedPath,
+          'pattern': pattern,
+          'regex': regexEnabled,
+          'caseSensitive': caseSensitive,
+        },
+      );
+    } on FormatException catch (error) {
       return ToolExecutionResult.failure(
         tool: name,
         errorCode: 'invalid_input',
-        errorMessage: 'grep tool requires non-empty "pattern"',
+        errorMessage: error.message,
       );
     }
-
-    final searchPath = (invocation.input['path'] as String?)?.trim() ?? '.';
-    final resolvedPath = _resolvePath(searchPath, cwd: cwd);
-    final regexEnabled = invocation.input['regex'] as bool? ?? false;
-    final caseSensitive = invocation.input['caseSensitive'] as bool? ?? true;
-    final entityType = FileSystemEntity.typeSync(resolvedPath);
-    if (entityType == FileSystemEntityType.notFound) {
-      return ToolExecutionResult.failure(
-        tool: name,
-        errorCode: 'path_not_found',
-        errorMessage: 'grep path not found: $resolvedPath',
-      );
-    }
-
-    RegExp? matcher;
-    if (regexEnabled) {
-      try {
-        matcher =
-            RegExp(pattern, caseSensitive: caseSensitive, multiLine: true);
-      } catch (error) {
-        return ToolExecutionResult.failure(
-          tool: name,
-          errorCode: 'invalid_input',
-          errorMessage: 'invalid regex: $error',
-        );
-      }
-    }
-
-    final matches = <String>[];
-    final rootPath = entityType == FileSystemEntityType.directory
-        ? resolvedPath
-        : File(resolvedPath).parent.path;
-    await for (final file in _enumerateSearchFiles(resolvedPath, entityType)) {
-      try {
-        final lines = await file.readAsLines();
-        for (var index = 0; index < lines.length; index++) {
-          final line = lines[index];
-          final matched = regexEnabled
-              ? matcher!.hasMatch(line)
-              : _containsPattern(
-                  line,
-                  pattern,
-                  caseSensitive: caseSensitive,
-                );
-          if (matched) {
-            matches.add(
-              '${_relativePath(file.path, rootPath)}:${index + 1}:$line',
-            );
-          }
-        }
-      } catch (_) {
-        // Skip unreadable or non-text files to keep grep resilient.
-      }
-    }
-    return ToolExecutionResult(
-      tool: name,
-      ok: true,
-      output: matches.join('\n'),
-      metadata: {'count': matches.length, 'path': resolvedPath},
-    );
   }
+}
+
+String _requiredTrimmedStringInput(
+  Map<String, Object?> input,
+  String key, {
+  required String tool,
+}) {
+  final value = input[key];
+  if (value is! String || value.trim().isEmpty) {
+    throw FormatException('$tool tool requires non-empty "$key"');
+  }
+  return value.trim();
+}
+
+String _requiredStringInput(
+  Map<String, Object?> input,
+  String key, {
+  required String tool,
+}) {
+  final value = input[key];
+  if (value is! String) {
+    throw FormatException('$tool tool requires string "$key"');
+  }
+  return value;
+}
+
+String? _optionalTrimmedStringInput(
+  Map<String, Object?> input,
+  String key, {
+  required String tool,
+}) {
+  final value = input[key];
+  if (value == null) {
+    return null;
+  }
+  if (value is! String) {
+    throw FormatException('$tool tool "$key" must be a string');
+  }
+  final trimmed = value.trim();
+  return trimmed.isEmpty ? null : trimmed;
+}
+
+bool? _optionalBoolInput(
+  Map<String, Object?> input,
+  String key, {
+  required String tool,
+}) {
+  final value = input[key];
+  if (value == null) {
+    return null;
+  }
+  if (value is! bool) {
+    throw FormatException('$tool tool "$key" must be a boolean');
+  }
+  return value;
+}
+
+int? _optionalPositiveIntInput(
+  Map<String, Object?> input,
+  String key, {
+  required String tool,
+}) {
+  final value = input[key];
+  if (value == null) {
+    return null;
+  }
+  if (value is! num || !value.isFinite || value % 1 != 0) {
+    throw FormatException('$tool tool "$key" must be a positive integer');
+  }
+  final intValue = value.toInt();
+  if (intValue < 1) {
+    throw FormatException('$tool tool "$key" must be a positive integer');
+  }
+  return intValue;
 }
 
 String _resolvePath(String path, {String? cwd}) {
@@ -653,10 +884,12 @@ Map<String, String>? _parseShellEnvironment(Object? raw) {
       );
     }
     final value = entry.value;
-    if (value == null) {
-      throw FormatException('shell tool env "$key" cannot be null');
+    if (value is! String) {
+      throw FormatException(
+        'shell tool env "$key" must be a string',
+      );
     }
-    parsed[key] = value.toString();
+    parsed[key] = value;
   }
   return parsed;
 }

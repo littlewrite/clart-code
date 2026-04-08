@@ -1,152 +1,157 @@
 # Clart Code SDK 路线图
 
-> 目标：先把 Dart 侧 SDK 边界梳理正确，再继续补齐 SDK 主线能力。当前默认不启动 CLI/TUI 对接工作。
+> 时间：2026-04-08
+>
+> 目标：以 `open-agent-sdk-typescript` 的 public API 为主要基线，继续补齐 Dart SDK 主线能力；默认不启动 CLI/TUI 对接工作。
 
 ## 总体原则
 
 - SDK 优先，CLI/TUI 不在当前迭代范围。
-- 参考 `open-agent-sdk-typescript` 时，优先对齐 SDK public API。
-- 参考 `claude-code` / `claudecode` 时，只提取能力域，不直接继承产品层 backlog。
-- 先纠正边界和耦合，再继续加功能。
-- 具体见：`docs/clart-code-sdk-next-capabilities-plan.md`
+- 参考 `open-agent-sdk-typescript` 时，优先对齐 SDK public surface。
+- 参考 `./claude-code`、`./claudecode` 时，只提取能力域，不直接继承产品层 backlog。
+- 先收口会影响“SDK 是否完备”的 public surface，再考虑扩展型 service。
 
-## Stage A: 能力审计与边界纠偏
+## 当前判断
 
-状态：已完成
+当前 Dart SDK 的状态更准确地说是：
 
-范围：
+- 核心闭环已具备
+- public API 仍有几块明显缺口
 
-- 重新梳理 `./claude-code`、`./claudecode`、`open-agent-sdk-typescript`
-- 明确哪些能力属于 SDK 主线，哪些属于产品层
-- 核对 Dart 当前实现是否偏离
-- 修正明显的结构性偏差
+这里的“核心闭环”指：
 
-本轮落地：
+- `ClartCodeAgent`
+- request / output control 第一层
+- session helper
+- tool loop
+- MCP 最小接入
+- skills 最小接入
+- named agent / 最小 subagent
 
-- 新增 `docs/clart-code-sdk-capability-audit.md`
-- 重写 `docs/clart-code-sdk-feature-matrix.md`
-- 更新 `docs/clart-code-sdk-architecture.md`
-- SDK session store 不再直接依赖 `lib/src/cli/workspace_store.dart`
+## P0：先补真正影响完备度的缺口
 
-收尾标准：
-
-- 文档明确 SDK 主线与产品层边界
-- 至少修正一个明确的 SDK/CLI 结构耦合点
-
-## Stage B: 完整化现有 SDK 主线
-
-状态：进行中
+### 1. Agent facade convenience API
 
 目标：
 
-- 在不扩大产品层范围的前提下，把当前已经进入 SDK 的能力补完整
+- 让 Dart 侧 agent facade 更接近 TS SDK，而不是把能力都埋在 options 与 helper 里
 
-范围：
+当前仍缺：
 
-- `ClartCodeAgent` 上的 session metadata convenience API
-  - `snapshot()`
-  - `renameSession()`
-  - `setSessionTags()`
-  - `addSessionTag()`
-  - `removeSessionTag()`
-  - `forkSession()`
-- 更细粒度 hooks
-  - model turn start/end
-  - permission decision
-  - cancelled terminal event
-- 更完整的 session interrupt / queued input / cancellation 语义
+- `createAgent()` 风格 factory
+- `setPermissionMode()`
+- `setMaxThinkingTokens()`
+- `getApiType()`
 
-当前已完成：
-
-- `ClartCodeAgent` 已补 `snapshot()/renameSession()/setSessionTags()/addSessionTag()/removeSessionTag()/forkSession()`
-- 更细粒度 hooks 已补：
-  - model turn start/end
-  - permission decision
-  - cancelled terminal event
-- 最小 session interrupt / queued input 语义已补：
-  - 并发 prompt/query 串行排队
-  - `interrupt()` 打断 active run
-  - `clearQueuedInputs()` 清理 pending queue
-
-收尾标准：
-
-- session 元数据不必只通过 store 层操作
-- cancellation 语义不再只停留在 request-scoped 最小版
-- hooks 能覆盖 agent 主循环中的关键生命周期点
-
-## Stage C: SDK service 边界补齐
-
-状态：待评估
+### 2. Observability / compaction runtime
 
 目标：
 
-- 只把确实应该成为 SDK service 的能力提升出来
+- 让 observability 不停留在“边界事件已发出，但 runtime 还没真正成立”的中间状态
 
-候选范围：
+当前状态：
 
-- context injection service
-- task service
-- config/context state 的 SDK 化抽象
+- `stream_event` / `rate_limit_event` 已有
+- `status` / `compact_boundary` 已有最小 live runtime producer
+
+当前仍缺：
+
+- 真正 compact service
+- 更细的 interrupt / queued-input / session-state 事件面
+
+### 3. MCP runtime truthfulness
+
+目标：
+
+- 让文档、类型、运行时能力保持一致
+
+当前状态：
+
+- `stdio` / `sdk` 已可用
+- `sse/http/ws` 仍不是 runtime 完成
+
+下一步策略：
+
+- 要么继续明确标为 unsupported
+- 要么补完整 runtime
+- 但不能继续在文档或 surface 上制造“看起来可用”的错觉
+
+## P1：补 SDK 易用性
+
+### 1. 更强的 typed tool helper
+
+当前状态：
+
+- 已有最小 `tool()` / `defineTool()` DSL
+
+仍缺：
+
+- 更顺手的 typed args / result helper
+- 更接近 TS helper 生态的注册体验
+
+### 2. 更像 SDK 主线的 builtin tools
+
+优先顺序：
+
+1. `web`
+2. `ask-user`
+3. `tool-search`
+4. `notebook`
 
 说明：
 
-- 这一阶段开始前，需要再次确认这些能力是否真的是 SDK public API 缺口
-- 不要因为 Claude Code 有完整产品能力，就提前把 service 面做大
+- `todo`、`config`、LSP、plan/worktree/task/team 工具先后置评估
+- 其中一部分已经开始更接近扩展型 SDK 或产品层，不应机械当作当前 P0
 
-## Stage D: 下一阶段能力实现
+### 3. 更完整的 permission mode public semantics
 
-状态：已规划，待开工
+当前状态：
 
-范围：
+- 已有 `allow/deny/ask`
+- 已有 `updatedInput`
+- 已有 permission decision hook
 
-- `tools`
-- `MCP`
-- `skills`
-- `multi-agent`
+仍缺：
 
-执行顺序：
+- 更接近 TS 的 `permissionMode` 语义分层
+- ask-user / permission prompt 一类配套能力
 
-1. 先补 `tools + MCP`
-2. 再做 `skills`
-3. 最后做 `multi-agent` 最小版
+## P2：再决定要不要继续做更深的 orchestration
 
-说明：
+### 1. Skills
 
-- 详细拆解见 `docs/clart-code-sdk-next-capabilities-plan.md`
-- `tools` 与 `MCP` 属于 SDK 基座补强
-- `skills` 属于复用能力层
-- `multi-agent` 只先做 SDK 意义上的最小 subagent API，不追 Claude Code 的重型 team/coordinator/background/remote 版本
-- 下一步开工时，不建议把 `tools` 与 `MCP` 平铺并行；应先修 `MCP registry` 对齐，再继续补 tool public API 与 builtin tools
+当前状态：
 
-## 当前明确不做
+- 已有 registry / loader / inline/fork / runtime constraints / hooks integration
+
+下一步：
+
+- 继续扩完整 lifecycle surface
+- 继续评估哪些事件需要进入 stream public surface
+
+### 2. Multi-agent
+
+当前状态：
+
+- 已有 `runSubagent()`、named agents、agent registry、`agent` tool、child event merge
+
+下一步：
+
+- 继续补 `SendMessageTool`
+- 再评估 background / resume / team 是否值得进入 SDK 主线
+
+## 明确不做
 
 - CLI 命令迁移到 SDK
 - rich/fullscreen TUI
 - slash command UI
-- skills
-- subagents / team
 - workflow / cron / monitor
-- IDE / plugin / OAuth / bridge / remote sessions
+- IDE / plugin / OAuth / bridge / remote session
+- 重型 team/coordinator/swarm 模式
 
-## 继续执行时的优先判断
+## 建议阅读顺序
 
-如果下一轮继续只做 SDK，优先顺序是：
-
-1. `MCP transport` 的 CLI 收尾
-2. 再评估更细 builtin input/error 约束
-3. 再评估是否需要更细的 queued-input / interrupt 事件面
-
-补记：
-
-- `MCP registry` 对齐已完成
-- `MCP transport` 的 SDK 类型/runtime 收口已开始，CLI 收口仍后置
-- `MCP tool/resource` error 语义与测试已在 SDK 范围内完成
-- `tool public API` 已补 direct tool registration 与可扩 permission outcome
-- 第一批 builtin tools 已补齐，`shell` 不再是 stub
-
-不要先做：
-
-1. CLI/TUI
-2. Skills
-3. Subagents
-4. 产品层扩展能力
+- API 使用：`docs/clart-code-sdk-usage.md`
+- 能力对照：`docs/clart-code-sdk-feature-matrix.md`
+- 完成度判断：`docs/clart-code-sdk-completeness-review.md`
+- 架构边界：`docs/clart-code-sdk-architecture.md`

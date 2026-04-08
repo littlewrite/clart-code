@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'sdk_mcp_server.dart';
 import 'mcp_types.dart';
 
 class McpRegistry {
@@ -161,6 +162,11 @@ McpServerConfig _legacyCliEntryToConfig({
 }
 
 Map<String, Object?> _configValueJson(McpServerConfig config) {
+  if (config is McpSdkServerConfig) {
+    throw UnsupportedError(
+      'In-process SDK MCP servers cannot be written to the MCP registry file.',
+    );
+  }
   final json = Map<String, Object?>.from(config.toJson());
   json.remove('name');
   return json;

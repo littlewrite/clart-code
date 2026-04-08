@@ -15,6 +15,12 @@ class ToolExecutor {
   final ToolScheduler scheduler;
   final ToolPermissionPolicy permissionPolicy;
 
+  static List<Tool> baseTools({String? cwd}) {
+    return List<Tool>.unmodifiable(
+      builtinBaseTools(cwd: cwd),
+    );
+  }
+
   factory ToolExecutor.fromTools(
     Iterable<Tool> tools, {
     ToolScheduler scheduler = const ToolScheduler(),
@@ -32,14 +38,7 @@ class ToolExecutor {
     ToolPermissionPolicy permissionPolicy = const ToolPermissionPolicy(),
   }) {
     return ToolExecutor.fromTools(
-      [
-        ReadTool(cwd: cwd),
-        WriteTool(cwd: cwd),
-        EditTool(cwd: cwd),
-        GlobTool(cwd: cwd),
-        GrepTool(cwd: cwd),
-        ShellTool(cwd: cwd),
-      ],
+      ToolExecutor.baseTools(cwd: cwd),
       permissionPolicy: permissionPolicy,
     );
   }

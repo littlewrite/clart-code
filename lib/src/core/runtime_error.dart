@@ -2,6 +2,7 @@ enum RuntimeErrorCode {
   securityRejected,
   providerFailure,
   invalidInput,
+  budgetExceeded,
   permissionDenied,
   toolNotFound,
   toolRuntimeError,

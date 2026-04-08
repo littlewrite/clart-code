@@ -63,10 +63,12 @@ void main() {
             ChatMessage(role: MessageRole.tool, text: 'tool result'),
           ],
           model: 'gpt-5.3-codex',
+          effort: ClartCodeReasoningEffort.high,
         ),
       );
 
       expect(body['model'], 'gpt-5.3-codex');
+      expect(body['reasoning'], {'effort': 'high'});
       expect(body['input'], isA<List>());
       final input = body['input'] as List;
       expect(input, hasLength(4));
@@ -127,6 +129,45 @@ void main() {
       expect((input.first as Map)['type'], 'function_call_output');
       expect((input.first as Map)['call_id'], 'call_read_1');
       expect((input.first as Map)['output'], 'file body');
+    });
+
+    test('builds responses api body with max tokens and json schema output',
+        () {
+      final body = buildOpenAiResponsesRequestBodyForTest(
+        request: const QueryRequest(
+          messages: [
+            ChatMessage(role: MessageRole.user, text: 'return json'),
+          ],
+          model: 'gpt-5.4',
+          maxTokens: 256,
+          jsonSchema: ClartCodeJsonSchema(
+            name: 'reply_schema',
+            schema: {
+              'type': 'object',
+              'properties': {
+                'answer': {'type': 'string'},
+              },
+              'required': ['answer'],
+            },
+          ),
+        ),
+      );
+
+      expect(body['max_output_tokens'], 256);
+      expect(body['text'], {
+        'format': {
+          'type': 'json_schema',
+          'name': 'reply_schema',
+          'schema': {
+            'type': 'object',
+            'properties': {
+              'answer': {'type': 'string'},
+            },
+            'required': ['answer'],
+          },
+          'strict': true,
+        },
+      });
     });
 
     test('extracts text from responses api output array', () {
@@ -215,6 +256,23 @@ void main() {
       expect(events.first.toolCalls.first.id, 'call_read_1');
       expect(events.first.toolCalls.first.name, 'read');
       expect(events.first.toolCalls.first.input, {'path': '/tmp/demo.txt'});
+    });
+
+    test('parses responses stream completed event usage and cost', () {
+      final events = parseOpenAiResponsesStreamPayloadEventsForTest(
+        eventName: 'response.completed',
+        rawPayload:
+            '{"type":"response.completed","response":{"model":"gpt-5.4","usage":{"input_tokens":11,"output_tokens":5,"total_tokens":16,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2},"total_cost":0.75},"output":[{"type":"message","content":[{"type":"output_text","text":"done text"}]}]}}',
+      );
+
+      expect(events, hasLength(1));
+      expect(events.first.type, ProviderStreamEventType.done);
+      expect(events.first.usage?.inputTokens, 11);
+      expect(events.first.usage?.outputTokens, 5);
+      expect(events.first.usage?.totalTokens, 16);
+      expect(events.first.usage?.cachedInputTokens, 3);
+      expect(events.first.usage?.reasoningTokens, 2);
+      expect(events.first.costUsd, 0.75);
     });
 
     test('parses responses refusal delta event', () {
@@ -376,6 +434,28 @@ void main() {
       expect((toolResultContent.single as Map)['type'], 'tool_result');
       expect((toolResultContent.single as Map)['tool_use_id'], 'toolu_1');
       expect((toolResultContent.single as Map)['content'], 'demo body');
+    });
+
+    test('claude request body honors max tokens thinking and system prompts',
+        () {
+      final body = buildClaudeRequestBodyForTest(
+        request: const QueryRequest(
+          messages: [
+            ChatMessage(role: MessageRole.user, text: 'hello'),
+          ],
+          systemPrompt: 'prepend system',
+          appendSystemPrompt: 'append system',
+          maxTokens: 2048,
+          thinking: ClartCodeThinkingConfig.enabled(budgetTokens: 512),
+        ),
+      );
+
+      expect(body['max_tokens'], 2048);
+      expect(body['thinking'], {
+        'type': 'enabled',
+        'budget_tokens': 512,
+      });
+      expect(body['system'], 'prepend system\nappend system');
     });
 
     test('run extracts native tool calls from Claude response', () async {
@@ -582,6 +662,72 @@ void main() {
       expect(events.last.toolCalls.single.name, 'read');
       expect(events.last.toolCalls.single.input, {'path': '/tmp/demo.txt'});
     });
+
+    test('Claude stream can emit rate-limit and raw stream events', () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close(force: true);
+      });
+
+      server.listen((request) async {
+        request.response.statusCode = 200;
+        request.response.headers.set(
+          HttpHeaders.contentTypeHeader,
+          'text/event-stream',
+        );
+        request.response.headers.set(
+          'anthropic-ratelimit-requests-remaining',
+          '17',
+        );
+
+        void writeEvent(String event, Map<String, Object?> data) {
+          request.response.write('event: $event\n');
+          request.response.write('data: ${jsonEncode(data)}\n\n');
+        }
+
+        writeEvent('content_block_delta', {
+          'type': 'content_block_delta',
+          'index': 0,
+          'delta': {
+            'type': 'text_delta',
+            'text': 'hello',
+          },
+        });
+        writeEvent('message_stop', {
+          'type': 'message_stop',
+        });
+        await request.response.close();
+      });
+
+      final provider = ClaudeApiProvider(
+        apiKey: 'test-key',
+        baseUrl: 'http://${server.address.host}:${server.port}/v1',
+        model: 'claude-sonnet-4-6',
+      );
+
+      final events = <ProviderStreamEvent>[];
+      await for (final event in provider.stream(
+        const QueryRequest(
+          messages: [
+            ChatMessage(role: MessageRole.user, text: 'hello'),
+          ],
+          includeObservabilityMessages: true,
+        ),
+      )) {
+        events.add(event);
+      }
+
+      expect(events.map((event) => event.type), [
+        ProviderStreamEventType.rateLimit,
+        ProviderStreamEventType.streamEvent,
+        ProviderStreamEventType.textDelta,
+        ProviderStreamEventType.streamEvent,
+        ProviderStreamEventType.done,
+      ]);
+      expect(events.first.rateLimitInfo?.provider, 'claude');
+      expect(events.first.rateLimitInfo?.requestsRemaining, '17');
+      expect(events[1].event?['type'], 'content_block_delta');
+    });
   });
 
   group('ProviderStreamEvent', () {
@@ -621,6 +767,26 @@ void main() {
       expect(event.type, ProviderStreamEventType.error);
       expect(event.error, error);
       expect(event.output, 'error output');
+    });
+
+    test('streamEvent and rateLimit factories create correct events', () {
+      final streamEvent = ProviderStreamEvent.streamEvent(
+        event: const {'type': 'delta'},
+        model: 'test-model',
+      );
+      final rateLimitEvent = ProviderStreamEvent.rateLimit(
+        rateLimitInfo: const QueryRateLimitInfo(
+          provider: 'test',
+          status: 'ok',
+          requestsRemaining: '8',
+        ),
+      );
+
+      expect(streamEvent.type, ProviderStreamEventType.streamEvent);
+      expect(streamEvent.event, {'type': 'delta'});
+      expect(streamEvent.model, 'test-model');
+      expect(rateLimitEvent.type, ProviderStreamEventType.rateLimit);
+      expect(rateLimitEvent.rateLimitInfo?.requestsRemaining, '8');
     });
   });
 }

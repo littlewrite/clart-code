@@ -74,6 +74,7 @@ class McpToolWrapper implements Tool {
       // MCP 工具返回格式：{ content: [...], isError?: bool }
       final content = result['content'] as List?;
       final isError = result['isError'] as bool? ?? false;
+      final resultMetadata = _coerceMetadataMap(result['metadata']);
 
       if (isError) {
         final errorText = _extractTextFromContent(content);
@@ -86,6 +87,7 @@ class McpToolWrapper implements Tool {
             'source': 'mcp',
             'serverName': qualifiedName.serverName,
             'toolName': qualifiedName.toolName,
+            if (resultMetadata != null) ...resultMetadata,
             'content': List<Object?>.from(content ?? const []),
           },
         );
@@ -93,8 +95,16 @@ class McpToolWrapper implements Tool {
 
       final outputText = _extractTextFromContent(content);
       return ToolExecutionResult.success(
-        tool: invocation.name,
-        output: outputText,
+              tool: invocation.name, output: outputText)
+          .copyWith(
+        metadata: resultMetadata == null
+            ? null
+            : {
+                'source': 'mcp',
+                'serverName': qualifiedName.serverName,
+                'toolName': qualifiedName.toolName,
+                ...resultMetadata,
+              },
       );
     } on McpOperationException catch (error) {
       return ToolExecutionResult.failure(
@@ -149,6 +159,13 @@ class McpToolWrapper implements Tool {
 
     return buffer.toString();
   }
+}
+
+Map<String, Object?>? _coerceMetadataMap(Object? raw) {
+  if (raw is Map) {
+    return Map<String, Object?>.from(raw.cast<String, Object?>());
+  }
+  return null;
 }
 
 /// MCP 资源读取工具

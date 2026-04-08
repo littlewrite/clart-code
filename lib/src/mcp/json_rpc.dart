@@ -1,4 +1,6 @@
 /// JSON-RPC 2.0 协议实现
+library json_rpc;
+
 import 'dart:async';
 import 'dart:convert';
 

@@ -153,4 +153,58 @@ void main() {
       }
     }
   });
+
+  test('session store preserves cascaded subagent transcript metadata',
+      () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'clart_sdk_store_subagent_transcript_',
+    );
+
+    try {
+      final agent = ClartCodeAgent(
+        ClartCodeAgentOptions(
+          cwd: tempDir.path,
+          model: 'parent-model',
+          providerOverride: _SubagentTranscriptProvider(),
+        ),
+      );
+
+      final result = await agent.runSubagent(
+        'inspect persisted child output',
+        options: const ClartCodeSubagentOptions(
+          name: 'reviewer',
+          model: 'child-model',
+          allowedTools: ['read'],
+        ),
+      );
+
+      expect(result.transcriptMessages, hasLength(1));
+
+      final store = ClartCodeSessionStore(cwd: tempDir.path);
+      final persisted = store.load(agent.sessionId);
+      expect(persisted, isNotNull);
+
+      final subagentMessage = persisted!.transcript.singleWhere(
+        (message) => message.kind == TranscriptMessageKind.subagent,
+      );
+      expect(subagentMessage.name, 'reviewer');
+      expect(subagentMessage.sessionId, result.sessionId);
+      expect(subagentMessage.parentSessionId, agent.sessionId);
+      expect(subagentMessage.text, contains('output:\npersisted child answer'));
+    } finally {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    }
+  });
+}
+
+class _SubagentTranscriptProvider extends NativeToolCallingLlmProvider {
+  @override
+  Future<QueryResponse> run(QueryRequest request) async {
+    return QueryResponse.success(
+      output: 'persisted child answer',
+      modelUsed: request.model,
+    );
+  }
 }

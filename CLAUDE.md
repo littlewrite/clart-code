@@ -158,16 +158,15 @@ dart pub upgrade
 ## 参考文档
 
 详细实现说明请参阅：
-- `docs/claudecode-mvp-minimal-flow.md` - MVP 功能范围和启动流程
-- `docs/mcp-implementation.md` - MCP 集成架构
-- `docs/progress-update-2026-04-05.md` - 最新进度总结
-- `docs/dart_status.md` - Dart 实现完整度评估
+- `docs/clart-code-sdk-usage.md` - 当前 SDK 使用方式
+- `docs/clart-code-sdk-architecture.md` - SDK 架构边界
+- `docs/clart-code-sdk-feature-matrix.md` - TS 基线与 Dart 能力对照
+- `docs/clart-code-sdk-completeness-review.md` - 当前完成度与缺口判断
+- `docs/clart-code-sdk-roadmap.md` - 下一步优先级
 
 ## TypeScript 参考
 
-原始 TypeScript 实现位于 `claudecode/` 目录，可作为以下参考：
+TypeScript 参考实现位于 `claude-code/`、`claudecode/` 和 `/Users/th/Node/open-agent-sdk-typescript`，可作为以下参考：
 - 功能完整度对比
 - 实现模式
 - 边界情况处理
-
-当前 TS→Dart 映射核心功能约完成 70%。

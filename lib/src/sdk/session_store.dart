@@ -101,14 +101,8 @@ class ClartCodeSessionSnapshot {
             },
           )
           .toList(growable: false),
-      'transcript': transcript
-          .map(
-            (message) => {
-              'kind': message.kind.name,
-              'text': message.text,
-            },
-          )
-          .toList(growable: false),
+      'transcript':
+          transcript.map((message) => message.toJson()).toList(growable: false),
     };
   }
 
@@ -193,6 +187,42 @@ class ClartCodeSessionStore {
     return snapshots;
   }
 
+  ClartCodeSessionSnapshot? latest() {
+    final sessions = list();
+    if (sessions.isEmpty) {
+      return null;
+    }
+    return sessions.first;
+  }
+
+  ClartCodeSessionSnapshot? active() {
+    final activeId = readActiveSessionId();
+    if (activeId == null) {
+      return null;
+    }
+    return load(activeId);
+  }
+
+  ClartCodeSessionSnapshot? info(String sessionId) {
+    return load(sessionId);
+  }
+
+  List<ChatMessage>? messages(String sessionId) {
+    final snapshot = load(sessionId);
+    if (snapshot == null) {
+      return null;
+    }
+    return List<ChatMessage>.unmodifiable(snapshot.history);
+  }
+
+  List<TranscriptMessage>? transcriptMessages(String sessionId) {
+    final snapshot = load(sessionId);
+    if (snapshot == null) {
+      return null;
+    }
+    return List<TranscriptMessage>.unmodifiable(snapshot.transcript);
+  }
+
   ClartCodeSessionSnapshot? fork(
     String sessionId, {
     String? title,
@@ -269,6 +299,49 @@ class ClartCodeSessionStore {
       sessionId,
       existing.tags.where((item) => item != normalizedTag).toList(),
     );
+  }
+
+  ClartCodeSessionSnapshot? append(
+    String sessionId, {
+    List<ChatMessage> history = const [],
+    List<TranscriptMessage> transcript = const [],
+  }) {
+    final existing = load(sessionId);
+    if (existing == null) {
+      return null;
+    }
+    if (history.isEmpty && transcript.isEmpty) {
+      return existing;
+    }
+
+    final updated = existing.copyWith(
+      history: [...existing.history, ...history],
+      transcript: [...existing.transcript, ...transcript],
+      updatedAt: DateTime.now().toUtc().toIso8601String(),
+    );
+    save(updated);
+    return updated;
+  }
+
+  bool delete(String sessionId) {
+    final file = File(_sessionPath(sessionId));
+    if (!file.existsSync()) {
+      return false;
+    }
+    file.deleteSync();
+
+    if (readActiveSessionId() == sessionId) {
+      final latestSession = latest();
+      if (latestSession == null) {
+        final activeFile = File(_activeSessionPath);
+        if (activeFile.existsSync()) {
+          activeFile.deleteSync();
+        }
+      } else {
+        _writeActiveSessionId(latestSession.id);
+      }
+    }
+    return true;
   }
 
   String? readActiveSessionId() {
@@ -355,24 +428,7 @@ MessageRole? _parseMessageRole(String? raw) {
 }
 
 TranscriptMessage _transcriptMessageFromJson(Map<String, Object?> json) {
-  final text = json['text'] as String? ?? '';
-  switch (json['kind'] as String?) {
-    case 'userPrompt':
-      return TranscriptMessage.userPrompt(text);
-    case 'localCommand':
-      return TranscriptMessage.localCommand(text);
-    case 'localCommandStdout':
-      return TranscriptMessage.localCommandStdout(text);
-    case 'localCommandStderr':
-      return TranscriptMessage.localCommandStderr(text);
-    case 'assistant':
-      return TranscriptMessage.assistant(text);
-    case 'toolResult':
-      return TranscriptMessage.toolResult(text);
-    case 'system':
-    default:
-      return TranscriptMessage.system(text);
-  }
+  return TranscriptMessage.fromJson(json);
 }
 
 String _buildSessionTitle(

@@ -1,105 +1,165 @@
-# Clart Code SDK 架构与实施记录
+# Clart Code SDK 架构与边界
+
+> 时间：2026-04-08
+>
+> 目的：用当前代码状态说明 Dart SDK 的入口、运行时分层、以及它和 CLI / Claude Code 产品层之间的边界。
 
 ## 目标
 
-- 保留现有 CLI。
-- 新增独立 SDK 入口，避免 TUI 继续绑定底层执行链。
-- 先把 `ClartCodeAgent` 做成稳定的高层封装，再让 CLI/TUI 逐步退化为适配层。
-- 除非用户明确提出，否则当前工作默认只推进 SDK，不启动 CLI 对接 SDK 的落地工作。
+- 保留现有 CLI，不把 CLI/TUI 当作当前 SDK 工作的主线。
+- 让 `ClartCodeAgent` 成为稳定的高层程序化入口。
+- 让 tool loop、session、MCP、skills、最小 subagent 都通过 SDK surface 暴露。
+- 继续参考 `./claude-code`、`./claudecode`、`/Users/th/Node/open-agent-sdk-typescript`，但只对齐适合 Dart SDK 的 public API，不照搬产品层逻辑。
 
-## 新入口
+## 入口
 
 - SDK 入口：`lib/clart_code_sdk.dart`
 - CLI 入口：`lib/clart_code.dart`
 
-这两个入口并行存在：
+当前两条入口并行存在：
 
-- CLI 继续服务当前命令行使用场景。
-- SDK 面向测试、后续 TUI、以及未来的程序化调用。
+- CLI 继续服务命令行使用场景。
+- SDK 面向测试、程序化调用、以及未来可能重做的轻量 UI。
 
-## 配套文档
+## 当前公开能力
 
-- 功能矩阵：`docs/clart-code-sdk-feature-matrix.md`
-- 能力审计：`docs/clart-code-sdk-capability-audit.md`
-- 下一阶段能力规划：`docs/clart-code-sdk-next-capabilities-plan.md`
-- 路线图：`docs/clart-code-sdk-roadmap.md`
-- 工作日志：`docs/clart-code-sdk-worklog.md`
+SDK 当前已公开这些主能力域：
 
-## Phase 1 已落地范围
+- `ClartCodeAgent` 高层 API
+- top-level `query()` / `prompt()` / `runSubagent()`
+- request / output control
+- session 持久化与 continue helper
+- provider 抽象
+- tool loop 与最小 custom tool DSL
+- MCP registry / manager / SDK in-process helper
+- skills registry / loader / runtime constraints
+- named agents / 最小 subagent public API
+- hooks / cancellation / observability
 
-- 新增 `ClartCodeAgent`
-- 新增 `ClartCodeAgentOptions`
-- 新增 SDK 流式消息模型 `ClartCodeSdkMessage`
-- 新增聚合结果模型 `ClartCodePromptResult`
-- 新增 `ClartCodeSessionStore`
-- 复用现有 `.clart/sessions/<id>.json` 工作区会话格式
+## 运行时分层
 
-当前 `ClartCodeAgent` 已完成：
+### 1. SDK facade
 
-- 单轮 prompt/query 调用
-- 基于现有 `QueryEngine` 的流式消费
-- 会话 history / transcript 累积
-- 本地 session 持久化与 resume
-- 最小 provider 组装：`local|claude|openai`
+主要文件：
 
-## 当前边界
+- `lib/src/sdk/clart_code_agent.dart`
+- `lib/src/sdk/sdk_models.dart`
+- `lib/src/sdk/sdk_helpers.dart`
+- `lib/src/sdk/session_store.dart`
 
-这一阶段刻意不做：
+职责：
 
-- TUI
-- rich 输入编辑
+- 组装 provider、tool executor、MCP、skills、agents
+- 对外提供 `query()`、`prompt()`、`runSubagent()` 等高层调用
+- 维护会话、history、stream/result 聚合、runtime hooks
+
+### 2. Core runtime
+
+主要文件：
+
+- `lib/src/core/models.dart`
+- `lib/src/core/transcript.dart`
+- `lib/src/core/runtime_error.dart`
+- `lib/src/core/turn_executor.dart`
+
+职责：
+
+- request / response / usage / error 的底层模型
+- transcript 与 runtime message 基础抽象
+- 单轮执行和 provider 结果归一化
+
+### 3. Provider abstraction
+
+主要文件：
+
+- `lib/src/providers/llm_provider.dart`
+- `lib/src/providers/provider_strategy.dart`
+
+职责：
+
+- 统一 local / Claude / OpenAI provider surface
+- 处理 provider-native tool calling、streaming、usage、rate limit 信息
+- 把 provider 差异归一化回 SDK runtime
+
+### 4. Tool platform
+
+主要文件：
+
+- `lib/src/tools/tool_models.dart`
+- `lib/src/tools/tool_executor.dart`
+- `lib/src/tools/builtin_tools.dart`
+- `lib/src/tools/tool_permissions.dart`
+- `lib/src/tools/mcp_tools.dart`
+- `lib/src/tools/skill_tool.dart`
+- `lib/src/tools/agent_tool.dart`
+
+职责：
+
+- 统一 builtin / custom / MCP / skill / agent 工具
+- 做权限决策、执行调度、错误归一化
+- 把 tool result 回注到 agent loop
+
+### 5. MCP / Skills / Agents 扩展层
+
+主要文件：
+
+- `lib/src/mcp/*`
+- `lib/src/skills/*`
+- `lib/src/agents/*`
+
+职责：
+
+- 作为 tool loop 之上的扩展能力层
+- 保持“最小可编程”语义，不向 CLI/TUI 产品层扩张
+
+## 边界判断
+
+当前明确属于 SDK 主线：
+
+- Agent facade
+- request / output control
+- session API
+- provider abstraction
+- tool platform
+- permission semantics
+- hooks
+- MCP integration
+- skills
+- 最小 subagent orchestration
+
+当前明确不纳入 SDK 主线：
+
+- CLI command 系统
+- TUI / rich 输入编辑 / fullscreen UI
 - slash command UI
-- 完整 tool-call 闭环
-- hooks / subagents / tasks 的 SDK 化公开 API
+- workflow / cron / monitor
+- IDE / plugin / OAuth / bridge / remote session
+- 重型 team/coordinator/swarm 产品形态
 
-说明：
+## 当前真实状态
 
-- 仓库内部已经有 tool、MCP、task 的最小实现。
-- 但当前 LLM 调用主链还没有把“模型输出 -> tool use -> tool result -> 再入模型”完整挂到 SDK agent 循环里。
-- 所以 Phase 1 先把 Agent、Session、Stream 协议立住，不伪装成已经完成工具闭环。
+和早期 Phase 1 文档不同，当前 SDK 已经不再停留在“只有 agent + session + stream 协议”的阶段。
 
-## 本轮纠偏
+当前已经成立的闭环包括：
 
-- SDK 的 session 持久化继续复用 `.clart/sessions/<id>.json` 与 `active_session.json` 格式。
-- 但 SDK 不再直接依赖 CLI 的 `workspace_store.dart` 实现。
-- 后续如果 CLI 与 SDK 共享存储格式，只共享格式，不共享 CLI 私有模块。
-- 参考 `./claude-code`、`./claudecode` 时，只把它们当作能力来源，不把其产品层能力直接映射成 SDK 近期 backlog。
+- provider-native tool calling + fallback tool loop
+- direct custom tool registration 与最小 `tool()` / `defineTool()` DSL
+- session helper 与 continue helper
+- skills registry / loader / `skill` tool
+- named agents / `agent` tool / `runSubagent()`
+- `status` / `compact_boundary` 的最小 observability runtime producer
 
-## 后续阶段建议
+## 当前仍然缺的层
 
-### Phase 2
+- `createAgent()`、`setPermissionMode()`、`setMaxThinkingTokens()`、`getApiType()` 这类 agent facade convenience API
+- 真正的 compact service，而不只是 `status` / `compact_boundary` 边界事件
+- 更强的 typed tool helper 与更大的 builtin tool 覆盖
+- MCP `sse/http/ws` runtime transport
+- `SendMessageTool`、background/resume、team 等更深一层 orchestration
 
-- 把 tool loop 正式接入 `ClartCodeAgent`
-- 定义 SDK 侧 tool schema 与 tool result 事件
-- 暴露 `allowedTools / disallowedTools / permissionMode`
+## 推荐阅读顺序
 
-当前进度补充：
-
-- 以上三项已经进入实现中。
-- 当前 SDK 已有一个可运行的最小 tool loop，采用文本 JSON plan 协议：
-  - 模型输出 `tool_calls`
-  - agent 执行工具
-  - tool result 作为 `MessageRole.tool` 回注
-- 这解决了 “模型 -> 工具 -> 模型” 的基础闭环，但还不是 provider-native function calling。
-
-### Phase 3
-
-- 把 MCP 注册与连接管理提升到 SDK 层
-- 支持 agent 启动时装载 MCP tools/resources
-
-### Phase 4
-
-- 把 tasks、workspace 状态、review/diff 等能力统一抽到 SDK service
-- CLI 改为消费 SDK，而不是继续直接编排底层 core
-
-### Phase 5
-
-- 在 SDK 之上重新实现轻量 TUI
-- UI 只负责输入、订阅事件、渲染，不再直接掌控执行状态机
-
-## 设计原则
-
-- SDK 优先于 TUI
-- session 格式统一，不重复造轮子
-- 先做真实可测的 public API，再做复杂交互层
-- 不把 CLI 私有状态机继续扩散到 SDK
+- 使用方式：`docs/clart-code-sdk-usage.md`
+- 能力对照：`docs/clart-code-sdk-feature-matrix.md`
+- 完成度判断：`docs/clart-code-sdk-completeness-review.md`
+- 下一步优先级：`docs/clart-code-sdk-roadmap.md`
